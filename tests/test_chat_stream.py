@@ -239,6 +239,7 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     annotations = chat_mod.sess.get_message_annotations(sid)
     assert annotations["assistant-final-uuid"]["ts"] == done["completed_at_ms"]
     assert annotations["assistant-final-uuid"]["elapsed_s"] == 1.5
+    assert annotations["assistant-final-uuid"]["turn_status"] == "completed"
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
@@ -295,6 +296,125 @@ def test_tool_only_turn_persists_completion_annotation(
     annotations = chat_mod.sess.get_message_annotations(sid)
     assert annotations[assistant_uuid]["ts"] == done["completed_at_ms"]
     assert annotations[assistant_uuid]["elapsed_s"] == 2.5
+    assert annotations[assistant_uuid]["turn_status"] == "completed"
+    persisted = chat_mod._RawMsg(
+        assistant_uuid,
+        "assistant",
+        {"content": [{
+            "type": "tool_use", "id": "tu_tool_only", "name": "Read",
+            "input": {"file_path": "/tmp/tool-only.txt"},
+        }]},
+    )
+    shaped = chat_mod._sdk_messages_to_ui([persisted], annotations)
+    assert shaped[-1]["role"] == "tool_use"
+    assert shaped[-1]["model"] == "claude-sonnet-4-6"
+    assert shaped[-1]["turn_status"] == "completed"
+
+
+def test_forced_interrupt_persists_refreshable_footer_and_private_snapshot(
+        stream_env, client):
+    """A Result-less forced stop must retain its footer after a reload."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    bc = chat_mod.TurnBroadcast(
+        session_id=sid, model="codex:gpt-5.6-sol")
+    bc.user_text = "interrupt fixture"
+    bc.cancelled = True
+    bc.last_assistant_uuid = "assistant-interrupted-exact-uuid"
+    bc.started_at = 1_700_000_000.0
+    bc.cancelled_at_ms = 1_700_000_004_200
+    bc.publish({
+        "event": "text",
+        "data": json.dumps({"text": "partial answer"}),
+    })
+
+    assert chat_mod._persist_cancelled_turn_snapshot(bc) is True
+
+    annotations = chat_mod.sess.get_message_annotations(sid)
+    footer = annotations[bc.last_assistant_uuid]
+    assert footer == {
+        "model": "codex:gpt-5.6-sol",
+        "ts": bc.cancelled_at_ms,
+        "turn_status": "cancelled",
+        "elapsed_s": 4.2,
+    }
+    snapshots, generation = chat_mod._load_cancelled_turn_snapshots(sid)
+    assert generation
+    assert len(snapshots) == 1
+    tail = snapshots[0]["messages"][-1]
+    assert tail["role"] == "assistant"
+    assert tail["text"] == "partial answer"
+    assert tail["model"] == "codex:gpt-5.6-sol"
+    assert tail["turn_status"] == "cancelled"
+    assert tail["ts"] == bc.cancelled_at_ms
+    assert tail["elapsed"] == 4.2
+
+    path = chat_mod._cancelled_turn_snapshot_path(sid, bc.turn_id)
+    assert path is not None and path.exists()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_activity_hidden_turn_never_enters_global_task_center(
+        stream_env, client, monkeypatch):
+    """A lightweight side branch streams normally without ledger mutations."""
+    from backend import activity as activity_module
+
+    chat_mod = stream_env
+    created = client.post(
+        "/api/chat/sessions",
+        headers={
+            "X-Auth-Token": TEST_TOKEN,
+            "Content-Type": "application/json",
+        },
+        json={
+            "name": "side question fixture",
+            "model": "claude-sonnet-4-6",
+            "activity_hidden": True,
+        },
+    )
+    assert created.status_code == 200, created.text
+    sid = created.json()["id"]
+    assistant_uuid = "activity-hidden-assistant"
+    messages = [
+        AssistantMessage(
+            content=[TextBlock(text="lightweight answer")],
+            model="claude-sonnet-4-6",
+            usage={},
+            uuid=assistant_uuid,
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=1100, duration_api_ms=1000,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={},
+        ),
+    ]
+
+    async def fake_get_client(
+        session_id, model, permission="bypassPermissions", effort="", service_tier="",
+    ):
+        return _FakeStreamClient(messages)
+
+    def forbidden_activity(*_args, **_kwargs):
+        raise AssertionError("activity ledger must ignore lightweight branch")
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod,
+        "_recent_turn_uuids",
+        lambda _sid, _want_image_user: (assistant_uuid, "hidden-user"),
+    )
+    monkeypatch.setattr(activity_module.activity, "start", forbidden_activity)
+    monkeypatch.setattr(activity_module.activity, "finish", forbidden_activity)
+    monkeypatch.setattr(activity_module.activity, "set_state", forbidden_activity)
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        f"&prompt=ask&model=claude-sonnet-4-6&permission=default"
+    )
+    assert response.status_code == 200, response.text
+    assert any(event == "done" for event, _ in _parse_sse(response.text))
+    assert chat_mod.sess.get_session(sid)["activity_hidden"] is True
 
 
 def test_done_is_published_before_slow_post_turn_bookkeeping(
@@ -377,6 +497,171 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
             recent.close()
 
     asyncio.run(exercise())
+
+
+def test_activity_stays_running_until_background_continuation_finishes(
+        stream_env, client, monkeypatch):
+    """A main ResultMessage is not the logical end while a task is detached.
+
+    The tab derives its yellow dot from the task pin.  Activity Center must keep
+    the same session running until that pin settles and the CLI's continuation
+    reaches its own ResultMessage; otherwise opening the center shows no running
+    indicator for work that is visibly still active in the tab strip.
+    """
+    from backend import activity as activity_module
+
+    chat_mod = stream_env
+    sid = _make_session(client)
+
+    async def exercise():
+        watcher_attached = asyncio.Event()
+        release_watcher = asyncio.Event()
+        activity_transitions = []
+
+        started = TaskStartedMessage(
+            subtype="task_started", data={}, task_id="task_deferred",
+            description="sleep 20", uuid="task-start", session_id=sid,
+            tool_use_id="tu-bg", task_type="bash",
+        )
+        main_result = ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+        notification = TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="task_deferred",
+            status="completed", output_file="/tmp/task.out", summary="done",
+            uuid="task-finish", session_id=sid, tool_use_id="tu-bg",
+        )
+        reaction = AssistantMessage(
+            content=[TextBlock(text="后台任务已经完成。")],
+            model="claude-sonnet-4-6", usage={}, uuid="continuation-asst",
+        )
+        continuation_result = ResultMessage(
+            subtype="success", duration_ms=12, duration_api_ms=10,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={},
+        )
+
+        class _DeferredBackgroundClient(_FakeStreamClient):
+            async def receive_messages(self):
+                watcher_attached.set()
+                await release_watcher.wait()
+                for message in (notification, reaction, continuation_result):
+                    yield message
+
+        fake = _DeferredBackgroundClient([started, main_result])
+
+        async def fake_get_client(*_args, **_kwargs):
+            return fake
+
+        monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+        monkeypatch.setattr(
+            activity_module.activity,
+            "start",
+            lambda activity_sid, *, summary="": activity_transitions.append(
+                ("start", activity_sid, summary)),
+        )
+        monkeypatch.setattr(
+            activity_module.activity,
+            "finish",
+            lambda activity_sid, status: activity_transitions.append(
+                ("finish", activity_sid, status)),
+        )
+
+        broadcast = await chat_mod._start_turn(sid, "run a background task")
+        await asyncio.wait_for(watcher_attached.wait(), timeout=1)
+
+        assert any(
+            event.get("event") == "done"
+            for event in broadcast.replay_events()
+        )
+        assert activity_transitions == [
+            ("start", sid, "run a background task"),
+        ]
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {
+            "task_deferred",
+        }
+        assert chat_mod._background_activity_finishes[sid] == "completed"
+
+        await asyncio.wait_for(broadcast.task, timeout=1)
+        watcher = chat_mod._task_watchers[sid]
+        release_watcher.set()
+        await asyncio.wait_for(watcher, timeout=1)
+
+        assert activity_transitions == [
+            ("start", sid, "run a background task"),
+            ("finish", sid, "completed"),
+        ]
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert sid not in chat_mod._background_activity_finishes
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._background_activity_finishes.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        if recent is not None:
+            recent.close()
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+@pytest.mark.parametrize(
+    ("deferred_status", "expected_status"),
+    [("completed", "failed"), ("cancelled", "cancelled")],
+)
+def test_background_stream_eof_releases_dead_task_and_closes_activity(
+        stream_env, monkeypatch, deferred_status, expected_status):
+    """A closed CLI can never deliver the pending task's terminal marker.
+
+    This is the force-teardown path behind the stale yellow tab / Activity
+    Center row: unlike watcher replacement, the watcher is not cancelled; its
+    shared stream ends cleanly with EOF while the task pin is still present.
+    """
+    from backend import activity as activity_module
+
+    chat_mod = stream_env
+    sid = f"sid-eof-{deferred_status}"
+    task_id = f"task-eof-{deferred_status}"
+    transitions = []
+
+    class _ClosedClient:
+        async def receive_messages(self):
+            if False:  # pragma: no cover - make this an async generator
+                yield None
+
+    async def exercise():
+        chat_mod._pin_background_task(sid, task_id)
+        chat_mod._bg_task_descriptions[task_id] = "sleep 30"
+        chat_mod._background_activity_finishes[sid] = deferred_status
+        await chat_mod._watch_inflight_tasks(
+            sid, _ClosedClient(), {task_id: "sleep 30"})
+
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda activity_sid, status: transitions.append(
+            (activity_sid, status)),
+    )
+    try:
+        asyncio.run(exercise())
+        assert transitions == [(sid, expected_status)]
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert sid not in chat_mod._background_activity_finishes
+        assert task_id not in chat_mod._bg_task_descriptions
+        assert task_id not in chat_mod._bg_task_pinned_at
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._background_activity_finishes.pop(sid, None)
+        chat_mod._bg_task_descriptions.pop(task_id, None)
+        chat_mod._bg_task_pinned_at.pop(task_id, None)
+        chat_mod._background_turn_started_at.pop(sid, None)
+        chat_mod._background_origin_turn_id.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
 
 
 def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
@@ -861,13 +1146,17 @@ def test_settle_background_task_dedups(stream_env):
 def test_merge_session_inflight_recovers_orphaned_task(stream_env):
     """Watcher replacement must retain every session-level task even when this
     turn's local inflight_tasks doesn't contain it. _merge_session_inflight
-    unions the turn-local launches with the session-level pin set."""
+    derives the set from the session-level pin set and enriches it with any
+    turn-local launch metadata."""
     chat_mod = stream_env
     sid = "sid-orphan"
     try:
         # Prior-turn task still pinned at session level + description cached,
-        # but NOT in this turn's local inflight dict.
-        chat_mod._sessions_with_inflight_tasks[sid] = {"task_prior"}
+        # but NOT in this turn's local inflight dict. `task_now` is a launch
+        # from THIS turn — every launch path pins (_pin_background_task), so a
+        # live turn-local task is always in the pin set too.
+        chat_mod._pin_background_task(sid, "task_prior")
+        chat_mod._pin_background_task(sid, "task_now")
         chat_mod._bg_task_descriptions["task_prior"] = "deep research"
         turn_local = {"task_now": {"tool_use_id": "tu_now",
                                    "description": "this turn"}}
@@ -877,18 +1166,21 @@ def test_merge_session_inflight_recovers_orphaned_task(stream_env):
         # Both the just-launched task and the orphaned prior task are covered.
         assert set(merged) == {"task_now", "task_prior"}
         assert merged["task_now"]["description"] == "this turn"
+        assert merged["task_now"]["tool_use_id"] == "tu_now"
         assert merged["task_prior"]["description"] == "deep research"
         # Turn-local entry is not mutated (defensive copy).
         assert "task_prior" not in turn_local
 
-        # A session with no pins → just the turn-local set, unchanged.
-        assert chat_mod._merge_session_inflight("sid-none", turn_local) == \
-            turn_local
+        # A session with no pins → nothing in flight, whatever the turn-local
+        # dict still holds (see the no-resurrect test).
+        assert chat_mod._merge_session_inflight("sid-none", turn_local) == {}
         # Empty everything → empty (no spurious watcher spawn).
         assert chat_mod._merge_session_inflight("sid-none", {}) == {}
     finally:
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
         chat_mod._bg_task_descriptions.pop("task_prior", None)
+        for tid in ("task_prior", "task_now"):
+            chat_mod._bg_task_pinned_at.pop(tid, None)
 
 
 def test_watcher_opens_continuation_turn_and_unpins(stream_env):
@@ -919,7 +1211,7 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         model="claude-sonnet-4-6", usage={},
         uuid="continuation-assistant-uuid")
     result = ResultMessage(
-        subtype="success", duration_ms=120, duration_api_ms=100,
+        subtype="success", duration_ms=1120, duration_api_ms=1100,
         is_error=False, num_turns=1, session_id=sid,
         total_cost_usd=0.0, usage={})
     fake_client = _FakeWatchClient([notif, reaction, result])
@@ -943,7 +1235,7 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         assert kinds[-1] == "done", f"missing terminal done: {kinds}"
         done_ev = next(e for e in bc.events if e.get("event") == "done")
         done = json.loads(done_ev["data"])
-        assert done["duration_ms"] == 120
+        assert done["duration_ms"] == 1120
         assert done["assistant_uuid"] == "continuation-assistant-uuid"
         assert isinstance(done["completed_at_ms"], int)
         assert done["completed_at_ms"] > 0
@@ -956,6 +1248,13 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         assert payload["tool_use_id"] == "tu"
         assert payload["status"] == "completed"
         assert payload["output_file"] == "/tmp/o.md"
+        annotations = chat_mod.sess.get_message_annotations(sid)
+        assert annotations["continuation-assistant-uuid"] == {
+            "model": done["model"],
+            "ts": done["completed_at_ms"],
+            "turn_status": "completed",
+            "elapsed_s": 1.1,
+        }
         # All pending settled → pin released, client reclaimable.
         assert sid not in chat_mod._sessions_with_inflight_tasks
         assert sid not in chat_mod._task_watchers
@@ -969,14 +1268,20 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
 
 
 def test_continuation_terminal_precedes_annotation_bookkeeping(stream_env):
-    """The footer terminal event must not wait for transcript sidecars."""
+    """Queue done, annotate its exact UUID, then release the event loop."""
     import inspect
 
     source = inspect.getsource(stream_env._watch_inflight_tasks)
     done_at = source.index(
         'b.publish({"event": "done", "data": json.dumps(done_payload)})')
-    annotate_at = source.index("_recent_turn_uuids, session_id, False")
+    annotate_at = source.index("sess.set_message_annotation(", done_at)
+    finish_at = source.index("b.finish()", annotate_at)
     assert done_at < annotate_at
+    assert annotate_at < finish_at
+    close_source = source[source.index("async def _close_continuation"):finish_at]
+    assert "_recent_turn_uuids" not in close_source
+    assert "asyncio.to_thread" not in close_source
+    assert '(state or {}).get("assistant_uuid")' in close_source
     assert stream_env._CONTINUATION_GRACE <= 8
 
 
@@ -2424,3 +2729,178 @@ def test_preflight_compact_trusts_the_token_count_over_the_verdict(
     # The prompt survived the scare — it was sent after the compact, not dropped.
     assert fake.queried[0] == "/compact"
     assert len(fake.queried) == 2
+
+
+def test_watcher_publishes_settlement_into_live_turn_when_slot_is_busy(stream_env):
+    """A background task settling in the turn-teardown window must still be
+    reported.
+
+    The pump routes to `self._turn or self._background`; a turn detaches its
+    queue at ResultMessage while `_active_turns[sid]` is only popped later, in
+    _pump_gen_to_broadcast's finally. A task settling inside that window is
+    therefore handed to the WATCHER (the in-turn dispatch is already gone, so it
+    can never report it) while _open_continuation still refuses to take the
+    occupied slot. The old code published only `if cont is not None`, so dedup
+    was won here and delivery happened nowhere: no toast, no card flip
+    (2026-08-04, task b97zswye9). The live turn's broadcast is the carrier.
+    """
+    import asyncio
+
+    chat_mod = stream_env
+    sid = "sid-busy-slot"
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task_race"}
+    # A live (not done) turn occupying the slot — exactly the teardown window.
+    live = chat_mod.TurnBroadcast(session_id=sid, model="m")
+    chat_mod._active_turns[sid] = live
+
+    notif = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="task_race",
+        status="completed", output_file="/tmp/race.md", summary="ok",
+        uuid="u-race", session_id=sid, tool_use_id="tu-race")
+    fake_client = _FakeWatchClient([notif])
+
+    async def run():
+        await chat_mod._watch_inflight_tasks(
+            sid, fake_client, {"task_race": "sleep 20"})
+
+    try:
+        asyncio.run(run())
+        # No continuation was opened (the slot was busy) — so the event must
+        # have landed on the live turn instead of being dropped.
+        assert chat_mod._active_turns.get(sid) is live
+        kinds = [e.get("event") for e in live.events]
+        assert "task_notification" in kinds, f"settlement dropped: {kinds}"
+        payload = json.loads(next(
+            e for e in live.events
+            if e.get("event") == "task_notification")["data"])
+        assert payload["task_id"] == "task_race"
+        assert payload["tool_use_id"] == "tu-race"
+        assert payload["status"] == "completed"
+        assert payload["output_file"] == "/tmp/race.md"
+        # Settlement still unpinned the task.
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._recent_turns.pop(sid, None)
+
+
+def test_merge_session_inflight_does_not_resurrect_watcher_settled_task(stream_env):
+    """Only the in-turn dispatch pops the turn-local `inflight_tasks`, so a task
+    the WATCHER settled stays in that dict. Merging it back in re-pinned a
+    finished task into a fresh watcher generation, and the session then reported
+    active:true while waiting for a notification that can never arrive twice
+    (2026-08-04: `generation=3 pending=['b97zswye9', ...]`). The pin set is the
+    sole authority."""
+    chat_mod = stream_env
+    sid = "sid-no-resurrect"
+    try:
+        # Watcher already settled task_gone → not in the pin set. task_live is.
+        chat_mod._sessions_with_inflight_tasks[sid] = {"task_live"}
+        turn_local = {
+            "task_gone": {"tool_use_id": "tu_gone", "description": "settled"},
+            "task_live": {"tool_use_id": "tu_live", "description": "running"},
+        }
+
+        merged = chat_mod._merge_session_inflight(sid, turn_local)
+
+        assert set(merged) == {"task_live"}, \
+            "a watcher-settled task was resurrected into the next watcher"
+        # Turn-local metadata still enriches the surviving pin.
+        assert merged["task_live"]["tool_use_id"] == "tu_live"
+        assert merged["task_live"]["description"] == "running"
+        # No pins at all → no spurious watcher spawn.
+        assert chat_mod._merge_session_inflight("sid-none", turn_local) == {}
+        assert chat_mod._merge_session_inflight("sid-none", {}) == {}
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+
+def test_stale_task_pins_expire_after_the_watch_timeout(stream_env):
+    """A pin is the ONLY thing making a session report background_active, and
+    _settle_background_task needs a terminal notification to clear it. A task
+    that never delivers one (a background job that produced no output) used to
+    pin its session forever — respawning a watcher after every user turn and
+    keeping the browser's reconnect machinery awake. The deadline is absolute
+    from the task's own launch, not per-watcher."""
+    import time as _time
+
+    chat_mod = stream_env
+    sid = "sid-stale-pin"
+    try:
+        chat_mod._pin_background_task(sid, "task_fresh")
+        chat_mod._pin_background_task(sid, "task_zombie")
+        chat_mod._bg_task_descriptions["task_zombie"] = "pytest that died"
+        # Backdate one pin past the watch timeout.
+        chat_mod._bg_task_pinned_at["task_zombie"] = (
+            _time.time() - chat_mod._TASK_WATCH_TIMEOUT - 1)
+
+        reaped = chat_mod._reap_stale_task_pins(sid)
+
+        assert reaped == ["task_zombie"]
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {"task_fresh"}
+        # Reaping consumes the bookkeeping so nothing leaks.
+        assert "task_zombie" not in chat_mod._bg_task_pinned_at
+        assert "task_zombie" not in chat_mod._bg_task_descriptions
+        # A fresh pin is never reaped, and the call is idempotent.
+        assert chat_mod._reap_stale_task_pins(sid) == []
+
+        # Last pin expiring drops the session entirely → background_active False.
+        chat_mod._bg_task_pinned_at["task_fresh"] = (
+            _time.time() - chat_mod._TASK_WATCH_TIMEOUT - 1)
+        assert chat_mod._reap_stale_task_pins(sid) == ["task_fresh"]
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        for tid in ("task_fresh", "task_zombie"):
+            chat_mod._bg_task_pinned_at.pop(tid, None)
+            chat_mod._bg_task_descriptions.pop(tid, None)
+
+
+def test_watcher_timeout_keeps_absolute_task_deadline_across_respawns(
+    stream_env, monkeypatch,
+):
+    chat_mod = stream_env
+    now = 10_000.0
+    timeout = float(chat_mod._TASK_WATCH_TIMEOUT)
+    monkeypatch.setattr(chat_mod.time, "time", lambda: now)
+    try:
+        chat_mod._bg_task_pinned_at["task_old"] = now - timeout + 100
+        chat_mod._bg_task_pinned_at["task_new"] = now - timeout + 800
+
+        first = chat_mod._task_watch_timeout_remaining(
+            {"task_old", "task_new"})
+        assert first == 800
+
+        # A replacement watcher gets the remaining lease, not a fresh timeout.
+        now += 125
+        replacement = chat_mod._task_watch_timeout_remaining(
+            {"task_old", "task_new"})
+        assert replacement == 675
+    finally:
+        chat_mod._bg_task_pinned_at.pop("task_old", None)
+        chat_mod._bg_task_pinned_at.pop("task_new", None)
+
+
+def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
+    chat_mod = stream_env
+    sid = "sid-watcher-without-pin"
+
+    class LiveWatcher:
+        @staticmethod
+        def done():
+            return False
+
+    try:
+        chat_mod._task_watchers[sid] = LiveWatcher()
+        assert chat_mod.session_active_status(sid) == {"active": False}
+
+        chat_mod._pin_background_task(sid, "task_live")
+        active = chat_mod.session_active_status(sid)
+        assert active["active"] is True
+        assert active["background"] is True
+        assert active["background_tasks_pending"] == 1
+    finally:
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._release_task_pins(sid, {"task_live"})

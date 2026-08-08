@@ -315,6 +315,10 @@ function portal() {
     // and the drop falls through to the browser, which opens the file
     // as a navigation away from muselab). See init() for the listeners.
     osFileDragging: false,
+    // The whole app is an OS-file drop surface.  Empty means workspace root;
+    // only a real directory row may set a nested destination.
+    osFileDropDir: "",
+    osFileDropOnDirectory: false,
     _dragCounter: 0,
     // Right-click context menu on a preview tab. { path, x, y } when open.
     previewTabCtxMenu: null,
@@ -371,6 +375,8 @@ function portal() {
     // nothing is open or the stat fetch 404s (stale/phantom tab).
     selectedMeta: null,
     _selectedMetaSeq: 0,
+    fileMetaClock: Date.now(),
+    _fileMetaClockTimer: null,
     // Set when a preview READ fails (404/413/403/…), so the unsupported empty
     // state can show a status-aware reason instead of always blaming the file
     // type. null = no error (genuine "unsupported type" or normal preview).
@@ -384,6 +390,27 @@ function portal() {
     previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false, truncated: false },
     _pfEls: [],
     PREVIEW_FIND_MAX_MATCHES: 500,
+    // Text selected in a parent-DOM file preview or a rendered chat bubble.
+    // The source snapshot is kept as plain serializable data; Range /
+    // Selection / DOM nodes never enter Alpine's reactive graph. HTML and PDF
+    // previews intentionally stay out of scope because their browsing
+    // contexts are sandboxed/browser-owned.
+    previewQuote: {
+      show: false, mode: "actions", source: "", role: "", sessionId: "",
+      messageId: "", text: "", path: "", question: "", followup: "",
+      x: 0, y: 0, above: false, truncated: false, sending: false,
+      askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
+      askAutoScroll: true,
+      // Ask mode starts anchored to the selection. The first title-bar drag
+      // converts x/y to viewport-relative top/left coordinates until close.
+      dragged: false, dragging: false,
+    },
+    _previewSelectionBound: false,
+    _previewSelectionTimer: null,
+    _previewQuoteDrag: null,
+    _previewQuoteConstraintFrame: null,
+    _previewQuoteResizeObserver: null,
+    PREVIEW_QUOTE_MAX_CHARS: 6000,
     _previewLoadSeq: 0,
     _previewAbort: null,
     // Path-bound, short-lived credentials for script-capable HTML iframes.
@@ -711,6 +738,11 @@ function portal() {
     _streamStartedAt: 0,
     pendingImages: [],    // [{id, mime, preview (data URL), uploading, error, file}]
     pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
+    // Selected preview/chat text attached to the current draft. Unlike the
+    // old quote action, these never rewrite `input`; they render as removable
+    // context chips above the composer and are folded into the actual prompt
+    // only when Send snapshots this exact tab's draft.
+    pendingQuotes: [],    // [{id, source, role, sessionId, messageId, path, text, truncated}]
     // Image annotation editor (L1: pen / rect / arrow / eraser + 5 colors + 3 sizes).
     // Opened via the ✎ button on an .img-chip. State is module-scoped on `this`
     // so the modal template can read it via x-show / :class. _baseBitmap is the
@@ -850,9 +882,11 @@ function portal() {
     mascotGreet: false,
 
     leftOpen: true,
-    rightOpen: true,
-    leftWidth: 280,
-    rightWidth: 440,
+    // Desktop's secondary right rail is the preview. Chat is the primary,
+    // always-mounted center pane and therefore has no open/closed flag.
+    previewOpen: true,
+    leftWidth: 340,
+    previewWidth: 440,
     showHidden: false,
     // ===== Trash =====
     // Files /delete moves into <ROOT>/.muselab-dustbin/ instead of unlink
@@ -1135,6 +1169,11 @@ function portal() {
           && focused && focused.closest && focused.closest(".terminal-host")) {
         return;
       }
+      // Composition candidate navigation/confirmation belongs wholly to the
+      // IME. Some WebViews report the commit Enter as an ordinary keydown
+      // immediately after compositionend; the per-element lifecycle guard
+      // below keeps global shortcuts from treating it as a real command.
+      if (this._isImeComposingEvent(ev)) return;
       // ---- Command palette ----
       // Cmd/Ctrl+K from anywhere opens it. While open, palette owns
       // ↑/↓/Enter; everything else falls through to the input.
@@ -1246,6 +1285,7 @@ function portal() {
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
         if (this.settings.show) { this.settings.show = false; return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
+        if (this.previewQuote.show) { this.dismissPreviewQuote(true); return; }
         // 退出编辑 — guard against silently discarding unsaved edits when ESC
         // is pressed out of habit (blur the focus). Only confirm when dirty.
         if (this.editing) { if (this._confirmLoseEdits()) this.editing = false; return; }
@@ -1329,6 +1369,7 @@ function portal() {
       this.configureMarked();
       this._initArtifacts();
       this._initStreamSelectionGuard();
+      this._initPreviewSelection();
       this._initAriaLabelMirror();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
@@ -1344,6 +1385,10 @@ function portal() {
       // picker, slash /resume, etc. without requiring each entry point
       // to remember to call _scrollTabIntoView.
       this.$watch("currentId", (tid) => {
+        if (this.previewQuote.show && this.previewQuote.sessionId
+            && this.previewQuote.sessionId !== tid) {
+          this.dismissTransientPreviewQuote(true);
+        }
         if (!tid) return;
         this.$nextTick(() => this._scrollTabIntoView(tid));
       });
@@ -1404,16 +1449,21 @@ function portal() {
       };
       document.addEventListener("dragenter", (e) => {
         if (!_hasFileType(e.dataTransfer)) return;
+        e.preventDefault();
+        e.stopPropagation();
         this._dragCounter++;
-        if (this._dragCounter === 1) this.osFileDragging = true;
-      });
+        this._setOsFileDropTarget(e.target);
+      }, true);
       document.addEventListener("dragleave", (e) => {
         // Some browsers (Firefox) don't expose types on dragleave; we
         // decrement unconditionally because every leave matches an
         // earlier enter and the counter floor at 0 prevents drift.
+        if (this._dragCounter <= 0) return;
+        e.preventDefault();
+        e.stopPropagation();
         if (this._dragCounter > 0) this._dragCounter--;
-        if (this._dragCounter === 0) this.osFileDragging = false;
-      });
+        if (this._dragCounter === 0) this._resetOsFileDragState();
+      }, true);
       // Required for drop to fire: dragover MUST be preventDefault'd at
       // some level. The preview overlay does this when visible, but for
       // areas of the page that aren't drop targets we also need a
@@ -1423,14 +1473,22 @@ function portal() {
       document.addEventListener("dragover", (e) => {
         if (!_hasFileType(e.dataTransfer)) return;
         e.preventDefault();
-      });
+        e.stopPropagation();
+        this._setOsFileDropTarget(e.target);
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      }, true);
       document.addEventListener("drop", (e) => {
-        // If the drop wasn't handled by an explicit zone (preview /
-        // chat input), suppress browser default and reset state.
-        if (_hasFileType(e.dataTransfer)) e.preventDefault();
-        this._dragCounter = 0;
-        this.osFileDragging = false;
-      });
+        if (!_hasFileType(e.dataTransfer)) return;
+        // Capture before the composer/preview/tree handlers: an OS file is a
+        // workspace upload, never an implicit chat attachment.  Internal tab
+        // and tree drags carry custom MIME types and never enter this branch.
+        e.preventDefault();
+        e.stopPropagation();
+        const dropTarget = this._externalFileDropTarget(e.target);
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+        this._resetOsFileDragState();
+        if (files.length) void this._uploadFilesToDir(dropTarget.dir, files);
+      }, true);
 
       // HTML preview bridge. Each live sandboxed frame reports image clicks,
       // readiness and internal scrolling through postMessage.
@@ -1535,16 +1593,28 @@ function portal() {
                       "ctxBreakdown:", JSON.stringify(this.ctxBreakdown));
         console.groupEnd();
       });
-      this.$watch("editing", v => v ? this.mountCM() : this.unmountCM());
-      // Removed: rightOpen toast ("Muse 回来了") — the panel opening is self-evident.
+      this.$watch("editing", v => {
+        this.dismissTransientPreviewQuote(true);
+        v ? this.mountCM() : this.unmountCM();
+      });
+      // Removed: pane-open toast — the panel opening is self-evident.
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
       this.$watch("selected", () => { if (this.editing) { this.unmountCM(); this.mountCM(); } });
       // Preview-header path + mtime strip: refresh the on-disk metadata
       // whenever the active file changes (tree click, tab switch, chat link,
       // boot restore). Fire once now too in case `selected` was restored
       // before this watcher attached.
-      this.$watch("selected", (p) => this.loadSelectedMeta(p));
+      this.$watch("selected", (p) => {
+        this.dismissTransientPreviewQuote(true);
+        this.loadSelectedMeta(p);
+      });
       this.loadSelectedMeta(this.selected);
+      // Relative file times should age naturally while a preview remains
+      // open. One shared minute tick is enough; never attach a timer or stat
+      // request to each tree row.
+      this._fileMetaClockTimer = setInterval(() => {
+        this.fileMetaClock = Date.now();
+      }, 60_000);
       // beforeunload guard for the editor: register a handler ONLY while there
       // are unsaved edits, and remove it the moment they're saved/discarded.
       // Attaching beforeunload unconditionally would defeat the browser's
@@ -1604,7 +1674,8 @@ function portal() {
     // shrinks the layout with no keyboard present → a big blank band appears
     // at the bottom of the chat. Zeroing the inset here keeps the two CSS
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
-    onChatInputBlur() {
+    onChatInputBlur(ev) {
+      this._resetImeCompositionState(ev);
       document.body.classList.remove("kb-open");
       document.documentElement.style.setProperty("--kb-inset", "0px");
       this._scheduleMobileRootReset();
@@ -2675,7 +2746,7 @@ function portal() {
     },
     greetMascot(msg) {
       // 去重：同一条 msg 在 1.5s 内重复调用只 toast 一次（Alpine $watch 在某些场景会双触发，
-      // 比如 rightOpen 既被 loadPrefs 写又被点击 toggle 时的 render 顺序）。
+      // 比如 previewOpen 既被 loadPrefs 写又被点击 toggle 时的 render 顺序）。
       const now = Date.now();
       if (msg && this._lastGreetMsg === msg && now - this._lastGreetAt < 1500) {
         return;
@@ -3021,7 +3092,8 @@ function portal() {
     },
     async onAttachDrop(ev) {
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
-      for (const f of files) await this._attachFile(f);
+      this._resetOsFileDragState();
+      await this._uploadFilesToDir("", files);
     },
     async onImagePaste(ev) {
       // Only handle pasted image data; let normal text paste through.
@@ -3773,8 +3845,11 @@ function portal() {
     // Compact, no decimals at minute granularity — second-precision past
     // ~30s adds visual noise without information value.
     fmtStreamElapsed(secs) {
-      if (!secs || secs < 1) return "";
-      const s = Math.floor(secs);
+      if (secs === null || secs === undefined || secs === "") return "";
+      const numeric = Number(secs);
+      if (!Number.isFinite(numeric) || numeric < 0) return "";
+      if (numeric < 1) return "<1s";
+      const s = Math.floor(numeric);
       if (s < 60) return `${s}s`;
       const m = Math.floor(s / 60);
       const rs = s % 60;
@@ -3798,6 +3873,54 @@ function portal() {
       const D = String(d.getDate()).padStart(2, "0");
       if (d.getFullYear() === now.getFullYear()) return `${M}-${D} ${hh}:${mm}`;
       return `${d.getFullYear()}-${M}-${D} ${hh}:${mm}`;
+    },
+    turnFooterStatus(m, pane) {
+      const stored = String((m && m.turn_status)
+        || (m && m._interrupted ? "cancelled" : "")
+        || (m && m._failed ? "failed" : ""));
+      if (stored) return stored;
+      // Fresh live bubbles are created before the terminal done payload can
+      // stamp turn_status.  A canonical historical footer already has ts, so
+      // never relabel such a prior turn just because a newer stream is active.
+      if (pane && pane.streaming && m && !m.ts) return "running";
+      // Compatibility for cached/front-end-injected records created before
+      // turn_status became part of the footer contract.  Their terminal `ts`
+      // is already durable proof that the turn closed; keep the footer and
+      // point-fork action available until the next canonical reload enriches
+      // the record with an explicit status.
+      if (m && m.ts) return "completed";
+      return "";
+    },
+    turnStatusLabel(status) {
+      const value = String(status || "");
+      if (value === "running") return this.lang === "zh" ? "运行中" : "Running";
+      if (value === "completed") return this.lang === "zh" ? "已完成" : "Completed";
+      if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
+      return this.lang === "zh" ? "已中断" : "Interrupted";
+    },
+    turnFooterTime(m, pane) {
+      const status = this.turnFooterStatus(m, pane);
+      if (status === "running") {
+        return Number((m && m.turn_started_at)
+          || (pane && pane._streamStartedAt) || (m && m.mts) || 0);
+      }
+      return Number((m && (m.ts || m.mts || m.turn_started_at)) || 0);
+    },
+    turnFooterElapsed(m, pane) {
+      const value = this.turnFooterStatus(m, pane) === "running"
+        ? Math.max(
+            Number((m && m.elapsed) || 0),
+            Number((pane && pane.streamElapsed) || 0),
+          )
+        : Number(m && m.elapsed);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    },
+    turnFooterModel(m, pane, sid) {
+      const live = String((m && m.model)
+        || (pane && pane.streamingModel) || "");
+      if (live) return live;
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      return String((meta && meta.model) || "");
     },
     // True when index i in messages[] is the tail of a turn — i.e. it
     // is muse-side AND the next message is either nonexistent or
@@ -4941,14 +5064,161 @@ function portal() {
       try { t.action && t.action.onClick && t.action.onClick(); }
       finally { this.dismissToast(t.id); }
     },
+    // ── Background-task settle feedback ────────────────────────────────────
+    // One agentic turn can settle dozens of Agent/Bash background tasks within
+    // a couple of seconds. Toasting each one unconditionally (the pre-2026-08-04
+    // behaviour) overflowed MAX_TOASTS instantly: the user saw a wall of
+    // identical "后台任务已完成" cards, the useful ones (failures) scrolled out
+    // of the stack, and every push+splice re-rendered the fixed overlay. Two
+    // guards here:
+    //   1. per-task_id dedup — a terminal state is reported at most once, so a
+    //      replayed continuation broadcast or a duplicate backend publisher
+    //      cannot re-toast the same task;
+    //   2. a short coalescing window — settles landing inside it collapse into
+    //      ONE toast that counts them by outcome.
+    // The task CARD is unaffected: applyTaskStatus still flips every card
+    // individually and immediately. This only governs the transient overlay.
+    _noteBackgroundTaskSettled(taskId, state, alreadyReported = false) {
+      const zh = this.lang === "zh";
+      // Terminal-state names as they arrive from the SSE payload; anything
+      // unrecognized is bucketed as a plain completion ("done").
+      const bucket = state === "failed" ? "failed"
+        : state === "stopped" ? "stopped" : "completed";
+      if (taskId) {
+        this._bgToastSeen = this._bgToastSeen || new Map();
+        if (this._bgToastSeen.has(taskId)) return;
+        this._bgToastSeen.set(taskId, bucket);
+        // Bound the dedup ledger. Terminal states never revert, so evicting
+        // the oldest entries can only re-admit a task that settled hundreds of
+        // tasks ago — long past any replay window.
+        if (this._bgToastSeen.size > 500) {
+          const drop = this._bgToastSeen.size - 500;
+          let i = 0;
+          for (const k of this._bgToastSeen.keys()) {
+            if (i++ >= drop) break;
+            this._bgToastSeen.delete(k);
+          }
+        }
+      } else if (alreadyReported) {
+        // No id to dedup on, but the server already published this exact
+        // transition through its other publisher — don't double-count it.
+        return;
+      }
+      this._bgToastBatch = this._bgToastBatch
+        || { completed: 0, failed: 0, stopped: 0 };
+      this._bgToastBatch[bucket] += 1;
+      if (this._bgToastTimer) return;
+      this._bgToastTimer = setTimeout(() => {
+        this._bgToastTimer = null;
+        const batch = this._bgToastBatch
+          || { completed: 0, failed: 0, stopped: 0 };
+        this._bgToastBatch = null;
+        const total = batch.completed + batch.failed + batch.stopped;
+        if (!total) return;
+        if (total === 1) {
+          const label = batch.failed ? (zh ? "后台任务失败" : "Background task failed")
+            : batch.stopped ? (zh ? "后台任务已停止" : "Background task stopped")
+              : (zh ? "后台任务已完成" : "Background task finished");
+          this.toast(label, batch.failed ? "error" : "info");
+          return;
+        }
+        const parts = [];
+        if (batch.completed) {
+          parts.push(zh ? `${batch.completed} 个已完成`
+            : `${batch.completed} finished`);
+        }
+        if (batch.failed) {
+          parts.push(zh ? `${batch.failed} 个失败` : `${batch.failed} failed`);
+        }
+        if (batch.stopped) {
+          parts.push(zh ? `${batch.stopped} 个已停止` : `${batch.stopped} stopped`);
+        }
+        const body = zh
+          ? `后台任务：${parts.join("、")}`
+          : `Background tasks: ${parts.join(", ")}`;
+        this.toast(body, batch.failed ? "error" : "info");
+      }, 700);
+    },
 
     // Enter pressed while a CJK IME is composing confirms the highlighted
     // candidate; it must not also submit the surrounding prompt or rename.
     // `isComposing` is the standard signal, while keyCode/which 229 and
     // key="Process" cover older Safari/WebView and Windows IME variants.
+    //
+    // Chromium WebViews and Safari can emit compositionend just BEFORE the
+    // very same candidate-confirming Enter, with isComposing=false and
+    // keyCode=13. Track the textarea lifecycle directly and treat an Enter in
+    // that short event window as part of the commit. DOM-local fields avoid
+    // reactive writes while the native IME buffer is live.
+    onImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      target._museImeComposing = true;
+      target._museImeEndedAt = 0;
+
+      // Alpine's x-model effect is allowed to write `textarea.value` whenever
+      // the root `input` value changes.  That is normally harmless, but a
+      // programmatic draft/session reconciliation that lands while Windows
+      // Pinyin / macOS marked text is active makes Chromium replace the
+      // native composition buffer without emitting compositionend.  The
+      // textarea then remains the IME's stale target: plain Latin input still
+      // works, while switching back to Chinese can stay broken until the page
+      // is restarted.
+      //
+      // Keep the DOM-owned marked text authoritative for this short window.
+      // Input events still update Alpine's model; only model -> DOM writes are
+      // deferred.  We restore Alpine's original hook and synchronize the
+      // committed DOM value in compositionend/blur below.
+      if (!target._museImeOriginalForceModelUpdate
+          && typeof target._x_forceModelUpdate === "function") {
+        const original = target._x_forceModelUpdate;
+        target._museImeOriginalForceModelUpdate = original;
+        target._x_forceModelUpdate = value => {
+          if (target._museImeComposing) {
+            target._museImeDeferredModelValue = value;
+            return;
+          }
+          original(value);
+        };
+      }
+    },
+    onImeCompositionEnd(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._finishImeComposition(target);
+      target._museImeEndedAt = Number(ev.timeStamp) || 0;
+    },
+    _finishImeComposition(target) {
+      if (!target) return;
+      target._museImeComposing = false;
+      const original = target._museImeOriginalForceModelUpdate;
+      if (typeof original === "function") {
+        target._x_forceModelUpdate = original;
+      }
+      delete target._museImeOriginalForceModelUpdate;
+      delete target._museImeDeferredModelValue;
+      // Safari/WebView may fire compositionend before its final non-composing
+      // input event.  Commit the DOM value now; the later input is idempotent.
+      // This also deliberately lets the user's marked text win over a stale
+      // programmatic draft write that was deferred above.
+      if (this.input !== target.value) this.input = target.value;
+    },
+    _resetImeCompositionState(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._finishImeComposition(target);
+      target._museImeEndedAt = 0;
+    },
     _isImeComposingEvent(ev) {
-      return !!(ev && (ev.isComposing || ev.keyCode === 229 || ev.which === 229
-        || ev.key === "Process"));
+      if (!ev) return false;
+      const target = ev.target || ev.currentTarget;
+      const endedAt = Number(target && target._museImeEndedAt) || 0;
+      const eventAt = Number(ev.timeStamp) || 0;
+      const commitEnter = ev.key === "Enter" && endedAt > 0
+        && eventAt >= endedAt && eventAt - endedAt <= 80;
+      return !!(ev.isComposing || ev.keyCode === 229 || ev.which === 229
+        || ev.key === "Process" || (target && target._museImeComposing)
+        || commitEnter);
     },
     _claimNonImeEnter(ev) {
       if (!ev || this._isImeComposingEvent(ev)) return false;
@@ -5044,7 +5314,7 @@ function portal() {
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 7,          // v7 remembers the selected terminal profile
+        schema: 9,          // v9 gives the desktop file manager useful room
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
@@ -5058,8 +5328,8 @@ function portal() {
         activeWorkspace: this.activeWorkspace,
         workspaceLastSession: this.workspaceLastSession,
         workspaceSurfaces: this.workspaceSurfaces,
-        leftOpen: this.leftOpen, rightOpen: this.rightOpen,
-        leftWidth: this.leftWidth, rightWidth: this.rightWidth,
+        leftOpen: this.leftOpen, previewOpen: this.previewOpen,
+        leftWidth: this.leftWidth, previewWidth: this.previewWidth,
         showHidden: this.showHidden,
         openFilesCollapsed: this.openFilesCollapsed,
         openFilesHeight: this.openFilesHeight,
@@ -5118,9 +5388,21 @@ function portal() {
           this.workspaceSurfaces = p.workspaceSurfaces;
         }
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
-        if (typeof p.rightOpen === "boolean") this.rightOpen = p.rightOpen;
-        if (typeof p.leftWidth === "number") this.leftWidth = p.leftWidth;
-        if (typeof p.rightWidth === "number") this.rightWidth = p.rightWidth;
+        if (typeof p.leftWidth === "number") {
+          // v8 shipped the file manager at 280px.  Migrating only that exact
+          // old default gives existing users the roomier desktop layout while
+          // preserving any width they deliberately resized themselves.
+          this.leftWidth = this._loadedPrefsSchema < 9
+            && Math.abs(p.leftWidth - 280) <= 1
+            ? 340 : p.leftWidth;
+        }
+        // v7's rightOpen/rightWidth described the CHAT rail. In v8 chat is the
+        // always-visible center pane and PREVIEW owns the right rail. Preserve
+        // a useful old width, but never turn an old hidden-chat preference into
+        // a hidden preview on first load — the new layout should arrive intact.
+        if (typeof p.previewOpen === "boolean") this.previewOpen = p.previewOpen;
+        if (typeof p.previewWidth === "number") this.previewWidth = p.previewWidth;
+        else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
         if (Array.isArray(p.openTabIds)) this.openTabIds = p.openTabIds;
@@ -5153,11 +5435,10 @@ function portal() {
         if (typeof p.desktopFullPane === "string"
             && ["", "preview", "chat"].includes(p.desktopFullPane)) {
           this.desktopFullPane = p.desktopFullPane;
-          // Mirror toggleDesktopFull's invariant: fullscreen chat needs the
-          // right pane open or it restores to a blank screen (chat is hidden
-          // by .pane-hidden when rightOpen is false). rightOpen is restored
-          // just above, but guard against a persisted false slipping through.
-          if (p.desktopFullPane === "chat") this.rightOpen = true;
+          // Mirror toggleDesktopFull's invariant: fullscreen preview needs its
+          // optional right rail open or `.pane-hidden` would win over the
+          // fullscreen grid rule and restore a blank screen.
+          if (p.desktopFullPane === "preview") this.previewOpen = true;
         }
         if (typeof p.openFilesCollapsed === "boolean") this.openFilesCollapsed = p.openFilesCollapsed;
         // null = auto-fit; only restore an explicit user override.
@@ -5621,10 +5902,12 @@ function portal() {
       return null;
     },
     _isClaudeModel(model) {
-      return (model || "").startsWith("claude-");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return m.startsWith("claude-");
     },
     _isClaudeXHighModel(model) {
-      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(model || "");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(m);
     },
     _isCodexModel(model) {
       const m = model || "";
@@ -6325,6 +6608,7 @@ function portal() {
           _activated: false,
           pendingImages: [],
           pendingDocs: [],
+          pendingQuotes: [],
           _historyIndex: -1,
           _historyDraft: "",
           _sendWaitingForUpload: false,
@@ -6428,6 +6712,11 @@ function portal() {
         // quota/auth error and confuse the user). Cleared by explicit
         // resume-queue or discard-queue actions on the failed user bubble.
         _queuePaused: false,
+        // Durable queue mutations are async.  Track them per action/item so a
+        // double-click cannot issue duplicate DELETE/resume requests, and so
+        // an edit is never copied back into the composer unless the server
+        // actually removed the queued original.
+        _queueMutating: {},
         // True only during _attachToServerTurn's poll window (between a turn's
         // done and the server starting the next queued turn) — suppresses the
         // idle "Queue waiting" banner so it doesn't flash mid-drain.
@@ -6520,6 +6809,10 @@ function portal() {
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
       }
+      if (!Array.isArray(st.draft.pendingQuotes)) st.draft.pendingQuotes = [];
+      if (!st._queueMutating || typeof st._queueMutating !== "object") {
+        st._queueMutating = {};
+      }
       return st;
     },
 
@@ -6589,6 +6882,11 @@ function portal() {
     setMobileTab(next) {
       if (!["files", "preview", "chat"].includes(next) || next === this.mobileTab) return;
       const previous = this.mobileTab;
+      if ((previous === "preview" && next !== "preview")
+          || (previous === "chat" && next !== "chat"
+              && this.previewQuote.source === "chat")) {
+        this.dismissTransientPreviewQuote(true);
+      }
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
       const tabSeq = this._mobileTabSeq = (this._mobileTabSeq || 0) + 1;
@@ -6687,6 +6985,10 @@ function portal() {
         return {
           id: it.id,
           text: it.text || "",
+          displayText: Object.prototype.hasOwnProperty.call(it, "display_text")
+            ? (it.display_text || "") : (it.text || ""),
+          pendingQuotes: Array.isArray(it.selection_quotes)
+            ? it.selection_quotes : [],
           image_ids: it.image_ids || "",
           hasAttach: !!((it.image_ids || "").trim()),
           images,
@@ -6702,6 +7004,35 @@ function portal() {
     _currentQueueLen() {
       const st = this.tabState[this.currentId];
       return (st && st.pendingQueue) ? st.pendingQueue.length : 0;
+    },
+    queueActionBusy(sid, key) {
+      const st = sid && this.tabState[sid];
+      return !!(st && st._queueMutating && st._queueMutating[key]);
+    },
+    _setQueueActionBusy(st, key, busy) {
+      if (!st || !key) return;
+      const next = { ...(st._queueMutating || {}) };
+      if (busy) next[key] = true;
+      else delete next[key];
+      // Replace the object so Alpine sees keys introduced after mount.
+      st._queueMutating = next;
+    },
+    async _runQueueMutation(sid, st, key, url, options, failureZh, failureEn) {
+      if (!sid || !st || this.tabState[sid] !== st
+          || this.queueActionBusy(sid, key)) return null;
+      this._setQueueActionBusy(st, key, true);
+      try {
+        const r = await fetch(url, options);
+        if (!r.ok) throw new Error(`queue mutation failed: HTTP ${r.status}`);
+        return r;
+      } catch (_e) {
+        if (this.tabState[sid] === st) {
+          this.toast(this.lang === "zh" ? failureZh : failureEn, "error", 3500);
+        }
+        return null;
+      } finally {
+        if (this.tabState[sid] === st) this._setQueueActionBusy(st, key, false);
+      }
     },
     async _enqueueMessage(sid, item) {
       this._ensureTabState(sid);
@@ -6729,6 +7060,8 @@ function portal() {
           // drain replays the turn under this mode (fixes queued messages
           // bypassing tool approval the UI said was required).
           body: JSON.stringify({ text: item.text || "", image_ids,
+                                 display_text: item.displayText || "",
+                                 selection_quotes: item.pendingQuotes || [],
                                  permission,
                                  plan_return_permission: planReturnPermission }),
         });
@@ -7034,7 +7367,7 @@ function portal() {
           }
         } catch (_e) {}
         if (contFound) return;   // continuation replay will flip the card
-        // FALLBACK reconciliation, every 4th tick (~32s): pull the history
+        // FALLBACK reconciliation, every 16th tick (~32s): pull the history
         // tail and stamp terminal task_status onto still-running cards. This
         // covers the cases the /active probe can't see — the watcher died
         // (server restart), the continuation's 60s TTL expired before a
@@ -7044,7 +7377,7 @@ function portal() {
         // 2026-06-11 when the typed-message path made the continuation
         // broadcast reliable.
         this._bgContTickN = (this._bgContTickN || 0) + 1;
-        if (this._bgContTickN % 4 !== 0) return;
+        if (this._bgContTickN % 16 !== 0) return;
         try {
           const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
                                   { headers: this.hdr() });
@@ -7110,7 +7443,14 @@ function portal() {
             { headers: this.hdr(), signal: controller.signal },
           );
           if (!stillOwned()) return;
-          if (!activeResponse.ok || !!(await activeResponse.json()).active) {
+          let activity = null;
+          try { activity = activeResponse.ok ? await activeResponse.json() : null; }
+          catch (_) { activity = null; }
+          // A detached background task has no live transcript writer.  It must
+          // not hold the just-finished foreground turn's canonical merge behind
+          // 30 repeated /active probes for the life of `sleep 20s`.  A real
+          // turn/continuation (active without background) still owns the pane.
+          if (!activity || (activity.active && !activity.background)) {
             retry();
             return;
           }
@@ -7161,10 +7501,15 @@ function portal() {
       if (!st || !st.pendingQueue) return;
       const item = st.pendingQueue[idx];
       if (!item) return;
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const key = "remove:" + item.id;
+      const r = await this._runQueueMutation(
+        sid, st, key,
+        "/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
+        { method: "DELETE", headers: this.hdr() },
+        "移除排队消息失败，原消息仍保留",
+        "Could not remove the queued message; it is still queued",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
     },
     async editPendingQueueItem(sid, idx) {
@@ -7179,16 +7524,27 @@ function portal() {
       if (!item) return;
       // Snapshot before _syncQueueFromServer wipes the mirror.
       const text = item.text || "";
+      const displayText = Object.prototype.hasOwnProperty.call(item, "displayText")
+        ? (item.displayText || "") : text;
+      const quotes = (item.pendingQuotes || []).slice();
       const imgs = (item.images || []).slice();
       const docs = (item.docs || []).slice();
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const key = "edit:" + item.id;
+      const r = await this._runQueueMutation(
+        sid, st, key,
+        "/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
+        { method: "DELETE", headers: this.hdr() },
+        "编辑排队消息失败，原消息仍保留",
+        "Could not edit the queued message; the original is still queued",
+      );
+      // Never create an editable duplicate when DELETE failed.  Previously the
+      // draft was restored unconditionally, so re-send could execute both the
+      // untouched queue item and its apparent replacement.
+      if (!r) return;
       await this._syncQueueFromServer(sid);
       if (this.tabState[sid] !== st) return;
       const draft = st.draft;
-      draft.input = text;
+      draft.input = displayText;
       // Rebuild the input-tray chips. No `file` on restored images, so the
       // in-chip "Annotate" button stays disabled (it guards on `!img.file`),
       // but the thumbnail + re-send path work fully.
@@ -7200,6 +7556,9 @@ function portal() {
         id: d.id, name: d.name, kind: d.kind,
         uploading: false, error: false,
       })));
+      draft.pendingQuotes.splice(
+        0, draft.pendingQuotes.length, ...quotes.map(q => ({ ...q })),
+      );
       if (sid === this.currentId) {
         this._activateComposerState(sid);
         this.$nextTick(() => {
@@ -7213,21 +7572,34 @@ function portal() {
       // turn it starts. Also the manual "kick" for the post-restart case —
       // the server intentionally does NOT auto-resume draining on boot, so
       // dormant items wait here until the user hits Resume.
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/pause", {
+      const st = this.tabState[sid];
+      if (!st) return;
+      const r = await this._runQueueMutation(
+        sid, st, "resume",
+        "/api/chat/sessions/" + sid + "/queue/pause",
+        {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
           body: JSON.stringify({ paused: false }),
-        });
-      } catch (_e) {}
+        },
+        "继续队列失败，请检查连接后重试",
+        "Could not resume the queue; check the connection and retry",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
       this._drainPendingQueue(sid);
     },
     async discardQueue(sid) {
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue",
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const st = this.tabState[sid];
+      if (!st) return;
+      const r = await this._runQueueMutation(
+        sid, st, "discard",
+        "/api/chat/sessions/" + sid + "/queue",
+        { method: "DELETE", headers: this.hdr() },
+        "清空队列失败，消息仍保留",
+        "Could not discard the queue; messages are still queued",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
@@ -7265,6 +7637,7 @@ function portal() {
       st.draft.input = this.input || "";
       st.draft.pendingImages = this.pendingImages || [];
       st.draft.pendingDocs = this.pendingDocs || [];
+      st.draft.pendingQuotes = this.pendingQuotes || [];
       st.draft._sendWaitingForUpload = !!this._sendWaitingForUpload;
       if (persist) this._persistChatDraft(id, st.draft.input);
     },
@@ -7275,6 +7648,7 @@ function portal() {
       this.input = draft.input || "";
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
+      this.pendingQuotes = draft.pendingQuotes;
       this._sendWaitingForUpload = !!draft._sendWaitingForUpload;
       this.$nextTick(() => {
         if (this.currentId === id && this.$refs.chatInput) {
@@ -7854,12 +8228,16 @@ function portal() {
             if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
               return false;
             }
+            // Same brake as _checkActiveTurn: this is a second, independent
+            // reconnect source, and it used to zero _reconnectAttempts right
+            // before sending — which is one of the reasons MAX_ATTEMPTS never
+            // bit. Ask the shared gate instead of resetting the counter.
+            if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;
             try { st.es.close(); } catch (_) {}
             if (st._stallWatch) clearInterval(st._stallWatch);
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
-            st._reconnectAttempts = 0;
             if (sid === this.currentId) {
               this.es = null;
               this.streaming = false;
@@ -7967,7 +8345,11 @@ function portal() {
       st.backgroundTaskCount = 0;
       st._continuationAwaitingReaction = false;
       st._draining = false;
-      st._reconnectAttempts = 0;
+      // NOTE — do NOT reset _reconnectAttempts here. Retiring a stream means
+      // "give up on this transport and reconcile from canonical history", not
+      // "the turn is new". Zeroing it let the retire→reconnect→retire cycle
+      // run without ever reaching MAX_ATTEMPTS (2026-08-04 flicker storm).
+      // The counter is cleared when a genuinely new turn is submitted.
       st._serverActiveObserved = false;
       st.streamElapsed = 0;
       st._streamStartedAt = 0;
@@ -7978,6 +8360,53 @@ function portal() {
         this.streamElapsed = 0;
         this._streamStartedAt = 0;
       }
+    },
+
+    // Central brake on transparent reconnects. A reconnect is never cheap:
+    // TurnBroadcast.subscribe() replays the ENTIRE turn (measured 2026-08-04:
+    // 403 events / ~900 KB mid-turn), and send({reconnect:true}) first wipes
+    // the in-flight bubbles (`splice(lastUserIdx + 1)`) before re-pushing them
+    // one by one. Any path that can fire faster than a turn lasts therefore
+    // shows up as a continuous flicker storm — 2026-08-04 measured ~60 full
+    // teardown+replay cycles in 20-30 s, driven by list-poll reconciliation
+    // rather than by a real transport failure.
+    //
+    // The brake distinguishes a LOOP from a flaky network by spacing, not by a
+    // hard lifetime cap: a loop re-fires within seconds, while sleep/wake or a
+    // dropped link re-fires minutes apart. So the budget is per-turn and
+    // recovers once reconnects stop coming in a burst. Callers that are refused
+    // must NOT reconnect anyway — they wait for the next probe (10 s list poll,
+    // 18 s stall watchdog), or fall back to _scheduleCanonicalStreamReload,
+    // which is flicker-free because it waits for the turn to end and then
+    // quiet-loads canonical history.
+    _allowReconnect(sid, turnId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st) return false;
+      const MIN_GAP_MS = 1500;         // never twice in one visual beat
+      const BURST_MAX = 6;             // close-together reconnects per turn
+      const BURST_WINDOW_MS = 60_000;  // quiet this long ⇒ not a loop, reset
+      const key = String(turnId || st.activeTurnId || "");
+      const now = Date.now();
+      let last = Number(st._reconnectGateAt) || 0;
+      // A different turn is different work, and the 60 s idle window means a
+      // reconnect that far apart cannot be a loop. Either way, start clean —
+      // otherwise the spacing rule would refuse a legitimate attach to the
+      // NEXT turn (e.g. the queue drain, which attaches ~350 ms after `done`).
+      if (st._reconnectGateTurn !== key || (last && now - last >= BURST_WINDOW_MS)) {
+        st._reconnectGateTurn = key;
+        st._reconnectGateCount = 0;
+        last = 0;
+      }
+      if (last && now - last < MIN_GAP_MS) return false;
+      if ((Number(st._reconnectGateCount) || 0) >= BURST_MAX) {
+        // Budget spent in a burst ⇒ treat it as a loop. Stop replaying; let the
+        // turn finish and reconcile from canonical history instead.
+        this._scheduleCanonicalStreamReload(sid, st);
+        return false;
+      }
+      st._reconnectGateAt = now;
+      st._reconnectGateCount = (Number(st._reconnectGateCount) || 0) + 1;
+      return true;
     },
 
     _reconcileOpenSession(next) {
@@ -7994,9 +8423,18 @@ function portal() {
         const baselineN = Number(baseline);
         const hasBaseline = baseline !== undefined && Number.isFinite(baselineN);
         const newer = hasBaseline && newU > baselineN;
-        st._reconcileTargetUpdated = Math.max(
-          Number(st._reconcileTargetUpdated) || 0,
-          newU,
+        const priorTarget = Number(st._reconcileTargetUpdated) || 0;
+        const backgroundOnly = !!cur.background_active && !cur.turn_active;
+        const messageCountChanged = !!previous
+          && Number(cur.message_count || 0) !== Number(previous.message_count || 0);
+        const turnCountChanged = !!previous
+          && Number(cur.turn_count || 0) !== Number(previous.turn_count || 0);
+        // JSONL mtime can advance on task lifecycle/progress records even when
+        // no visible conversation row changed.  During a detached background
+        // gap, only count changes are evidence that the pane needs a canonical
+        // refresh; status/name/time updates belong to their own UI surfaces.
+        const visibleNewer = newer && (
+          !backgroundOnly || messageCountChanged || turnCountChanged
         );
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
@@ -8006,26 +8444,62 @@ function portal() {
           || !!(previous && previous.active)
           || (newer && streamAgeMs >= 5000)
         );
+        // A live SSE is the strongest evidence available that the turn is still
+        // running: it is a direct pipe to the turn itself, while the session
+        // list is a 10 s snapshot that can lag a turn start (or race a turn
+        // boundary). Retiring a HEALTHY transport on one such tick used to
+        // hand the pane to the reconnect path, which then replayed the whole
+        // turn and re-armed itself — the outer half of the 2026-08-04 flicker
+        // storm. Only retire when the transport itself agrees it is dead:
+        // closed readyState, or no inbound event (incl. the 15 s server ping)
+        // for longer than two ping intervals. A healthy stream just records
+        // the discrepancy and keeps the pane; its own `done` reconciles.
         if ((st.streaming || st.es) && serverSettled) {
-          this._retireStaleSessionStream(sid, st);
+          const sseSilentMs = Date.now() - (Number(st._lastSseActivity)
+            || Number(st._streamStartedAt) || Date.now());
+          const transportDead = !st.es
+            || Number(st.es.readyState) === 2
+            || sseSilentMs >= 32_000;
+          if (transportDead) this._retireStaleSessionStream(sid, st);
           st._pendingExternalUpdate = true;
         }
         if (st.streaming || st.es) {
-          if (newer) st._pendingExternalUpdate = true;
+          if (visibleNewer) st._pendingExternalUpdate = true;
           continue;
         }
 
-        const needsRefresh = !!cur.active || st._pendingExternalUpdate || newer;
+        // `cur.active` alone is NOT a reason to re-read the transcript. The
+        // session list reports active for the whole life of an in-flight turn
+        // *and* of any background task (`_sessions_with_inflight_tasks`), so
+        // treating it as "needs refresh" re-ran a full ?tail=300 quiet reload
+        // on every tick of that window — and loadSession's tail then probed
+        // /active and reconnected, closing the 2026-08-04 flicker loop.
+        // Refresh only on real evidence of new content; handle "server has a
+        // live turn but this tab owns no transport" as a separate attach-only
+        // path that costs one /active probe and no pane rewrite.
+        const needsRefresh = st._pendingExternalUpdate || visibleNewer;
+        const hasTurnActivityFlag = Object.prototype.hasOwnProperty.call(
+          cur, "turn_active",
+        );
+        const wantsAttach = (
+          hasTurnActivityFlag ? !!cur.turn_active
+            : (!!cur.active && !cur.background_active)
+        ) && !st.streaming && !st.es;
+        if (needsRefresh && newU > priorTarget) st._reconcileRetryN = 0;
+        if (needsRefresh) {
+          st._reconcileTargetUpdated = Math.max(priorTarget, newU);
+        }
         if (st._reconcilePromise) {
           if (needsRefresh) st._pendingExternalUpdate = true;
           continue;
         }
         if (!needsRefresh) {
           if (!hasBaseline && st._loaded && newU) st._seenUpdated = newU;
+          if (wantsAttach && st._loaded) this._checkActiveTurn(sid);
           continue;
         }
 
-        const attach = !!cur.active;
+        const attach = wantsAttach;
         st._pendingExternalUpdate = false;
         let succeeded = false;
         const task = (async () => {
@@ -8055,13 +8529,22 @@ function portal() {
             const stillBehind = target > 0 && (!hasSeen || target > seen);
             if (stillBehind) st._pendingExternalUpdate = true;
             else if (succeeded) st._pendingExternalUpdate = false;
+            // Bounded catch-up retry. The transcript can legitimately lag the
+            // list target by one round (a list response observed U2 while the
+            // transcript request already in flight still carried U1), so retry
+            // — but back off and stop. An unbounded 250 ms retry is a hot loop
+            // whenever the gap does NOT close, and each round costs a full
+            // ?tail= reload of the visible pane (2026-08-04 flicker storm).
+            const retries = Number(st._reconcileRetryN) || 0;
+            if (!stillBehind) st._reconcileRetryN = 0;
             if (succeeded && stillBehind && !st.streaming && !st.es
-                && !st._reconcileRetryTimer) {
+                && !st._reconcileRetryTimer && retries < 6) {
+              st._reconcileRetryN = retries + 1;
               st._reconcileRetryTimer = setTimeout(() => {
                 st._reconcileRetryTimer = null;
                 const latest = (this.sessions || []).find(s => s && s.id === sid);
                 if (latest) this._reconcileOpenSession([latest]);
-              }, 250);
+              }, Math.min(2000, 250 * (retries + 1)));
             }
           }
         })();
@@ -8826,6 +9309,7 @@ function portal() {
           draft.input = "";
           draft.pendingImages.splice(0);
           draft.pendingDocs.splice(0);
+          draft.pendingQuotes.splice(0);
           draft._sendWaitingForUpload = false;
         }
         if (this.imageEditor.ownerSid === id) {
@@ -10811,9 +11295,7 @@ function portal() {
     },
 
     async onPreviewDrop(ev) {
-      this.previewDragHover = false;
-      this.osFileDragging = false;
-      this._dragCounter = 0;
+      this._resetOsFileDragState();
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
       const ownerWorkspace = this.fileWorkspacePath();
@@ -11224,6 +11706,27 @@ function portal() {
       if (!this._claimNonImeEnter(ev)) return;
       this.pickerCommitInlineRename();
     },
+    _applyRenamedSession(sid, name) {
+      const session = this.sessions.find(row => row.id === sid);
+      if (session) {
+        session.name = name;
+        session.auto_named = false;
+      }
+      // Activity rows carry a denormalized display name.  Patch the current
+      // browser synchronously after the successful request; the backend sends
+      // the same targeted row over Activity SSE so other tabs converge too.
+      // Never reload the conversation or the full Activity Center for a title
+      // change — both are unrelated surfaces and a reload can visibly churn
+      // their keyed DOM.
+      let activityChanged = false;
+      for (const item of this.activity.events || []) {
+        const itemSid = item.session_id || item.thread_id || "";
+        if (itemSid !== sid || item.session_name === name) continue;
+        item.session_name = name;
+        activityChanged = true;
+      }
+      if (activityChanged) this.activity.events = [...this.activity.events];
+    },
     async pickerCommitInlineRename() {
       const sid = this.renamingPickerSid;
       const name = (this.pickerRenameDraft || "").trim();
@@ -11238,8 +11741,7 @@ function portal() {
         body: JSON.stringify({ name }),
       });
       if (r.ok) {
-        cur.name = name;
-        cur.auto_named = false;
+        this._applyRenamedSession(sid, name);
       } else {
         this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
       }
@@ -11696,6 +12198,10 @@ function portal() {
         }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
+          // Rate-limited: a reconnect replays the whole turn over a wiped
+          // pane, and this probe runs from ~8 different pollers. Without the
+          // gate they compound into a visible reconnect storm (2026-08-04).
+          if (!this._allowReconnect(sid, d.turn_id)) return;
           // Reconnect any time the backend says there's an active turn.
           // get_session_api returns SDK-only messages (no broadcast
           // overlay), so loadSession's view is just the user msg — the
@@ -11823,6 +12329,16 @@ function portal() {
       // messages never blanks the conversation or jumps the scroll. Cold opens
       // and tab switches keep the normal skeleton + chunked-reveal path.
       const quiet = !!opts.quiet;
+      // probeActive:false → do NOT run _checkActiveTurn after the load.
+      // _checkActiveTurn reconnects whenever the backend reports a live turn,
+      // and a reconnect replays the entire turn over a wiped pane. Cold opens
+      // and tab switches genuinely need that probe (it's how a page reload
+      // re-attaches to a running turn), but the quiet reconciliation callers
+      // do NOT: each of them already probed /active itself and decided what to
+      // do, so probing again here just turned every poll-driven quiet reload
+      // into a reconnect — the inner half of the 2026-08-04 flicker loop.
+      const probeActive = opts.probeActive !== undefined
+        ? !!opts.probeActive : !quiet;
       const st = this._ensureTabState(sid);
       const runtimeSettingsGenerationAtLoad = st._runtimeSettingsGeneration;
       // A live stream owns st.messages and every SSE closure points directly at
@@ -11873,10 +12389,26 @@ function portal() {
         // pages in from the server via _fetchOlderWindow on "Load earlier".
         const _coldEarly = !this.appReady;
         const _mobileEarly = this._isMobileLayout();
-        const _initialLoadEarly = _mobileEarly
+        const _baseInitialLoad = _mobileEarly
           ? (_coldEarly ? 8 : 15)
           : (_coldEarly ? 30 : 60);
-        const FETCH_TAIL = _initialLoadEarly * 5;
+        // QUIET refresh must not shrink the pane. A quiet load is a merge into
+        // an ALREADY-PAINTED pane, and a long agentic turn can leave up to
+        // _mountedMessageCap() (300 desktop) bubbles mounted — far more than
+        // the cold-open window above. Loading the narrow window in that state
+        // spliced several hundred bubbles down to ~60 and pushed the rest into
+        // _earlierMessages: a violent height collapse + mass DOM teardown,
+        // which is the post-turn half of the "会话区刷新闪烁" report
+        // (2026-08-04). Widen the window (and the fetched tail) to at least
+        // what is currently mounted so a quiet merge is a true in-place morph.
+        // Cold opens and non-quiet loads keep the narrow, freeze-avoiding
+        // window — nothing is painted yet there, so there is nothing to
+        // preserve.
+        const _mountedNow = (quiet && Array.isArray(st.messages))
+          ? st.messages.length : 0;
+        const _quietFloor = Math.min(this._mountedMessageCap(), _mountedNow);
+        const _initialLoadEarly = Math.max(_baseInitialLoad, _quietFloor);
+        const FETCH_TAIL = Math.max(_baseInitialLoad * 5, _quietFloor);
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const controller = new AbortController();
         const timeout = setTimeout(
@@ -12017,9 +12549,12 @@ function portal() {
         // the original one-shot path — zero behaviour change for short sessions.
         let _deferHead = null;
         if (sid === this.currentId && quiet) {
-          // Quiet refresh: render the whole visible window synchronously (small —
-          // it's a refresh, not a cold open) so the in-place swap below morphs in
-          // fully-rendered bubbles with no deferred-head dance.
+          // Quiet refresh: render the whole visible window synchronously so the
+          // in-place swap below morphs in fully-rendered bubbles with no
+          // deferred-head dance. Not as costly as it looks even with the
+          // mounted-width floor above: _preserveCanonicalMessageIdentity has
+          // already reused the live objects, which keep their existing `html`,
+          // so renderMarkdown only does real work for genuinely new rows.
           visible.forEach(renderMarkdown);
         } else if (sid === this.currentId) {
           if (visible.length > INITIAL_LOAD) {
@@ -12149,7 +12684,7 @@ function portal() {
           // know the reply isn't done yet. A proper "reconnect SSE for
           // live streaming" UI is a larger refactor; for now we just
           // surface the state. The user can wait + reload to see more.
-          this._checkActiveTurn(sid);
+          if (probeActive) this._checkActiveTurn(sid);
           if (resolvedModel) this.model = resolvedModel;
           // Per-tab state owns the primitive; root permission is only the
           // currently visible selector mirror.
@@ -12467,7 +13002,12 @@ function portal() {
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
       const existingTail = existing[existing.length - 1];
       const liveFooter = existingTail && existingTail.role !== "user"
-        ? { ts: existingTail.ts, elapsed: existingTail.elapsed }
+        ? {
+            ts: existingTail.ts,
+            elapsed: existingTail.elapsed,
+            model: existingTail.model,
+            turn_status: existingTail.turn_status,
+          }
         : null;
       const candidates = new Map();
       for (const message of existing) {
@@ -12502,6 +13042,8 @@ function portal() {
         const liveFields = mountedKey.includes(":live:") ? {
           ts: matched.ts,
           elapsed: matched.elapsed,
+          model: matched.model,
+          turn_status: matched.turn_status,
           memoryRecall: matched.memoryRecall,
         } : null;
         const canonicalFields = { ...canonical };
@@ -12510,6 +13052,10 @@ function portal() {
         if (liveFields) {
           if (liveFields.ts) matched.ts = liveFields.ts;
           if (liveFields.elapsed) matched.elapsed = liveFields.elapsed;
+          if (liveFields.model && !matched.model) matched.model = liveFields.model;
+          if (liveFields.turn_status && !matched.turn_status) {
+            matched.turn_status = liveFields.turn_status;
+          }
           if (liveFields.memoryRecall) matched.memoryRecall = liveFields.memoryRecall;
         }
         matched._k = mountedKey;
@@ -12525,6 +13071,12 @@ function portal() {
         if (!canonicalTail.ts && liveFooter.ts) canonicalTail.ts = liveFooter.ts;
         if (!canonicalTail.elapsed && liveFooter.elapsed) {
           canonicalTail.elapsed = liveFooter.elapsed;
+        }
+        if (!canonicalTail.model && liveFooter.model) {
+          canonicalTail.model = liveFooter.model;
+        }
+        if (!canonicalTail.turn_status && liveFooter.turn_status) {
+          canonicalTail.turn_status = liveFooter.turn_status;
         }
       }
       return result;
@@ -12559,6 +13111,13 @@ function portal() {
       if (!Object.prototype.hasOwnProperty.call(m, "forkUuid")) m.forkUuid = "";
       if (!Object.prototype.hasOwnProperty.call(m, "ts")) m.ts = null;
       if (!Object.prototype.hasOwnProperty.call(m, "elapsed")) m.elapsed = 0;
+      if (!Object.prototype.hasOwnProperty.call(m, "model")) m.model = "";
+      if (!Object.prototype.hasOwnProperty.call(m, "turn_status")) {
+        m.turn_status = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "memoryRecall")) {
+        m.memoryRecall = null;
+      }
       this._assignLiveKey(st, m);
       const target = (st._laterMessages && st._laterMessages.length)
         ? st._laterMessages : st.messages;
@@ -13153,11 +13712,14 @@ function portal() {
         headers: { ...this.hdr(), "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
       });
-      if (r.ok) { await this.refreshSessions(); this.toast(this.t("toast.renamed"), "success"); }
+      if (r.ok) {
+        this._applyRenamedSession(cur.id, name);
+        this.toast(this.t("toast.renamed"), "success");
+      }
     },
 
     // ===== settings modal =====
-    async openSettings() {
+    async openSettings(activePage = "") {
       const r = await fetch("/api/settings", { headers: this.hdr() });
       if (!r.ok) {
         this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
@@ -13187,7 +13749,8 @@ function portal() {
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = this.isWideScreen ? "provider" : null;
+      this.settings.activePage = activePage === "memory"
+        ? "memory" : (this.isWideScreen ? "provider" : null);
       this.settings.show = true;
       // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
       // stays lazy because Codex quota refresh intentionally runs a CLI probe.
@@ -13195,6 +13758,11 @@ function portal() {
       this.refreshSkillList();
       this.loadClaudeAuthStatus();
       this.loadMemorySettings();
+    },
+
+    async openMemoryCenter(tab = "") {
+      if (tab) this.settings.memory.tab = tab;
+      await this.openSettings("memory");
     },
 
     _memoryConfigPayload() {
@@ -13242,12 +13810,7 @@ function portal() {
               : `${unseen.length} new Skill candidate(s) await review`,
             "info", 8000, {
               label: this.lang === "zh" ? "打开记忆中心" : "Open Memory Center",
-              onClick: async () => {
-                await this.openSettings();
-                this.settings.activePage = "memory";
-                this.settings.memory.tab = "skills";
-                await this.refreshMemoryCenter();
-              },
+              onClick: () => this.openMemoryCenter("skills"),
             });
           const merged = [...new Set([...seen, ...unseen])].slice(-100);
           this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
@@ -17157,6 +17720,7 @@ function portal() {
       return saved;
     },
     onPreviewViewportScroll() {
+      this.dismissTransientPreviewQuote(true);
       clearTimeout(this._previewViewSaveTimer);
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
@@ -18644,6 +19208,7 @@ function portal() {
 
     async openFile(n, opts = {}) {
       if (!n || !n.path) return false;
+      this.dismissTransientPreviewQuote(true);
       if (this.previewSurface === "terminal") this._teardownTerminalView();
       this.previewSurface = "file";
       // Clicking / double-clicking the file that already owns the editor is a
@@ -19216,17 +19781,86 @@ function portal() {
         if (!isOwner()) return;
         if (!r.ok) { this.selectedMeta = null; return; }
         const d = await r.json();
-        if (isOwner()) this.selectedMeta = d;
+        if (isOwner()) {
+          this.fileMetaClock = Date.now();
+          this.selectedMeta = d;
+        }
       } catch { if (isOwner()) this.selectedMeta = null; }
     },
-    // Format a unix-seconds mtime as "YYYY-MM-DD HH:mm" in local time for the
-    // preview-header strip. Returns "" for a falsy timestamp.
+    // Format a unix-seconds timestamp and its surrounding file metadata for
+    // the compact preview-header presentation below.
+    fileBreadcrumb(path) {
+      const parts = String(path || "").split("/").filter(Boolean);
+      parts.pop(); // the pane title already owns the basename
+      const root = this.lang === "zh" ? "根目录" : "Workspace root";
+      if (!parts.length) return root;
+      const tail = parts.slice(-3);
+      return `${parts.length > 3 ? "…" : root} › ${tail.join(" › ")}`;
+    },
+    // Exact local timestamp for metadata tooltips. The visible strip uses a
+    // quieter relative/calendar label instead.
     fmtMtime(ts) {
       if (!ts) return "";
       const d = new Date(ts * 1000);
       const p = (n) => String(n).padStart(2, "0");
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
-             + `${p(d.getHours())}:${p(d.getMinutes())}`;
+             + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    },
+    fmtRelativeMtime(ts) {
+      if (!ts) return "";
+      const nowMs = Number(this.fileMetaClock) || Date.now();
+      const then = new Date(Number(ts) * 1000);
+      const diffSeconds = Math.max(0, Math.floor((nowMs - then.getTime()) / 1000));
+      const zh = this.lang === "zh";
+      if (diffSeconds < 60) return zh ? "刚刚" : "just now";
+      if (diffSeconds < 3600) {
+        const minutes = Math.floor(diffSeconds / 60);
+        return zh ? `${minutes} 分钟前` : `${minutes} min ago`;
+      }
+      if (diffSeconds < 6 * 3600) {
+        const hours = Math.floor(diffSeconds / 3600);
+        return zh ? `${hours} 小时前` : `${hours} hr ago`;
+      }
+      const now = new Date(nowMs);
+      const dayKey = d => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      const clock = then.toLocaleTimeString(zh ? "zh-CN" : "en-US", {
+        hour: "2-digit", minute: "2-digit", hour12: !zh,
+      });
+      if (dayKey(then) === dayKey(now)) return zh ? `今天 ${clock}` : `Today ${clock}`;
+      const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+      if (dayKey(then) === dayKey(yesterday)) {
+        return zh ? `昨天 ${clock}` : `Yesterday ${clock}`;
+      }
+      if (then.getFullYear() === now.getFullYear()) {
+        return then.toLocaleDateString(zh ? "zh-CN" : "en-US", {
+          month: "short", day: "numeric",
+        });
+      }
+      return then.toLocaleDateString(zh ? "zh-CN" : "en-US", {
+        year: "numeric", month: "short", day: "numeric",
+      });
+    },
+    fileSizeTitle(value) {
+      const size = Number(value);
+      if (!Number.isFinite(size) || size < 0) return "";
+      const exact = new Intl.NumberFormat(
+        this.lang === "zh" ? "zh-CN" : "en-US",
+      ).format(Math.round(size));
+      return this.lang === "zh" ? `${exact} 字节` : `${exact} bytes`;
+    },
+    fileMetaTitle(meta) {
+      if (!meta) return "";
+      const parts = [];
+      const size = Number(meta.size);
+      if (Number.isFinite(size) && size >= 0) {
+        parts.push(`${this.fmtSize(size)}（${this.fileSizeTitle(size)}）`);
+      }
+      if (meta.mtime) {
+        parts.push(this.lang === "zh"
+          ? `修改于 ${this.fmtMtime(meta.mtime)}`
+          : `Modified ${this.fmtMtime(meta.mtime)}`);
+      }
+      return parts.join(" · ");
     },
     closeAllTabs() {
       if (!this.tabs.length) return;
@@ -19434,9 +20068,18 @@ function portal() {
       return "";
     },
     fmtSize(n) {
-      if (n < 1024) return n + "B";
-      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + "K";
-      return (n / 1024 / 1024).toFixed(1) + "M";
+      let value = Number(n);
+      if (!Number.isFinite(value) || value < 0) return "";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      if (unit === 0) return `${Math.round(value)} B`;
+      const digits = value >= 100 ? 0 : 1;
+      const compact = value.toFixed(digits).replace(/\.0$/, "");
+      return `${compact} ${units[unit]}`;
     },
     // Returns a Promise that resolves once every block in `root` is
     // highlighted AND artifacts (mermaid/HTML) are rendered. Most callers
@@ -19693,6 +20336,811 @@ function portal() {
           if (typeof fn === "function") fn();
         }
       });
+    },
+
+    // Selection actions live in the parent document so the same small helper
+    // works for rendered chat bubbles, Markdown, plain text/code and table
+    // previews without weakening the HTML iframe sandbox. PDF remains
+    // browser-owned and is deliberately unsupported here as well.
+    _initPreviewSelection() {
+      if (this._previewSelectionBound) return;
+      this._previewSelectionBound = true;
+      document.addEventListener("selectionchange", () => {
+        // Focusing the inline question field collapses the document selection.
+        // The selected source has already been snapshotted, so retain the ask
+        // panel until the user explicitly closes it or opens the full branch.
+        if (this.previewQuote.show && this.previewQuote.mode === "ask") return;
+        clearTimeout(this._previewSelectionTimer);
+        this._previewSelectionTimer = setTimeout(() => {
+          this._previewSelectionTimer = null;
+          this._syncPreviewSelection();
+        }, 60);
+      });
+      document.addEventListener("pointerdown", (ev) => {
+        const inPopover = ev.target && ev.target.closest
+          && ev.target.closest(".preview-selection-popover");
+        if (!inPopover) this.dismissTransientPreviewQuote(false);
+      }, true);
+      const onViewportResize = () => {
+        // Mobile keyboards can resize the visual viewport while the question
+        // textarea is focused. Do not interpret that as a cancellation.
+        if (this.previewQuote.show && this.previewQuote.mode !== "ask") {
+          this.dismissPreviewQuote(false);
+        } else if (this.previewQuote.show && this.previewQuote.dragged) {
+          this._schedulePreviewQuoteConstraint();
+        }
+      };
+      window.addEventListener("resize", onViewportResize);
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", onViewportResize);
+        window.visualViewport.addEventListener("scroll", onViewportResize);
+      }
+      this.$nextTick(() => {
+        const popover = this._previewQuoteElement();
+        if (!popover || !window.ResizeObserver) return;
+        this._previewQuoteResizeObserver = new ResizeObserver(() => {
+          // The compact answer grows while streaming. If the user parked the
+          // window near an edge, keep the growing shell in view without
+          // disturbing its position during ordinary content updates.
+          if (this.previewQuote.show && this.previewQuote.dragged
+              && !this.previewQuote.dragging) {
+            this._schedulePreviewQuoteConstraint();
+          }
+        });
+        this._previewQuoteResizeObserver.observe(popover);
+      });
+    },
+
+    _previewQuoteElement() {
+      return this.$refs.previewSelectionPopover
+        || document.querySelector(".preview-selection-popover");
+    },
+
+    _previewQuoteViewport() {
+      const viewport = window.visualViewport;
+      return {
+        left: viewport ? viewport.offsetLeft : 0,
+        top: viewport ? viewport.offsetTop : 0,
+        width: Math.max(1, viewport ? viewport.width : window.innerWidth),
+        height: Math.max(1, viewport ? viewport.height : window.innerHeight),
+      };
+    },
+
+    _clampPreviewQuotePosition(left, top, width, height) {
+      const viewport = this._previewQuoteViewport();
+      const margin = 12;
+      const minLeft = viewport.left + margin;
+      const minTop = viewport.top + margin;
+      const maxLeft = Math.max(
+        minLeft, viewport.left + viewport.width - Math.max(0, width) - margin,
+      );
+      const maxTop = Math.max(
+        minTop, viewport.top + viewport.height - Math.max(0, height) - margin,
+      );
+      return {
+        x: Math.min(maxLeft, Math.max(minLeft, Number(left) || 0)),
+        y: Math.min(maxTop, Math.max(minTop, Number(top) || 0)),
+      };
+    },
+
+    _constrainPreviewQuoteToViewport() {
+      if (!this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || !this.previewQuote.dragged || this.previewQuote.dragging) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover || !popover.getClientRects().length) return false;
+      const rect = popover.getBoundingClientRect();
+      const next = this._clampPreviewQuotePosition(
+        this.previewQuote.x, this.previewQuote.y, rect.width, rect.height,
+      );
+      if (next.x === this.previewQuote.x && next.y === this.previewQuote.y) {
+        return false;
+      }
+      this.previewQuote.x = next.x;
+      this.previewQuote.y = next.y;
+      return true;
+    },
+
+    _schedulePreviewQuoteConstraint() {
+      if (this._previewQuoteConstraintFrame != null) return;
+      const schedule = window.requestAnimationFrame || ((fn) => setTimeout(fn, 0));
+      this._previewQuoteConstraintFrame = schedule(() => {
+        this._previewQuoteConstraintFrame = null;
+        this._constrainPreviewQuoteToViewport();
+      });
+    },
+
+    startPreviewQuoteDrag(ev) {
+      if (!ev || !this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || (ev.button != null && ev.button !== 0)
+          || ev.isPrimary === false) return false;
+      const target = ev.target && ev.target.closest ? ev.target : null;
+      const head = target && target.closest(".preview-selection-ask-head");
+      if (!head || (target.closest
+          && target.closest("button, input, textarea, select, a"))) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover || !popover.contains(head)) return false;
+      const rect = popover.getBoundingClientRect();
+      const handle = ev.currentTarget || head;
+      this._previewQuoteDrag = {
+        pointerId: ev.pointerId,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        left: rect.left,
+        top: rect.top,
+        handle,
+      };
+      Object.assign(this.previewQuote, {
+        x: rect.left,
+        y: rect.top,
+        above: false,
+        dragged: true,
+        dragging: true,
+      });
+      try { handle.setPointerCapture(ev.pointerId); } catch (_) {}
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    movePreviewQuoteDrag(ev) {
+      const drag = this._previewQuoteDrag;
+      if (!drag || !ev || ev.pointerId !== drag.pointerId) return false;
+      const popover = this._previewQuoteElement();
+      if (!popover) return false;
+      const rect = popover.getBoundingClientRect();
+      const next = this._clampPreviewQuotePosition(
+        drag.left + ev.clientX - drag.startX,
+        drag.top + ev.clientY - drag.startY,
+        rect.width,
+        rect.height,
+      );
+      this.previewQuote.x = next.x;
+      this.previewQuote.y = next.y;
+      if (ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    finishPreviewQuoteDrag(ev) {
+      const drag = this._previewQuoteDrag;
+      if (!drag || (ev && ev.pointerId != null
+          && ev.pointerId !== drag.pointerId)) return false;
+      this._previewQuoteDrag = null;
+      this.previewQuote.dragging = false;
+      try {
+        if (drag.handle && drag.handle.hasPointerCapture
+            && drag.handle.hasPointerCapture(drag.pointerId)) {
+          drag.handle.releasePointerCapture(drag.pointerId);
+        }
+      } catch (_) {}
+      this._constrainPreviewQuoteToViewport();
+      if (ev && ev.cancelable) ev.preventDefault();
+      return true;
+    },
+
+    _cancelPreviewQuoteDrag() {
+      const drag = this._previewQuoteDrag;
+      this._previewQuoteDrag = null;
+      if (drag && drag.handle) {
+        try {
+          if (drag.handle.hasPointerCapture
+              && drag.handle.hasPointerCapture(drag.pointerId)) {
+            drag.handle.releasePointerCapture(drag.pointerId);
+          }
+        } catch (_) {}
+      }
+      this.previewQuote.dragging = false;
+    },
+
+    _previewSelectionHost(node) {
+      if (!node || this.previewSurface !== "file" || !this.selected) return null;
+      const body = this.$refs.previewBody;
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      if (!body || !el || !body.contains(el) || !el.closest) return null;
+      const host = el.closest(".markdown, pre.text, .xlsx-preview");
+      if (!host || !body.contains(host) || !host.getClientRects().length) return null;
+      if (this.editing) {
+        return host.matches(".markdown") && !!host.closest(".editor-live-preview")
+          ? host : null;
+      }
+      if (host.closest(".editor-wrap")) return null;
+      if (this.previewMode === "md" && host.matches(".markdown")) return host;
+      if (this.previewMode === "text" && host.matches("pre.text")) return host;
+      if (this.previewMode === "csv" && host.matches(".csv-preview")) return host;
+      if (this.previewMode === "xlsx" && host.matches(".xlsx-preview")
+          && !host.matches(".csv-preview")) return host;
+      return null;
+    },
+
+    _chatSelectionHost(node) {
+      if (!node || !this.currentId) return null;
+      const body = this.$refs.chatBody;
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      if (!body || !el || !body.contains(el) || !el.closest) return null;
+      if (el.closest("textarea, input, button, [contenteditable='true'], .edit-msg-wrap")) {
+        return null;
+      }
+      const pane = el.closest(".msg-pane[data-tid]");
+      if (!pane || pane.dataset.tid !== this.currentId || !body.contains(pane)
+          || !pane.getClientRects().length) return null;
+      const message = el.closest(".msg");
+      const bubble = el.closest(".bubble");
+      if (!message || !bubble || !message.contains(bubble)
+          || message.classList.contains("is-hidden") || !bubble.getClientRects().length) {
+        return null;
+      }
+      if (message.classList.contains("user")) {
+        const text = el.closest(".user-msg-text");
+        return text && bubble.classList.contains("user-bubble")
+          ? { host: bubble, role: "user", messageId: message.dataset.uuid || "" }
+          : null;
+      }
+      if (message.classList.contains("assistant")) {
+        return {
+          host: bubble,
+          role: "assistant",
+          messageId: message.dataset.uuid || "",
+        };
+      }
+      return null;
+    },
+
+    _syncPreviewSelection() {
+      if (this.previewQuote.show && this.previewQuote.mode === "ask") return;
+      const selection = window.getSelection && window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount) {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      const previewAnchor = this._previewSelectionHost(selection.anchorNode);
+      const previewFocus = this._previewSelectionHost(selection.focusNode);
+      const chatAnchor = previewAnchor ? null : this._chatSelectionHost(selection.anchorNode);
+      const chatFocus = previewAnchor ? null : this._chatSelectionHost(selection.focusNode);
+      let source = "";
+      let role = "";
+      let messageId = "";
+      if (previewAnchor && previewAnchor === previewFocus) {
+        source = "preview";
+      } else if (chatAnchor && chatFocus && chatAnchor.host === chatFocus.host
+                 && chatAnchor.role === chatFocus.role) {
+        source = "chat";
+        role = chatAnchor.role;
+        messageId = chatAnchor.messageId || "";
+      } else {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      let selectedText = String(selection.toString() || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\r\n?/g, "\n")
+        .trim();
+      if (!selectedText) {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      const truncated = selectedText.length > this.PREVIEW_QUOTE_MAX_CHARS;
+      if (truncated) {
+        selectedText = selectedText.slice(0, this.PREVIEW_QUOTE_MAX_CHARS).trimEnd();
+      }
+      const range = selection.getRangeAt(0);
+      const rects = Array.from(range.getClientRects()).filter(r => r.width || r.height);
+      const rect = rects[rects.length - 1] || range.getBoundingClientRect();
+      if (!rect || (!rect.width && !rect.height)) {
+        this.dismissPreviewQuote(false);
+        return;
+      }
+      const viewportWidth = Math.max(1, window.innerWidth || 0);
+      const viewportHeight = Math.max(1, window.innerHeight || 0);
+      const popoverHalf = Math.min(170, Math.max(70, (viewportWidth - 24) / 2));
+      const above = viewportHeight - rect.bottom < 220 && rect.top > 220;
+      Object.assign(this.previewQuote, {
+        show: true,
+        mode: "actions",
+        source,
+        role,
+        sessionId: this.currentId,
+        messageId,
+        text: selectedText,
+        path: source === "preview" ? this.selected : "",
+        question: "",
+        followup: "",
+        x: Math.min(viewportWidth - popoverHalf - 12,
+          Math.max(popoverHalf + 12, rect.left + rect.width / 2)),
+        y: above ? rect.top : rect.bottom,
+        above,
+        truncated,
+        sending: false,
+        askSessionId: "",
+        askSessionName: "",
+        askPrompt: "",
+        askError: "",
+        askAutoScroll: true,
+        dragged: false,
+        dragging: false,
+      });
+    },
+
+    dismissTransientPreviewQuote(clearSelection = false) {
+      // The tiny selection-actions bubble is contextual and should disappear
+      // when its selection loses ownership. Once expanded into an independent
+      // question, however, it is a real floating window: page clicks, file or
+      // chat switches, scrolling and editor changes must not close it. Only
+      // its close button, Escape, or "open full chat" dismisses that state.
+      if (!this.previewQuote.show || this.previewQuote.mode === "ask") {
+        return false;
+      }
+      this.dismissPreviewQuote(clearSelection);
+      return true;
+    },
+
+    dismissPreviewQuote(clearSelection = false) {
+      clearTimeout(this._previewSelectionTimer);
+      this._previewSelectionTimer = null;
+      this._cancelPreviewQuoteDrag();
+      Object.assign(this.previewQuote, {
+        show: false, mode: "actions", source: "", role: "", sessionId: "",
+        messageId: "", text: "", path: "", question: "", followup: "",
+        x: 0, y: 0, above: false, truncated: false, sending: false,
+        dragged: false, dragging: false, askSessionId: "",
+        askSessionName: "", askPrompt: "", askError: "", askAutoScroll: true,
+      });
+      if (clearSelection) {
+        try {
+          const selection = window.getSelection && window.getSelection();
+          if (selection) selection.removeAllRanges();
+        } catch (_) {}
+      }
+    },
+
+    _previewQuoteBlock(snapshot = this.previewQuote) {
+      const quote = String(snapshot.text || "")
+        .split("\n")
+        .map(line => "> " + line)
+        .join("\n");
+      const clipped = snapshot.truncated
+        ? (this.lang === "zh" ? "\n> …（选区过长，已截断）" : "\n> … (selection truncated)")
+        : "";
+      if (snapshot.source === "chat") {
+        const mine = snapshot.role === "user";
+        const label = this.lang === "zh"
+          ? (mine ? "引用自我的消息：" : "引用自 Muse 回复：")
+          : (mine ? "Quoted from my message:" : "Quoted from Muse:");
+        return `${label}\n\n${quote}${clipped}`;
+      }
+      const sourcePath = String(snapshot.path || this.selected || "")
+        .replace(/`/g, "\\`");
+      const label = this.lang === "zh" ? "引用自" : "Quoted from";
+      const colon = this.lang === "zh" ? "：" : ":";
+      return `${label} \`${sourcePath}\`${colon}\n\n${quote}${clipped}`;
+    },
+
+    previewQuoteExcerpt(snapshot = this.previewQuote) {
+      const text = String((snapshot && snapshot.text) || "")
+        .replace(/\s+/g, " ").trim();
+      return text.length > 120 ? text.slice(0, 120).trimEnd() + "…" : text;
+    },
+
+    previewQuoteSourceName(snapshot = this.previewQuote) {
+      if (snapshot && snapshot.source === "chat") {
+        if (snapshot.role === "user") {
+          return this.lang === "zh" ? "我的消息" : "My message";
+        }
+        return this.lang === "zh" ? "Muse 回复" : "Muse reply";
+      }
+      const path = String((snapshot && snapshot.path) || "");
+      return path.split("/").pop() || path;
+    },
+
+    previewQuoteSourceIcon(snapshot = this.previewQuote) {
+      if (snapshot && snapshot.source === "chat") {
+        return snapshot.role === "user" ? "#i-user" : "#i-brain";
+      }
+      return "#i-file-text";
+    },
+
+    _selectionQuoteSnapshot(snapshot = this.previewQuote) {
+      return {
+        id: this._uuid(),
+        source: snapshot.source || "preview",
+        role: snapshot.role || "",
+        sessionId: snapshot.sessionId || this.currentId || "",
+        messageId: snapshot.messageId || "",
+        path: snapshot.path || "",
+        text: snapshot.text || "",
+        truncated: !!snapshot.truncated,
+      };
+    },
+
+    _composerPromptText(input, quotes) {
+      const blocks = (quotes || [])
+        .filter(q => q && String(q.text || "").trim())
+        .map(q => this._previewQuoteBlock(q));
+      const body = String(input || "").trim();
+      if (body) blocks.push(body);
+      return blocks.join("\n\n").trim();
+    },
+
+    userSelectionQuotes(message) {
+      return Array.isArray(message && message.selectionQuotes)
+        ? message.selectionQuotes : [];
+    },
+
+    userVisibleText(message) {
+      if (!message) return "";
+      return Object.prototype.hasOwnProperty.call(message, "displayText")
+        ? (message.displayText || "") : (message.text || "");
+    },
+
+    quotePreviewSelection() {
+      if (!this.currentId || !this.previewQuote.show || !this.previewQuote.text) {
+        this.toast(this.lang === "zh" ? "请先打开一个会话" : "Open a chat first", "warn", 2200);
+        return false;
+      }
+      this._captureComposerState(this.currentId);
+      const draft = this._ensureTabState(this.currentId).draft;
+      if (draft.pendingQuotes.length >= 4) {
+        this.toast(
+          this.lang === "zh" ? "一次最多引用 4 段内容" : "Up to 4 quotes per message",
+          "warn", 2200,
+        );
+        return false;
+      }
+      draft.pendingQuotes.push(this._selectionQuoteSnapshot());
+      this.pendingQuotes = draft.pendingQuotes;
+      this.dismissPreviewQuote(true);
+      if (this._isMobileLayout()) this.setMobileTab("chat");
+      this.$nextTick(() => {
+        const ta = this.$refs.chatInput;
+        if (ta) ta.focus();
+      });
+      return true;
+    },
+
+    removePendingQuote(index) {
+      if (!Number.isInteger(index) || index < 0) return;
+      this.pendingQuotes.splice(index, 1);
+    },
+
+    openPreviewSelectionAsk() {
+      if (!this.previewQuote.show || !this.previewQuote.text) return;
+      this._cancelPreviewQuoteDrag();
+      this.previewQuote.mode = "ask";
+      this.previewQuote.dragged = false;
+      this.previewQuote.question = "";
+      this.previewQuote.followup = "";
+      this.previewQuote.askSessionId = "";
+      this.previewQuote.askSessionName = "";
+      this.previewQuote.askPrompt = "";
+      this.previewQuote.askError = "";
+      this.previewQuote.askAutoScroll = true;
+      this.$nextTick(() => {
+        // x-ref inside an x-if template is not guaranteed to join Alpine's
+        // root $refs collection on the same tick in every browser build.
+        const input = this.$refs.previewQuoteInput
+          || document.querySelector(".preview-selection-popover .preview-selection-ask textarea");
+        if (input) input.focus();
+      });
+    },
+
+    onPreviewQuoteAskEnter(ev) {
+      if (!ev || ev.isComposing || ev.keyCode === 229) return;
+      const isTouch = (window.matchMedia
+        && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
+      if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
+      ev.preventDefault();
+      this.sendPreviewSelectionQuestion();
+    },
+
+    async _createPreviewSelectionAskSession(snapshot, question) {
+      const sourceId = snapshot.sessionId || this.currentId;
+      const source = (this.sessions || []).find(s => s.id === sourceId);
+      const fallbackName = this.lang === "zh" ? "独立侧问" : "Side question";
+      const sourceName = (source && source.name) || (this.lang === "zh" ? "会话" : "Chat");
+      const questionHint = String(question || "").replace(/\s+/g, " ").trim().slice(0, 36);
+      const title = `${sourceName} · ${fallbackName}${questionHint ? `：${questionHint}` : ""}`;
+      const headers = { ...this.hdr(), "Content-Type": "application/json" };
+      let payload = null;
+      let forked = false;
+
+      // Prefer a real point-in-time fork so the side question inherits the
+      // conversation's useful context. A streaming/empty source cannot be
+      // forked safely; in that case fall back to an isolated session whose
+      // prompt still carries the selected text explicitly.
+      if (sourceId && source && !this.isTabStreaming(sourceId)) {
+        const response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(sourceId)}/fork`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              up_to_message_id: snapshot.source === "chat"
+                ? (snapshot.messageId || null) : null,
+              title,
+              activity_hidden: true,
+              runtime_profile: "side_question",
+            }),
+          },
+        );
+        if (response.ok) {
+          payload = await response.json();
+          forked = true;
+        } else if (![400, 404, 409].includes(response.status)) {
+          throw new Error(`selection fork ${response.status}`);
+        }
+      }
+
+      if (!payload) {
+        const response = await fetch("/api/chat/sessions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            name: title,
+            model: (source && source.model) || this.model || "",
+            permission: "default",
+            cwd: (source && source.cwd) || this.currentWorkspacePath(),
+            open_ids: this.openTabIds || [],
+            activity_hidden: true,
+            runtime_profile: "side_question",
+          }),
+        });
+        if (!response.ok) throw new Error(`selection session ${response.status}`);
+        payload = await response.json();
+      }
+
+      const id = payload.id || payload.session_id;
+      if (!id) throw new Error("selection session missing id");
+      const meta = {
+        ...payload,
+        id,
+        name: payload.name || title,
+        active: false,
+        cwd: payload.cwd || (source && source.cwd) || this.currentWorkspacePath(),
+        _selectionAsk: true,
+        _selectionAskForked: forked,
+        activity_hidden: true,
+        runtime_profile: "side_question",
+      };
+      this.sessions = [meta, ...this.sessions.filter(s => s.id !== id)];
+      this._sessionsEtag = "";
+      const state = this._ensureTabState(id);
+      // The compact panel only needs this branch-local turn. Canonical
+      // reconciliation may later hydrate inherited fork history in-place.
+      state._loaded = true;
+      state.permission = "default";
+      state.effort = this._normalizeEffort(meta.effort);
+      state.serviceTier = this._normalizeServiceTier(meta.service_tier);
+      return meta;
+    },
+
+    previewSelectionAskMessages() {
+      const sid = this.previewQuote.askSessionId;
+      const state = sid && this.tabState && this.tabState[sid];
+      const messages = state ? this._allPaneMessages(state) : [];
+      if (!messages.length) return [];
+      const expected = this.previewQuote.askPrompt || "";
+      let userIndex = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user"
+            && (!expected || messages[i].text === expected)) {
+          userIndex = i;
+          break;
+        }
+      }
+      // Keep the branch-local user turns as well as assistant replies so the
+      // floating window can behave like a compact multi-turn conversation.
+      // Inherited fork history stays before the exact first side-question
+      // prompt and is therefore intentionally excluded.
+      return messages.slice(Math.max(0, userIndex));
+    },
+
+    previewSelectionAskConversation() {
+      return this.previewSelectionAskMessages().filter(message => (
+        message && message.text
+        && (message.role === "user" || message.role === "assistant")
+      ));
+    },
+
+    previewSelectionAskUserText(message) {
+      if (!message) return "";
+      if (message.text === this.previewQuote.askPrompt) {
+        return this.previewQuote.question || "";
+      }
+      return this.userVisibleText(message);
+    },
+
+    previewSelectionAskMessageHtml(message) {
+      const text = String((message && message.text) || "").trim();
+      return text ? this.mdRender(text) : "";
+    },
+
+    previewSelectionAskText() {
+      return this.previewSelectionAskMessages()
+        .filter(m => m && m.role === "assistant" && m.text)
+        .map(m => m.text)
+        .join("\n\n")
+        .trim();
+    },
+
+    previewSelectionAskHtml(message = null) {
+      const text = message ? String(message.text || "").trim()
+        : this.previewSelectionAskText();
+      return text ? this.mdRender(text) : "";
+    },
+
+    previewSelectionAskSearching() {
+      if (!this.previewSelectionAskRunning()) return false;
+      const messages = this.previewSelectionAskMessages();
+      let lastUser = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user") {
+          lastUser = i;
+          break;
+        }
+      }
+      return messages.slice(lastUser + 1).some(message => (
+        message && message.role === "tool_use"
+        && (message.name === "WebSearch" || message.name === "WebFetch")
+      ));
+    },
+
+    onPreviewSelectionAskScroll(ev) {
+      const el = ev && ev.currentTarget;
+      if (!el) return;
+      this.previewQuote.askAutoScroll = (
+        el.scrollHeight - el.scrollTop - el.clientHeight < 48
+      );
+    },
+
+    scrollPreviewSelectionAskConversation(force = false) {
+      if (!force && !this.previewQuote.askAutoScroll) return false;
+      const el = document.querySelector(
+        ".preview-selection-popover .preview-selection-conversation",
+      );
+      if (!el || !el.getClientRects().length) return false;
+      el.scrollTop = el.scrollHeight;
+      return true;
+    },
+
+    previewSelectionAskRunning() {
+      const sid = this.previewQuote.askSessionId;
+      const state = sid && this.tabState && this.tabState[sid];
+      return !!(this.previewQuote.sending
+        || (state && (state.streaming || state.backgroundActive)));
+    },
+
+    previewSelectionAskFailed() {
+      const sid = this.previewQuote.askSessionId;
+      const state = sid && this.tabState && this.tabState[sid];
+      if (!state) return false;
+      const messages = this._allPaneMessages(state);
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user") return !!messages[i]._failed;
+      }
+      return false;
+    },
+
+    async openPreviewSelectionAskSession() {
+      const sid = this.previewQuote.askSessionId;
+      if (!sid) return false;
+      const state = this.tabState && this.tabState[sid];
+      // Once the side turn is done, opening the branch should reveal its
+      // inherited history too. While streaming, retain the live object graph.
+      if (state && !state.streaming && !state.es) state._loaded = false;
+      this.dismissPreviewQuote(true);
+      await this.openTab(sid);
+      if (this._isMobileLayout()) this.setMobileTab("chat");
+      return true;
+    },
+
+    _previewSelectionAskPrompt(question, snapshot = null) {
+      const instruction = this.lang === "zh"
+        ? "这是一个独立侧问。请基于这个侧问分支已有的上下文回答。必要时可以使用 WebSearch 或 WebFetch 核实公开信息；不得调用其他工具或修改文件。搜索时不要把文件路径、凭证、私人信息或选中原文直接放入查询词或 URL，应先抽象成最少必要的公开关键词。"
+        : "This is an independent side question. Answer from the context already present in this side branch. You may use WebSearch or WebFetch when public information needs verification; do not use other tools or modify files. Never put file paths, credentials, private data, or the selected passage verbatim into a query or URL; reduce it to the minimum necessary public keywords first.";
+      const label = this.lang === "zh"
+        ? (snapshot ? "问题：" : "追问：")
+        : (snapshot ? "Question:" : "Follow-up:");
+      const parts = [];
+      if (snapshot) parts.push(this._previewQuoteBlock(snapshot));
+      parts.push(instruction, `${label}\n${question}`);
+      return parts.join("\n\n");
+    },
+
+    onPreviewQuoteFollowupEnter(ev) {
+      if (!ev || ev.isComposing || ev.keyCode === 229) return;
+      const isTouch = (window.matchMedia
+        && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
+      if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
+      ev.preventDefault();
+      this.sendPreviewSelectionFollowup();
+    },
+
+    async sendPreviewSelectionFollowup() {
+      const sid = this.previewQuote.askSessionId;
+      const question = String(this.previewQuote.followup || "").trim();
+      if (!sid || !question || this.previewSelectionAskRunning()
+          || this.workspaceSwitching) return false;
+      const prompt = this._previewSelectionAskPrompt(question);
+      this.previewQuote.sending = true;
+      this.previewQuote.askError = "";
+      this.previewQuote.askAutoScroll = true;
+      try {
+        const result = await this.send({
+          sessionId: sid,
+          detachedText: prompt,
+          detachedDisplayText: question,
+          permissionMode: "default",
+        });
+        if (result === false) {
+          this.previewQuote.askError = this.lang === "zh"
+            ? "追问发送失败，请重试"
+            : "Could not send the follow-up; please retry";
+          return false;
+        }
+        this.previewQuote.followup = "";
+        this.$nextTick(() => this.scrollPreviewSelectionAskConversation(true));
+        return true;
+      } catch (_) {
+        this.previewQuote.askError = this.lang === "zh"
+          ? "追问发送失败，请重试"
+          : "Could not send the follow-up; please retry";
+        return false;
+      } finally {
+        this.previewQuote.sending = false;
+      }
+    },
+
+    async sendPreviewSelectionQuestion() {
+      if (!this.previewQuote.show || this.previewQuote.mode !== "ask"
+          || this.previewQuote.sending) return false;
+      const question = String(this.previewQuote.question || "").trim();
+      if (!question) return false;
+      if (!this.currentId) {
+        this.toast(this.lang === "zh" ? "请先打开一个会话" : "Open a chat first", "warn", 2200);
+        return false;
+      }
+      if (!this.availableModels || !this.availableModels.length) {
+        this.toast(this.lang === "zh" ? "请先在设置里配置一个模型" : "Configure a model in Settings first", "warn", 3000);
+        this.openSettings();
+        return false;
+      }
+      if (this.workspaceSwitching) return false;
+      const snapshot = {
+        source: this.previewQuote.source,
+        role: this.previewQuote.role,
+        sessionId: this.previewQuote.sessionId,
+        messageId: this.previewQuote.messageId,
+        path: this.previewQuote.path,
+        text: this.previewQuote.text,
+        truncated: this.previewQuote.truncated,
+      };
+      const prompt = this._previewSelectionAskPrompt(question, snapshot);
+      this.previewQuote.sending = true;
+      this.previewQuote.askError = "";
+      try {
+        const target = await this._createPreviewSelectionAskSession(snapshot, question);
+        this.previewQuote.askSessionId = target.id;
+        this.previewQuote.askSessionName = target.name || "";
+        this.previewQuote.askPrompt = prompt;
+        const result = await this.send({
+          sessionId: target.id,
+          detachedText: prompt,
+          detachedDisplayText: question,
+          permissionMode: "default",
+        });
+        if (result === false) {
+          this.previewQuote.askError = this.lang === "zh"
+            ? "侧问未能启动，可打开会话后重试"
+            : "Could not start the side question; open the chat to retry";
+          return false;
+        }
+        return true;
+      } catch (_) {
+        this.previewQuote.askError = this.lang === "zh"
+          ? "创建独立侧问失败，请重试"
+          : "Could not create the side question; please retry";
+        this.toast(this.previewQuote.askError, "error", 3000);
+        return false;
+      } finally {
+        this.previewQuote.sending = false;
+      }
     },
 
     // A11y: mirror every button's `title` attribute into `aria-label` so
@@ -20354,6 +21802,37 @@ function portal() {
     },
 
     // ===== upload / drag-drop / mkdir =====
+    _externalFileDropTarget(target) {
+      const el = target && target.nodeType === 1
+        ? target
+        : (target && target.parentElement);
+      const row = el && el.closest
+        ? el.closest(".filelist li.dir[data-path]")
+        : null;
+      return {
+        dir: row ? String(row.dataset.path || "") : "",
+        explicitDirectory: !!row,
+      };
+    },
+    _setOsFileDropTarget(target) {
+      const drop = this._externalFileDropTarget(target);
+      this.osFileDragging = true;
+      this.osFileDropDir = drop.dir;
+      this.osFileDropOnDirectory = drop.explicitDirectory;
+      this.dragOver = drop.explicitDirectory ? drop.dir : "";
+      this.dragOverRoot = !drop.explicitDirectory;
+      return drop;
+    },
+    _resetOsFileDragState() {
+      this._dragCounter = 0;
+      this.osFileDragging = false;
+      this.osFileDropDir = "";
+      this.osFileDropOnDirectory = false;
+      this.dragOver = "";
+      this.dragOverRoot = false;
+      this.previewDragHover = false;
+      this.dragHover = false;
+    },
     async upload(ev) {
       // Multi-file picker: upload all selected files in parallel to the
       // workspace root and refresh the tree ONCE, mirroring onPreviewDrop.
@@ -20548,6 +22027,17 @@ function portal() {
       this._lpStart = null;
     },
     onTreeNodeDragOver(ev, n) {
+      const types = Array.from(ev.dataTransfer?.types || []);
+      if (types.includes("Files")
+          && !types.includes(this._DRAG_MIME_INTERNAL)) {
+        // External files are deliberately stricter than tree moves: only a
+        // directory row is an explicit nested destination.  A file row is
+        // just another part of the window and therefore means workspace root.
+        this.dragOver = n.is_dir ? n.path : "";
+        this.dragOverRoot = !n.is_dir;
+        ev.dataTransfer.dropEffect = "copy";
+        return;
+      }
       // Target dir = the node itself when it's a folder, or its parent
       // directory when it's a file. Dropping onto a file lands the
       // item next to that file (matches Finder / VSCode behavior).
@@ -20594,10 +22084,11 @@ function portal() {
         return;
       }
 
-      // OS file upload — dropping onto a file uploads into that file's
-      // parent dir (same dir-resolution as internal moves).
+      // OS file upload — only a directory row is a nested target. Dropping on
+      // a file row follows the app-wide default and uploads to workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
-      await this._uploadFilesToDir(targetDir, files);
+      this._resetOsFileDragState();
+      await this._uploadFilesToDir(n.is_dir ? n.path : "", files);
     },
     // Parallel-upload a set of OS files into `targetDir` (empty string =
     // workspace root), then refresh the tree once and surface a single
@@ -20672,6 +22163,7 @@ function portal() {
       }
       // OS file upload → workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
+      this._resetOsFileDragState();
       await this._uploadFilesToDir("", files);
     },
     async moveTreeItem(srcPath, targetDir) {
@@ -20988,16 +22480,9 @@ function portal() {
       return EDITABLE_EXT.has(ext);
     },
 
-    // Files-pane visibility toggle wired to the preview-pane header's chevron
-    // button. Special-cased for fullscreen: when the preview pane is in
-    // desktop-fullscreen mode (this.desktopFullPane === "preview"), the files
-    // pane is already hidden by the fullscreen layout CSS — so tapping the
-    // chevron in that state should EXIT fullscreen (not just flip a flag
-    // that does nothing visible). We also force leftOpen=true on the exit
-    // path so the user lands on a layout where the files pane IS visible,
-    // matching the affordance the chevron just promised them.
-    // 2026-05-28 user request: "全屏预览模式下，点击 隐藏文件区按钮，
-    // 应该要自动退出全屏预览".
+    // Files visibility toggle in the center chat header. In chat fullscreen
+    // the side rail is already hidden by CSS, so the chevron exits focus mode
+    // and explicitly restores Files instead of flipping an invisible flag.
     toggleFilesPane() {
       if (this.desktopFullPane) {
         this.desktopFullPane = "";
@@ -21009,21 +22494,15 @@ function portal() {
       this.savePrefs();
     },
 
-    // Chat (Muse) pane visibility toggle, wired to the preview-pane header's
-    // right-hand chevron. Mirrors toggleFilesPane's fullscreen special-case:
-    // when the preview pane is fullscreen (desktopFullPane === "preview") the
-    // Muse pane is already hidden by the fullscreen layout, so tapping
-    // "hide Muse" would flip a flag that changes nothing visible. Instead we
-    // EXIT fullscreen and force the Muse pane open, landing the user on a
-    // layout where Muse IS visible — matching the affordance the button
-    // promises. 2026-05-29 user request: "预览区全屏的情况下，点击隐藏 Muse
-    // 按钮，应该自动退出全屏".
-    toggleChatPane() {
+    // Preview visibility toggle, wired to the center chat header's right-hand
+    // chevron. In either desktop fullscreen mode the side rail is already
+    // hidden, so the chevron exits fullscreen and explicitly restores preview.
+    togglePreviewPane() {
       if (this.desktopFullPane) {
         this.desktopFullPane = "";
-        this.rightOpen = true;
+        this.previewOpen = true;
       } else {
-        this.rightOpen = !this.rightOpen;
+        this.previewOpen = !this.previewOpen;
       }
       this.savePrefs();
     },
@@ -21031,7 +22510,7 @@ function portal() {
     layoutStyle() {
       // Desktop fullscreen on one pane — collapse to a single 1fr column
       // and let the CSS rule for [data-desktop-full="..."] handle hiding
-      // the others. Skips the persisted leftWidth/rightWidth so the
+      // the others. Skips the persisted leftWidth/previewWidth so the
       // chosen pane truly fills the viewport (no 280px ghost gutter).
       if (this.desktopFullPane) {
         return { gridTemplateColumns: "1fr" };
@@ -21046,7 +22525,7 @@ function portal() {
       const cols = [];
       if (this.leftOpen) cols.push(Math.min(this.leftWidth, maxW) + "px", "4px");
       cols.push("1fr");
-      if (this.rightOpen) cols.push("4px", Math.min(this.rightWidth, maxW) + "px");
+      if (this.previewOpen) cols.push("4px", Math.min(this.previewWidth, maxW) + "px");
       return { gridTemplateColumns: cols.join(" ") };
     },
     // Toggle desktop fullscreen for a pane. Click the same pane's
@@ -21065,16 +22544,13 @@ function portal() {
 
       const next = (this.desktopFullPane === pane) ? "" : pane;
       this.desktopFullPane = next;
-      // Force the target pane open — otherwise "fullscreen chat" with
-      // rightOpen=false would land on a blank screen (chat is hidden by
-      // `.pane-hidden` regardless of the data-desktop-full rules).
-      // Preview shares the center column so always rendered; only the
-      // chat side needs rightOpen forced. Skipped on exit (next === "")
-      // to preserve the user's prior leftOpen/rightOpen layout.
-      if (next === "chat") this.rightOpen = true;
+      // Force preview open when it is the target — `.pane-hidden` otherwise
+      // wins regardless of the fullscreen grid rule. Chat is always mounted in
+      // the center, so it needs no corresponding visibility flag.
+      if (next === "preview") this.previewOpen = true;
       // FIX ⑥ (2026-05-30 follow-up): persist the fullscreen state so a
       // refresh restores it. There's no $watch("desktopFullPane"), and the
-      // sibling exit paths (toggleFilesPane / toggleChatPane) already call
+      // sibling exit paths (toggleFilesPane / togglePreviewPane) already call
       // savePrefs — this entry/exit path was the one gap, so toggling
       // fullscreen via the maximize button never stuck across a reload.
       this.savePrefs();
@@ -21164,7 +22640,7 @@ function portal() {
     startResize(which, ev) {
       ev.preventDefault();
       const startX = ev.clientX;
-      const startW = which === "left" ? this.leftWidth : this.rightWidth;
+      const startW = which === "left" ? this.leftWidth : this.previewWidth;
       const target = ev.currentTarget;
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
@@ -21211,26 +22687,26 @@ function portal() {
       const onMove = (e) => {
         const delta = isLeft ? (e.clientX - startX) : (startX - e.clientX);
         const targetW = startW + delta;
-        const isOpenNow = isLeft ? this.leftOpen : this.rightOpen;
+        const isOpenNow = isLeft ? this.leftOpen : this.previewOpen;
         if (isOpenNow && targetW < HIDE_AT) {
           // Going-down threshold crossed. Hide and remember the pre-drag
           // width so chevron-reopen later restores that size (rather than
           // showing a sliver). Drag continues so you can pull back out.
           if (isLeft) { this.leftWidth = startW; this.leftOpen = false; }
-          else        { this.rightWidth = startW; this.rightOpen = false; }
+          else        { this.previewWidth = startW; this.previewOpen = false; }
           return;
         }
         if (!isOpenNow && targetW >= SHOW_AT) {
           // Going-up threshold crossed during the same drag — re-open.
           if (isLeft) this.leftOpen = true;
-          else        this.rightOpen = true;
+          else        this.previewOpen = true;
         }
         // Only resize when actually open (post-show transition counts).
         const reopened = !isOpenNow && targetW >= SHOW_AT;
         if (isOpenNow || reopened) {
           const w = Math.max(SHOW_AT, Math.min(maxW, targetW));
           if (isLeft) this.leftWidth = w;
-          else        this.rightWidth = w;
+          else        this.previewWidth = w;
         }
         refreshCmSoon();   // keep CM in step with the editor pane's new width
       };
@@ -22394,6 +23870,10 @@ function portal() {
     // pointerdown on the chat body (see index.html) so onChatScroll can tell a
     // user scroll-up apart from a layout-induced scroll event.
     _userScrollIntent() {
+      if (this.previewQuote.show && this.previewQuote.source === "chat"
+          && this.previewQuote.mode !== "ask") {
+        this.dismissPreviewQuote(true);
+      }
       this._userScrollAt = Date.now();
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
       if (st) st._userScrollAt = this._userScrollAt;
@@ -22610,6 +24090,18 @@ function portal() {
       if (!sendSid) return false;
       if (sendSid === this.currentId) this._captureComposerState(sendSid);
       const sendState = this._ensureTabState(sendSid);
+      // Stop is an acknowledged control handshake, not an idle gap.  Sending
+      // while it is still settling used to enqueue a fresh message between the
+      // interrupt endpoint's atomic pause and the turn cleanup's second pause;
+      // that new item then appeared accepted but remained paused.  Keep the
+      // draft intact and make the short wait explicit instead.
+      if (sendState._stopping && !opts.reconnect && !opts.resumedItem) {
+        this.toast(this.lang === "zh"
+          ? "正在中断上一条任务，请稍候再发送"
+          : "The previous turn is still stopping; send again in a moment",
+        "warn", 2200);
+        return false;
+      }
       // Do not start a new turn between the optimistic selector change and
       // its persisted session update. Otherwise Plan Mode could launch with a
       // stale/missing return capability. Reconnects and queued snapshots own
@@ -22627,19 +24119,31 @@ function portal() {
         return false;
       }
       const sendDraft = sendState.draft;
+      // A preview-selection question is an independent prompt, not a rewrite
+      // of the visible composer. Keep the current draft and every attachment
+      // untouched while still reusing the normal current-session queue/SSE
+      // lifecycle. This also makes ticket failure recovery a no-op for the
+      // unrelated composer.
+      const hasDetachedText = typeof opts.detachedText === "string";
+      const detachedDisplayText = typeof opts.detachedDisplayText === "string"
+        ? opts.detachedDisplayText : opts.detachedText;
       // Snapshot the pinned session's draft before any await. Every later read,
       // clear, upload wait and enqueue remains owned by this exact state object.
-      const composerText = sendDraft.input || "";
-      const composerImages = sendDraft.pendingImages.slice();
-      const composerDocs = sendDraft.pendingDocs.slice();
+      const composerInput = hasDetachedText ? opts.detachedText : (sendDraft.input || "");
+      const composerImages = hasDetachedText ? [] : sendDraft.pendingImages.slice();
+      const composerDocs = hasDetachedText ? [] : sendDraft.pendingDocs.slice();
+      const composerQuotes = hasDetachedText ? [] : sendDraft.pendingQuotes.slice();
+      const composerText = hasDetachedText
+        ? composerInput : this._composerPromptText(composerInput, composerQuotes);
       const ownsSendDraft = () => this.tabState[sendSid] === sendState
         && sendState.draft === sendDraft;
       const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) => {
+        if (hasDetachedText) return;
         if (!ownsSendDraft()) return;
         if (preserveForHandshake) {
-          this._stageChatRecoveryDraft(sendSid, composerText);
+          this._stageChatRecoveryDraft(sendSid, composerInput);
         }
-        if (sendDraft.input === composerText) sendDraft.input = "";
+        if (sendDraft.input === composerInput) sendDraft.input = "";
         this._resetChatInputHistory(sendDraft);
         const removeOwned = (items, sent) => {
           for (let i = items.length - 1; i >= 0; i--) {
@@ -22648,6 +24152,7 @@ function portal() {
         };
         removeOwned(sendDraft.pendingImages, new Set(composerImages));
         removeOwned(sendDraft.pendingDocs, new Set(composerDocs));
+        removeOwned(sendDraft.pendingQuotes, new Set(composerQuotes));
         // Clearing the visible composer must not clear the durable backup
         // until the SSE handshake succeeds. A newer draft typed during an
         // await is persisted alongside that pending outgoing text.
@@ -22667,8 +24172,12 @@ function portal() {
       const sendMeta = (this.sessions || []).find(s => s.id === sendSid);
       const sendModel = sendSid === this.currentId
         ? this.model : ((sendMeta && sendMeta.model) || this.model);
-      const sendPermission = sendSid === this.currentId
+      const inheritedPermission = sendSid === this.currentId
         ? this.permission : ((sendMeta && sendMeta.permission) || "default");
+      const sendPermission = this._normalizePermissionMode(
+        opts.permissionMode || inheritedPermission,
+        "default",
+      );
       const sendPlanReturnPermission = sendPermission === "plan"
         ? ((sendMeta && sendMeta.plan_return_permission) || "")
         : "";
@@ -22729,14 +24238,14 @@ function portal() {
       // enqueued — they're meta-actions (/clear, /compact, /export) that
       // depend on session state at execution time, not user intent at
       // type time. We toast "wait for this turn to finish" instead.
-      if (!isReconnect && !resumed && text.startsWith("/")) {
+      if (!isReconnect && !resumed && !hasDetachedText && text.startsWith("/")) {
         const m = text.match(/^\/(\w+)(?:\s+(.*))?$/);
         if (m) {
           if (await this._confirmSessionBusy(sendSid, sendState)) {
             this.toast(this.t("queue.slash_blocked"), "warn", 3000);
             return;
           }
-          if (ownsSendDraft() && sendDraft.input === composerText) {
+          if (ownsSendDraft() && sendDraft.input === composerInput) {
             sendDraft.input = "";
             this._resetChatInputHistory(sendDraft);
             if (this.currentId === sendSid) this.input = "";
@@ -22753,7 +24262,7 @@ function portal() {
       } else {
         const hasAttachments = resumed
           ? !!((resumed.pendingImages || []).length || (resumed.pendingDocs || []).length)
-          : !!(composerImages.length || composerDocs.length);
+          : !!(composerImages.length || composerDocs.length || composerQuotes.length);
         if (!text && !hasAttachments) return;
       }
       // If any attachment is still mid-upload, silently wait for it to
@@ -22833,8 +24342,10 @@ function portal() {
           && await this._confirmSessionBusy(sendSid, sendState)) {
         const ok = await this._enqueueMessage(sendSid, {
           text,
+          displayText: composerInput,
           pendingImages: composerImages,
           pendingDocs: composerDocs,
+          pendingQuotes: composerQuotes,
           permission: sendPermission,
           plan_return_permission: sendPlanReturnPermission,
         });
@@ -22866,6 +24377,8 @@ function portal() {
         this._capLiveMessages(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
+          displayText: hasDetachedText ? detachedDisplayText : composerInput,
+          selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
             preview: im.preview,
             // Pre-compute the URL the backend will serve once it
@@ -22906,7 +24419,7 @@ function portal() {
       // Reconnect: nothing to clear. Resumed: input/pendingImages were
       // already cleared at enqueue time, and the user may have typed a
       // new draft since — don't touch their work-in-progress.
-      if (!isReconnect && !resumed) {
+      if (!isReconnect && !resumed && !hasDetachedText) {
         // Remove only the captured payload; a newer draft typed during an await
         // stays in the still-global Phase 1 composer.
         clearSubmittedComposer({ preserveForHandshake: true });
@@ -22927,7 +24440,7 @@ function portal() {
           if (!this._isMobileLayout()) ta.focus();
         });
       }
-      this._cancelMentionLookup();
+      if (!hasDetachedText) this._cancelMentionLookup();
       // streamSid + streamState alias the sendSid snapshot taken at function
       // entry. We KEEP the local names `streamSid` / `streamState` because
       // every downstream event handler (text / thinking / tool_use / done /
@@ -22947,6 +24460,14 @@ function portal() {
         streamState._serverActiveObserved = false;
         // A real new local turn supersedes any just-finished list expectation.
         streamState._sessionActivityExpected = null;
+        // Fresh turn ⇒ fresh reconnect budget. This is the ONLY place the
+        // transport-retry counter is cleared; see es.onopen /
+        // _retireStaleSessionStream for why resetting it elsewhere made the
+        // MAX_ATTEMPTS ceiling unreachable.
+        streamState._reconnectAttempts = 0;
+        streamState._reconnectGateTurn = "";
+        streamState._reconnectGateCount = 0;
+        streamState._reconnectGateAt = 0;
       }
       streamState.streaming = true;
       streamState._continuationAwaitingReaction = false;
@@ -23070,11 +24591,11 @@ function portal() {
       // deliberately not serialised across a page reload.
       let submittedDraftRestored = false;
       const restoreSubmittedComposer = (restoreAttachments = false) => {
-        if (isReconnect || resumed || submittedDraftRestored) return;
+        if (hasDetachedText || isReconnect || resumed || submittedDraftRestored) return;
         submittedDraftRestored = true;
         if (ownsSendDraft()) {
           sendDraft.input = this._mergeChatDraftText(
-            composerText, sendDraft.input || "",
+            composerInput, sendDraft.input || "",
           );
           if (restoreAttachments) {
             const restoreOwned = (items, sent) => {
@@ -23083,6 +24604,7 @@ function portal() {
             };
             restoreOwned(sendDraft.pendingImages, composerImages);
             restoreOwned(sendDraft.pendingDocs, composerDocs);
+            restoreOwned(sendDraft.pendingQuotes, composerQuotes);
           }
           this._resolveChatRecoveryDraft(sendSid, sendDraft.input);
           if (sendSid === this.currentId) this._activateComposerState(sendSid);
@@ -23092,7 +24614,7 @@ function portal() {
         // the text in localStorage so reopening the session still recovers it.
         const persisted = this._chatDraftRecord(sendSid);
         this._resolveChatRecoveryDraft(sendSid, this._mergeChatDraftText(
-          composerText,
+          composerInput,
           this._mergeChatDraftText(persisted.pending, persisted.text),
         ));
       };
@@ -23183,17 +24705,21 @@ function portal() {
       const es = new EventSource(url);
       streamState.es = es;
       if (streamSid === this.currentId) this.es = es;
-      // Reset auto-reconnect counter on each successful SSE open. NOTE
-      // — we deliberately do NOT (re)start the elapsed-time counter
-      // here. Timer + _streamStartedAt are set above at submit time so
-      // (a) the footer shows "0.0s" immediately instead of waiting
-      // through the SSE handshake, and (b) mid-stream reconnects don't
-      // visibly reset the displayed elapsed back to zero.
+      // NOTE — a successful open deliberately does NOT reset
+      // _reconnectAttempts. Every reconnect DOES open successfully (the
+      // backend replays the turn happily), so resetting here made the
+      // MAX_ATTEMPTS ceiling unreachable and let a reconnect loop run
+      // forever (2026-08-04 flicker storm). The budget is per-turn: it is
+      // cleared where a genuinely new turn is submitted (`!isReconnect` in
+      // send()), not on every transport open. We also deliberately
+      // do NOT (re)start the elapsed-time counter here: timer +
+      // _streamStartedAt are set above at submit time so (a) the footer shows
+      // "0.0s" immediately instead of waiting through the SSE handshake, and
+      // (b) mid-stream reconnects don't visibly reset the displayed elapsed.
       es.onopen = () => {
-        streamState._reconnectAttempts = 0;
         streamState._lastSseActivity = Date.now();
-        if (!isReconnect && !resumed) {
-          this._commitChatRecoveryDraft(sendSid, composerText);
+        if (!hasDetachedText && !isReconnect && !resumed) {
+          this._commitChatRecoveryDraft(sendSid, composerInput);
         }
       };
 
@@ -23308,6 +24834,26 @@ function portal() {
         // never evict (and visually jump) while the user has scrolled up to
         // read history. Evicted bubbles land in the "Load earlier" stash.
         if (this.atBottom) this.scrollToBottom(false);
+      };
+      // Coalesced variant for event bursts. A turn that settles N background
+      // tasks at once delivers N task_notification events back-to-back; calling
+      // _scrollIfActive per event ran N × (_capLiveMessages splice → Alpine DOM
+      // teardown → scrollHeight reflow → scrollTop slam), which is exactly the
+      // "会话区刷新闪烁" the user reported (2026-08-04). Collapse the whole burst
+      // into one pass on the next frame — the card patches themselves are
+      // already applied synchronously, so nothing visible is delayed beyond a
+      // single frame.
+      let _scrollCoalesceHandle = null;
+      const _scrollIfActiveSoon = () => {
+        if (_scrollCoalesceHandle !== null) return;
+        const run = () => {
+          _scrollCoalesceHandle = null;
+          if (!ownsStreamState()) return;
+          _scrollIfActive();
+        };
+        _scrollCoalesceHandle = (typeof requestAnimationFrame === "function")
+          ? requestAnimationFrame(run)
+          : setTimeout(run, 16);
       };
       const ownsStreamState = () => this.tabState[streamSid] === streamState;
       const ownsCurBubble = () => ownsStreamState() && !!curBubble
@@ -23679,18 +25225,14 @@ function portal() {
         //     scrolled far off-screen;
         //   - green unread dot when the launching session isn't the tab
         //     being viewed (same affordance as a turn finishing elsewhere).
-        const zh = this.lang === "zh";
-        const label = st === "failed"
-          ? (zh ? "后台任务失败" : "Background task failed")
-          : st === "stopped"
-            ? (zh ? "后台任务已停止" : "Background task stopped")
-            : (zh ? "后台任务已完成" : "Background task finished");
-        this.toast(label, st === "failed" ? "error" : "info");
+        // Deduped per task_id and coalesced across a burst — see
+        // _noteBackgroundTaskSettled.
+        this._noteBackgroundTaskSettled(d.task_id, st, !!d.already_reported);
         if (streamSid !== this.currentId) {
           const ts = this.tabState[streamSid];
           if (ts && !ts.streaming) ts.unread = true;
         }
-        _scrollIfActive();
+        _scrollIfActiveSoon();
       });
       es.addEventListener("rate_limit", ev => {
         let d;
@@ -23982,7 +25524,9 @@ function portal() {
         // _markDone covers every termination path (done / error /
         // cancelled / reconnect-give-up) — no scattered flagging logic.
         // EXCEPT user-cancelled — they don't need a "ding, ready!" cue.
-        if (this.currentId !== streamSid && !cancelled) {
+        const visibleSideQuestion = this.previewQuote.show
+          && this.previewQuote.askSessionId === streamSid;
+        if (this.currentId !== streamSid && !cancelled && !visibleSideQuestion) {
           streamState.unread = true;
         }
         // Stamp the tail of the just-finished turn with completion
@@ -24000,6 +25544,11 @@ function portal() {
         const completedAtMs = Number(meta.completedAtMs) || 0;
         const durationMs = Number(meta.durationMs) || 0;
         const assistantUuid = String(meta.assistantUuid || "");
+        const completedModel = String(
+          meta.model || streamState.streamingModel || modelForBubble || "",
+        );
+        const turnStatus = String(meta.turnStatus || "");
+        const memoryRecall = meta.memoryRecall || null;
         const _now = completedAtMs > 0 ? completedAtMs : Date.now();
         const _elapsed = durationMs > 0
           ? durationMs / 1000
@@ -24008,14 +25557,23 @@ function portal() {
         const _stamp = (m) => {
           if (!m.ts) m.ts = _now;
           if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+          if (!m.model && completedModel) m.model = completedModel;
+          if ((!m.turn_status || m.turn_status === "running") && turnStatus) {
+            m.turn_status = turnStatus;
+          }
+          if (!m.memoryRecall && memoryRecall) m.memoryRecall = memoryRecall;
         };
         // Tail-most muse-side message of THIS turn, used when the turn has no
         // assistant text bubble of its own to hang the footer on.
         let tailCandidate = null;
         let stampedAssistant = null;
+        let lastUserCandidate = null;
         for (let k = turnMessages.length - 1; k >= 0; k--) {
           const m = turnMessages[k];
-          if (m.role === "user") break;          // entered the previous turn
+          if (m.role === "user") {
+            lastUserCandidate = m;
+            break;                               // entered the previous turn
+          }
           if (tailCandidate === null) tailCandidate = m;
           // Skip tool blocks / standalone thinking; they're not the
           // "reply" the user reads time off.
@@ -24026,6 +25584,13 @@ function portal() {
           _stamp(m);                              // found the tail text bubble
           stampedAssistant = m;
           break;                                  // stop after the first one (most recent)
+        }
+        // An interrupt/error can land before the SDK emits any muse-side
+        // block.  Stamp that turn's user envelope so the terminal footer does
+        // not vanish with the pending bubble; the template explicitly allows
+        // a status-bearing user tail for this one exceptional shape.
+        if (!tailCandidate && lastUserCandidate && turnStatus) {
+          tailCandidate = lastUserCandidate;
         }
         // The footer is mounted on the actual turn-tail node. Stamp that node
         // regardless of whether an assistant bubble was found above; otherwise
@@ -24171,6 +25736,10 @@ function portal() {
           assistantUuid: d.assistant_uuid,
           completedAtMs: d.completed_at_ms,
           durationMs: d.duration_ms,
+          model: d.model,
+          turnStatus: d.cancelled
+            ? "cancelled" : (d.is_error ? "failed" : "completed"),
+          memoryRecall: d.memory_recall,
         });
         _stopTimer();
         if (isContinuation && !d.cancelled) {
@@ -24196,7 +25765,12 @@ function portal() {
         // reload on top of it.
         streamState._seenUpdated = undefined;
         if (streamSid === this.currentId) this._openSeenUpdated = undefined;
-        this.refreshSessions();
+        // Quiet ETag pull, NOT refreshSessions(): the latter also runs
+        // _recoverStalledStream, a second reconnect source. It early-returns
+        // here (streaming already false), but wiring a reconnect probe into
+        // the turn-completion path is how the 2026-08-04 storm kept re-arming
+        // itself. The list refresh is all this needs.
+        this._syncSessionListQuiet();
         if (this.currentId === streamSid) {
           // highlightCode resolves AFTER syntax highlight + artifact render
           // (mermaid / HTML preview iframes), which can grow the tail block's
@@ -24218,7 +25792,14 @@ function portal() {
         // drain will hit st.compacting=true and bail; the compact-finally
         // path will pick it up. If the queue's tab isn't the active one,
         // drain bails too and activateTab handles it on return.
-        if (d.is_error) {
+        // A normal user turn error pauses the durable queue server-side, so
+        // mirror that state immediately while the final queue sync catches up.
+        // A background continuation is different: its originating task has
+        // already settled and the backend deliberately keeps queued user input
+        // runnable. Treating its incomplete auto-reaction as a queue failure
+        // stranded otherwise-valid follow-ups in the completion window.
+        const queueBlockingError = !!d.is_error && !isContinuation;
+        if (queueBlockingError) {
           if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
             streamState._queuePaused = true;
             setTimeout(() => {
@@ -24302,7 +25883,13 @@ function portal() {
         // let the queue drain continue.
         if (serverError === "no active turn") {
           es.close(); _markDone(false, false, true); _stopTimer();
-          this.loadSession(streamSid).then(() => {
+          // This is a terminal reconciliation of content that is already on
+          // screen (especially a background continuation whose task-complete
+          // toast just fired), not a cold session open. A normal load flips
+          // messagesReady off and clears/rebuilds the array, producing an
+          // empty/skeleton flash before the same transcript returns. Quiet
+          // mode morphs canonical history into the mounted keyed messages.
+          this.loadSession(streamSid, { quiet: true }).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
           return;
@@ -24314,7 +25901,12 @@ function portal() {
             markUserFailed(serverError, errKind, errCta, errRetryable);
           }
           restoreSubmittedComposer(false);
-          es.close(); _markDone(false, false, true); _stopTimer();
+          es.close();
+          _markDone(false, false, true, {
+            model: modelForBubble,
+            turnStatus: "failed",
+          });
+          _stopTimer();
           // Pause auto-drain — same context likely fails the next message
           // too (quota / auth / cross-vendor signature). The failed user
           // bubble surfaces a "resume queue (N)" CTA so the user can
@@ -24387,7 +25979,6 @@ function portal() {
           // root-level streamElapsed which is now another tab's display.
           if (this.currentId !== streamSid) {
             _stopTimer();
-            streamState._reconnectAttempts = 0;
             return;
           }
           // streamState.streaming is still true from initial send(); use
@@ -24399,10 +25990,13 @@ function portal() {
             const d = await r.json();
             if (!d.active) {
               // Backend turn already finished while we were disconnected.
-              // Refresh session from disk to pick up the completed reply.
+              // Refresh session from disk to pick up the completed reply. The
+              // partial/live transcript is already visible, so keep this a
+              // quiet reconciliation rather than flashing a cold-load skeleton.
               _markDone(false, false, true); _stopTimer();
-              if (this.currentId === streamSid) this.loadSession(streamSid);
-              streamState._reconnectAttempts = 0;
+              if (this.currentId === streamSid) {
+                this.loadSession(streamSid, { quiet: true });
+              }
               return;
             }
             if (d.background && d.attachable === false) {
@@ -24413,7 +26007,6 @@ function portal() {
               _markDone(false, true, true);
               _stopTimer();
               this._ensureBgContPoller(streamSid);
-              streamState._reconnectAttempts = 0;
               return;
             }
             // Re-subscribe via the existing reconnect plumbing.
@@ -24454,10 +26047,38 @@ function portal() {
           }
         }, delay);
       });
-      es.addEventListener("cancelled", () => {
+      es.addEventListener("cancelled", ev => {
         flushRender();
+        let d = {};
+        try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        es.close(); _markDone(true, false, true); _stopTimer();
+        es.close();
+        _markDone(true, false, true, {
+          model: modelForBubble,
+          turnStatus: "cancelled",
+        });
+        _stopTimer();
+        // A force-stopped CLI may never commit this turn to canonical JSONL.
+        // The backend writes the already-rendered SSE record to a private,
+        // display-only snapshot BEFORE emitting snapshot_ready. Reconcile that
+        // snapshot quietly now so a list poll / tab switch / page reload sees
+        // the same content and Alpine can retain matching live objects + keys.
+        // If persistence failed, keep the live pane and clear its old revision
+        // baseline so stop()'s delayed list refresh cannot replace it with an
+        // older transcript immediately after the user clicks Stop.
+        streamState._seenUpdated = undefined;
+        if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+        if (d && d.snapshot_ready) {
+          this.loadSession(streamSid, {
+            quiet: true,
+            probeActive: false,
+          }).then(loaded => {
+            if (loaded && this.tabState[streamSid] === streamState) {
+              streamState._loaded = true;
+              streamState._pendingExternalUpdate = false;
+            }
+          });
+        }
         // User explicitly stopped — pause the queue too. Auto-draining
         // here would be surprising (they cancelled for a reason, almost
         // never "just this one but please send the rest"). The paused
@@ -24828,7 +26449,11 @@ function portal() {
       // Drop the failed bubble, put text back in input, and send.
       const idx = this.messages.indexOf(m);
       if (idx >= 0) this.messages.splice(idx, 1);
-      this.input = m.text || "";
+      this.input = this.userVisibleText(m);
+      this.pendingQuotes.splice(
+        0, this.pendingQuotes.length,
+        ...this.userSelectionQuotes(m).map(q => ({ ...q, id: this._uuid() })),
+      );
       // pendingImages/Docs we don't have here (preview state) — re-prompt
       // user to re-attach if they had files. Acceptable: error retry is rare.
       this.$nextTick(() => {
@@ -24862,7 +26487,7 @@ function portal() {
       }
       // Close any other open edit first (only one inline editor at a time).
       (this.messages || []).forEach(msg => { if (msg !== m && msg._editing) msg._editing = false; });
-      m._editText = m.text || "";
+      m._editText = this.userVisibleText(m);
       m._editing = true;
     },
 
@@ -24923,7 +26548,7 @@ function portal() {
       return (zh ? "Muse 出错：" : "Muse error: ") + s;
     },
     copyMsg(m) {
-      const text = m.text || "";
+      const text = m.role === "user" ? this.userVisibleText(m) : (m.text || "");
       navigator.clipboard?.writeText(text).then(
         () => {
           this.toast(this.t("toast.copied"), "success", 1500);
@@ -25366,10 +26991,50 @@ function portal() {
         paused: zh ? "已暂停" : "Paused", completed: zh ? "已完成" : "Completed",
         failed: zh ? "失败" : "Failed", cancelled: zh ? "已取消" : "Cancelled" })[state] || state;
     },
+    activityTaskSummary(item) {
+      const summary = String(item?.task_summary || "").trim();
+      const session = String(item?.session_name || "").trim();
+      return summary && summary !== session ? summary : "";
+    },
+    activityTurnLabel(item) {
+      const count = Math.max(0, Math.floor(Number(item?.turn_count) || 0));
+      if (count <= 1) return "";
+      return this.lang === "zh" ? `${count}轮` : `${count} turns`;
+    },
+    activityWorkspaceLabel(item) {
+      if ((this.activity.summary?.workspaces || []).length <= 1) return "";
+      return String(item?.workspace_name || "").trim();
+    },
+    activityStatusDetail(item) {
+      const detail = String(item?.status_detail || "").trim();
+      if (!detail || ["Task completed", "Task failed", "Task cancelled"].includes(detail)) {
+        return "";
+      }
+      return detail;
+    },
     activityTime(item) {
       const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    },
+    activityRelativeTime(item) {
+      const ts = this.activityEventTimestamp(item) * 1000;
+      if (!ts) return "";
+      const elapsed = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (elapsed < 45) return this.lang === "zh" ? "刚刚" : "Just now";
+      if (elapsed < 3600) {
+        const minutes = Math.max(1, Math.floor(elapsed / 60));
+        return this.lang === "zh" ? `${minutes}分钟前` : `${minutes}m ago`;
+      }
+      if (elapsed < 86400) {
+        const hours = Math.max(1, Math.floor(elapsed / 3600));
+        return this.lang === "zh" ? `${hours}小时前` : `${hours}h ago`;
+      }
+      if (elapsed < 7 * 86400) {
+        const days = Math.max(1, Math.floor(elapsed / 86400));
+        return this.lang === "zh" ? `${days}天前` : `${days}d ago`;
+      }
+      return this.activityTime(item);
     },
     async toggleActivityPin(item) {
       if (!item?.id || this.activity.view !== "timeline") return false;

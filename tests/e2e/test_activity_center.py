@@ -29,6 +29,152 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def test_memory_shortcut_opens_memory_settings_page(
+    page: Page, backend_url, auth_token
+):
+    _login(page, backend_url, auth_token)
+
+    shortcut = page.locator(".activity-center-btn + .icon-btn")
+    expect(shortcut).to_have_count(1)
+    expect(shortcut.locator('use[href="#i-brain"]')).to_have_count(1)
+    shortcut.click()
+
+    expect(page.locator(".settings-modal")).to_be_visible()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.settings.show && app.settings.activePage === 'memory';
+        }"""
+    )
+    expect(page.locator(".memory-settings-section")).to_be_visible()
+
+
+def test_cached_activity_refresh_does_not_shift_rows_or_modal(
+    page: Page, backend_url, auth_token,
+):
+    """The loading indicator must be out of flow when cached rows exist."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.events = [{
+            id: 'stable-refresh-row', kind: 'turn',
+            session_id: 'stable-refresh-session',
+            session_name: 'Stable activity row',
+            task_summary: 'Must not jump when loading disappears',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'running', read: true,
+            started_at: 100, finished_at: 0, updated_at: 100,
+          }];
+          app.activity.summary = {
+            running: 1, unread: 0, attention: 0,
+            groups: {review: 0, running: 1, failed: 0, history: 0},
+            group_unread: {review: 0, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          app.fetchActivity = () => new Promise(resolve => {
+            window.__finishStableActivityRefresh = resolve;
+          });
+          void app.openActivityCenter();
+        }"""
+    )
+    expect(page.locator(".activity-modal")).to_be_visible()
+    expect(page.locator(".activity-refreshing")).to_be_visible()
+    row = page.locator(".activity-row").filter(has_text="Stable activity row")
+    expect(row).to_be_visible()
+    # Measure only the loading/refresh transition.  The modal has its own
+    # short open scale transition; CI can reach this assertion while that
+    # unrelated animation is still changing geometry by ~1-2px.
+    page.wait_for_timeout(250)
+
+    before = page.evaluate(
+        """async () => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const row = Array.from(document.querySelectorAll('.activity-row'))
+            .find(node => node.textContent.includes('Stable activity row'));
+          return {
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyHeight: body.getBoundingClientRect().height,
+            rowTop: row.getBoundingClientRect().top,
+          };
+        }"""
+    )
+    page.evaluate("() => window.__finishStableActivityRefresh(true)")
+    page.wait_for_function(
+        "() => !document.querySelector('#app')._x_dataStack[0].activity.loading"
+    )
+    after = page.evaluate(
+        """async () => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const row = Array.from(document.querySelectorAll('.activity-row'))
+            .find(node => node.textContent.includes('Stable activity row'));
+          return {
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyHeight: body.getBoundingClientRect().height,
+            rowTop: row.getBoundingClientRect().top,
+          };
+        }"""
+    )
+
+    for key in ("modalHeight", "bodyHeight", "rowTop"):
+        assert abs(after[key] - before[key]) < 1, (before, after)
+
+
+def test_session_rename_updates_loaded_activity_row_immediately(
+    page: Page, backend_url, auth_token
+):
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const before = app.sessions.find(row => row.id === sid)?.name || '';
+          app.activity.events = [{
+            id: 'rename-target',
+            session_id: sid,
+            session_name: before,
+            task_summary: 'Keep task summary',
+            workspace: app.currentWorkspacePath(),
+            workspace_name: 'e2e',
+            state: 'completed',
+            read: true,
+            started_at: 1,
+            finished_at: 2,
+            updated_at: 2,
+          }];
+          app.renamingPickerSid = sid;
+          app.pickerRenameDraft = 'Renamed activity row';
+          await app.pickerCommitInlineRename();
+          return {
+            sessionName: app.sessions.find(row => row.id === sid)?.name,
+            activityName: app.activity.events[0]?.session_name,
+            taskSummary: app.activity.events[0]?.task_summary,
+            updatedAt: app.activity.events[0]?.updated_at,
+          };
+        }"""
+    )
+
+    assert result == {
+        "sessionName": "Renamed activity row",
+        "activityName": "Renamed activity row",
+        "taskSummary": "Keep task summary",
+        "updatedAt": 2,
+    }
+
+
 def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_token):
     page.add_init_script("localStorage.removeItem('muselab_activity_view')")
     _login(page, backend_url, auth_token)
@@ -193,9 +339,14 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
         }"""
     )
 
-    labels = page.locator(".activity-group .activity-row strong")
-    expect(labels).to_have_count(10)
-    assert labels.all_text_contents()[:3] == [
+    session_labels = page.locator(".activity-group .activity-session-name")
+    task_labels = page.locator(".activity-group .activity-task-summary")
+    expect(session_labels).to_have_count(10)
+    expect(task_labels).to_have_count(10)
+    assert session_labels.all_text_contents()[:3] == [
+        "Activity test", "Activity test", "Activity test",
+    ]
+    assert task_labels.all_text_contents()[:3] == [
         "Newest running task",
         "Newer failed task",
         "Older completed task",
@@ -209,7 +360,7 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     pin.click()
     expect(pin).to_be_enabled()
     expect(pin).to_have_attribute("aria-pressed", "true")
-    assert labels.all_text_contents()[:3] == [
+    assert task_labels.all_text_contents()[:3] == [
         "Older completed task",
         "Newest running task",
         "Newer failed task",
@@ -219,7 +370,7 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     pin.click()
     expect(pin).to_be_enabled()
     expect(pin).to_have_attribute("aria-pressed", "false")
-    assert labels.all_text_contents()[:3] == [
+    assert task_labels.all_text_contents()[:3] == [
         "Newest running task",
         "Newer failed task",
         "Older completed task",
@@ -229,7 +380,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     more = page.locator(".activity-group-more")
     expect(more).to_have_text("2 more")
     more.click()
-    expect(labels).to_have_count(12)
+    expect(session_labels).to_have_count(12)
+    expect(task_labels).to_have_count(12)
 
 
 def test_terminal_event_wins_over_stale_tab_activity_snapshot(
