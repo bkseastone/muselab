@@ -72,3 +72,12 @@ docs/background-tasks-spec.md
 
 # local Claude Code project docs — kept local, not published
 .claude/
+
+# Local Docker dev: empty CLAUDE_HOME shim (keeps real ~/.claude off the container).
+# docker-compose.override.yml IS tracked (shared dev config); only the shim is local.
+docker-empty-claude/
+
+# graphify 知识图谱: 生成产物, 用 `graphify update .` 重新生成.
+# 仅保留架构报告供浏览, 忽略缓存与原始图数据.
+graphify-out/*
+!graphify-out/GRAPH_REPORT.md

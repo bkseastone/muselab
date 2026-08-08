@@ -1,0 +1,30 @@
+# docker-compose.override.yml - 本地开发定制
+# base docker-compose.yml 保持原版, 升级 git pull 零冲突.
+# 合并规则: command(标量)覆盖 base / Dockerfile CMD;
+#           environment(字典)按 key 合并; volumes(列表)追加到 base.
+# 注意: ~/.claude 的隔离靠 .env 里 CLAUDE_HOME 指向空垫片目录实现,
+#       不在这里处理 (override 无法移除 base 的 volumes 项).
+
+services:
+  muselab:
+    # Dev mode: hot-reload backend Python. --reload-dir limits watching to
+    # backend so editing files in /data (workspace) doesn't restart server.
+    # 配合下面的 WATCHFILES_FORCE_POLLING 才能在 bind mount 上可靠生效.
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8765", "--reload", "--reload-dir", "/app/backend"]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # watchfiles 轮询模式: 宿主机改 ./backend 能被检测到
+      # (bind mount 上 inotify 对外部修改不可靠).
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      # 源码实时挂载: 宿主机编辑, 容器立即可见.
+      # backend 改动触发 uvicorn --reload; frontend/skills 请求时读取,
+      # 改完刷新浏览器 / 重新调用 Agent 即可.
+      - ./backend:/app/backend
+      - ./frontend:/app/frontend
+      - ./skills:/app/skills
+      # UI 配的 provider/MCP 持久化: 这俩写在容器内 /app,
+      # 不挂载的话 `docker rm` 重建会丢.
+      - ./provider_overrides.json:/app/provider_overrides.json
+      - ./mcp.json:/app/mcp.json
