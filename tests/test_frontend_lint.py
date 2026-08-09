@@ -21,21 +21,38 @@ FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 BACKEND = Path(__file__).resolve().parents[1] / "backend"
 
 
-# Match top-level method definitions inside the Alpine x-data object:
-#     methodName(args) {
-#     async methodName(args) {
-#     *gen(args) {
-# - Exactly 4 spaces of indent (the component's outer indent level).
-# - Strips optional `async ` / `static ` / `*` prefix so it doesn't capture
-#   the keyword as the name. Without this, `async closeChatTab` matched as
-#   `async` and missed the real collision.
-# - Excludes arrow assignments (`const foo = () =>`) and `function ` decls.
-# `(?!\{)` negative lookahead excludes calls like `_report({ ... })` where
-# the open paren is immediately followed by a `{` (object literal arg). A
-# real method def starts with `name(arg…)` or `name()`, never `name({`.
+# Candidate top-level method declarations inside the Alpine x-data object.
+# Calls can appear at the same four-space indentation in the boot IIFE, so the
+# test below also parses through the matching `)` and requires `{` after it.
 _METHOD_DEF = re.compile(
-    r"^    (?:async\s+|static\s+|\*\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\((?!\{)"
+    r"^    (?:async\s+|static\s+|\*\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
 )
+
+
+def _is_method_definition(source: str, open_paren: int) -> bool:
+    """Return whether the matching `)` is followed by a method body `{`."""
+    depth = 0
+    quote = ""
+    escaped = False
+    for i in range(open_paren, len(source)):
+        char = source[i]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return source[i + 1:].lstrip().startswith("{")
+    return False
 
 
 def test_app_js_has_no_duplicate_method_definitions():
@@ -47,7 +64,13 @@ def test_app_js_has_no_duplicate_method_definitions():
     text = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
     names = []
-    for line in text.splitlines():
+    lines = text.splitlines(keepends=True)
+    offsets = []
+    cursor = 0
+    for line in lines:
+        offsets.append(cursor)
+        cursor += len(line)
+    for line, offset in zip(lines, offsets):
         m = _METHOD_DEF.match(line)
         if not m:
             continue
@@ -59,7 +82,9 @@ def test_app_js_has_no_duplicate_method_definitions():
             "do", "else", "function", "case",
         }:
             continue
-        names.append(name)
+        open_paren = offset + m.end() - 1
+        if _is_method_definition(text, open_paren):
+            names.append(name)
 
     dupes = [n for n, c in Counter(names).items() if c > 1]
     assert not dupes, (
@@ -403,8 +428,11 @@ def test_enter_submission_waits_for_ime_composition():
     assert "target._museImeEndedAt" in ime
     assert "eventAt - endedAt <= 80" in ime
     assert helper.index("return false") < helper.index("ev.preventDefault()")
-    assert "_museImeOriginalForceModelUpdate" in app
-    assert "target._x_forceModelUpdate = value =>" in app
+    assert "_museImeOriginalForceModelUpdate" not in app
+    assert "target._x_forceModelUpdate = value =>" not in app
+    assert "_syncChatInputDom(value = this.input, options = {})" in app
+    assert "target._museImeComposing" in app
+    assert "ev.inputType === \"insertCompositionText\"" in app
     assert "this._finishImeComposition(target)" in app
     assert "if (this.input !== target.value) this.input = target.value" in app
 
@@ -414,7 +442,11 @@ def test_enter_submission_waits_for_ime_composition():
     assert '@keydown.enter="onEnter($event)"' in html
     assert '@compositionstart="onImeCompositionStart($event)"' in html
     assert '@compositionend="onImeCompositionEnd($event)"' in html
+    assert '@beforeinput="onChatBeforeInput($event)"' in html
     assert '@blur="onChatInputBlur($event)"' in html
+    assert 'x-effect="_syncChatInputDom(input, { target: $el })"' in html
+    assert 'x-model="input"' not in html
+    assert 'x-model.unintrusive="input"' not in html
     assert '@keydown.enter.prevent="commitRenameTab()"' not in html
     assert '@keydown.enter.prevent="pickerCommitInlineRename()"' not in html
     assert '@keydown.enter.prevent.stop="onEnter($event)"' not in html
@@ -1151,7 +1183,7 @@ def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate(
     assert '@click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"' in html
     assert "turnForkMessageId(paneMsgs, i)" in app
     assert 'class="fork-origin-banner"' in html
-    assert 'x-text="currentForkSource().name"' in html
+    assert 'x-text="currentForkSource()?.name || \'\'"' in html
 
     start = app.index("async forkConversation(id, upToMessageId = \"\")")
     end = app.index("\n    async menuFork", start)
@@ -1274,7 +1306,12 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     activity_state = app[app.index("activity: {"):app.index("_activityEtags:")]
-    assert 'view: "timeline"' in activity_state
+    assert 'view: "groups"' in activity_state
+
+    group_button = html.index("setActivityView('groups')")
+    status_button = html.index("setActivityView('status')")
+    timeline_button = html.index("setActivityView('timeline')")
+    assert group_button < status_button < timeline_button
 
     review = app.index('{ key: "review"')
     running = app.index('{ key: "running"', review)
@@ -1288,7 +1325,7 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'item.state === "completed" && !!item.read' in app
     assert 'item.state === "cancelled"' in app
     assert "ACTIVITY_GROUP_CAP: 5" in app
-    assert "ACTIVITY_TIMELINE_CAP: 10" in app
+    assert "ACTIVITY_TIMELINE_CAP: 15" in app
     assert 'group?.key === "timeline"' in app
     assert "this.activityGroupCap(group)" in app
     assert "activityHiddenCount(group)" in app
@@ -1305,17 +1342,54 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'this.activity.view === "timeline"' in app
     assert 'key === "timeline") return true' in app
     assert "setActivityView('timeline')" in html
+    assert "setActivityView('groups')" in html
+    assert 'activity.view === "groups"' in app
+    assert "activityCustomGroupSections()" in app
+    assert 'key: "custom:__ungrouped__"' in app
+    assert '"/api/activity/groups"' in app
+    assert '"/api/activity/groups/order"' in app
+    assert '}/group`' in app
+    assert 'class="activity-groups-toolbar"' in html
+    assert 'class="activity-group-editor"' in html
+    assert 'class="activity-row-group"' in html
+    assert '@dragstart="onActivityDragStart($event, item)"' in html
+    assert ".activity-group.is-custom.is-drag-over" in css
+    assert ".activity-move-menu" in css
     assert "const pinRank = Number(!!b.pinned) - Number(!!a.pinned)" in app
     assert "async toggleActivityPin(item)" in app
     assert 'method: "PATCH", json: { pinned: target }' in app
     assert '@click.stop="toggleActivityPin(item)"' in html
     assert 'x-show="activity.view === \'timeline\'"' in html
     assert ".activity-pin.active" in css
+    assert ".activity-modal { width:700px" in css
+    assert "max-height:min(82vh,820px)" in css
+    assert "min-height:min(56vh,520px)" in css
+    assert "scrollbar-gutter:stable" in css
 
     # The left marker is unread/action state, not a permanent failure marker.
     assert "activityIsUnreadResult(item) ? ' is-unread'" in html
     assert ".activity-row.failed.is-unread .activity-state-dot" in css
     assert ".activity-row.failed .activity-state-dot,.activity-row.waiting_approval" not in css
+
+
+def test_memory_recall_details_use_a_root_fixed_portal():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    trigger = html.index('class="memory-recall-trace"')
+    portal = html.index('class="memory-recall-global"')
+    activity = html.index('class="modal activity-modal"')
+    assert trigger < portal < activity
+    assert 'class="memory-recall-popover"' not in html
+    assert "document.querySelector(\".memory-recall-global\")" in app
+    assert '"position:fixed"' in app
+    assert "_queueMemoryRecallPosition()" in app
+    assert ".memory-recall-global {" in css
+    portal_css = css[css.index(".memory-recall-global {"):]
+    portal_css = portal_css[:portal_css.index("}")]
+    assert "position: fixed" in portal_css
+    assert "z-index: 880" in portal_css
 
 
 def test_activity_center_uses_two_compact_numberless_status_dots():
@@ -1772,6 +1846,106 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
         transport_finished_start:transport_finished_end]
 
 
+def test_fork_banner_and_message_template_are_null_and_key_safe():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "currentForkSource()?.name || ''" in html
+    assert 'x-for="(m, i) in paneMsgs" :key="m._k"' in html
+
+
+def test_render_key_hot_paths_use_pane_index_without_full_scans_or_transport_duplication():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    append_start = app.index("    _appendLiveMessage(st, m) {")
+    append_end = app.index("\n    // Keep the phone DOM", append_start)
+    append_body = app[append_start:append_end]
+    assert "_assignLiveKey(st, m)" in append_body
+    assert "_allPaneMessages" not in append_body
+    assert "_rebuildPaneMessageRenderKeys" not in append_body
+
+    activate_start = app.index("    _activateTabState(id) {")
+    activate_end = app.index("\n    // P1 (chat-perf-redesign)", activate_start)
+    activate_body = app[activate_start:activate_end]
+    assert "_ensurePaneMessageRenderKeys(id)" in activate_body
+    assert "_allPaneMessages" not in activate_body
+
+    capture_start = app.index("(function installErrorCapture() {")
+    capture_end = app.index("\n})();", capture_start)
+    capture = app[capture_start:capture_end]
+    assert capture.count('navigator.sendBeacon("/api/log/client-error"') == 1
+    assert capture.count('fetch("/api/log/client-error"') == 1
+    assert '_deliverClientErrorRecord(rec, telemetry, "[muse-telemetry]", "warn")' in capture
+
+
+def test_render_key_regression_boundaries_keep_state_and_owners_consistent():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    older_start = app.index("async _fetchOlderWindow(sid)")
+    older_end = app.index("async _fetchLaterWindow(sid)", older_start)
+    older = app[older_start:older_end]
+    assert older.index("const data = await r.json()") < older.index(
+        "if (this.tabState[sid] !== st) return 0")
+    assert older.index("if (this.tabState[sid] !== st) return 0") < older.index(
+        "this._historyEnvelopes")
+    assert older.index("if (this.tabState[sid] !== st) return 0") < older.index(
+        "this._ensurePaneMessageRenderKeys")
+
+    earlier_start = app.index("async loadEarlierMessages(sid)")
+    earlier_end = app.index("async loadLaterMessages(sid)", earlier_start)
+    earlier = app[earlier_start:earlier_end]
+    assert "await this._fetchOlderWindow(sid);\n        if (this.tabState[sid] !== st) return;" in earlier
+    assert "requestAnimationFrame(() => r()) : setTimeout(r, 0)));\n          if (this.tabState[sid] !== st) return;" in earlier
+    assert earlier.index("st.messages.unshift(...batch)") < earlier.index(
+        "this._ensurePaneMessageRenderKeys(sid)")
+    assert earlier.index("this._ensurePaneMessageRenderKeys(sid)") < earlier.index(
+        'this._capMountedWindow(st, "older")')
+
+    rebuild_start = app.index("_rebuildPaneMessageRenderKeys(tid, messages = null)")
+    rebuild_end = app.index("_ensurePaneMessageRenderKeys(tid)", rebuild_start)
+    rebuild = app[rebuild_start:rebuild_end]
+    assert "source.splice(i--, 1)" in rebuild
+    assert 'new Map([["duplicate", duplicateOccurrences]])' in rebuild
+    assert "occurrenceIssues" in rebuild
+
+    send_start = app.index("async send(opts = {})")
+    send_end = app.index("async stop()", send_start)
+    send = app[send_start:send_end]
+    reconnect = send[send.index("} else if (!isContinuation) {"):
+                     send.index("// (isContinuation:")]
+    assert "const removed = sendState.messages.splice(lastUserIdx + 1)" in reconnect
+    assert "this._releasePaneMessageRenderKeys(sendState" in reconnect
+
+    retry_start = app.index("retryFailedMessage(m)")
+    retry_end = app.index("onUserBubbleClick", retry_start)
+    assert "this._removePaneMessage(st, m)" in app[retry_start:retry_end]
+    edit_start = app.index("commitEditMessage(m)")
+    edit_end = app.index("_humanizeStreamError", edit_start)
+    assert "this._truncatePaneMessagesFrom(st, m)" in app[edit_start:edit_end]
+    truncate_start = app.index("_truncatePaneMessagesFrom(st, m)")
+    truncate_end = app.index("_appendLiveMessage(st, m)", truncate_start)
+    truncate = app[truncate_start:truncate_end]
+    assert "st._hasServerLater = false" in truncate
+    assert "this._releasePaneMessageRenderKeys(st" in truncate
+
+
+def test_render_key_telemetry_has_one_disposable_trailing_flush():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    report_start = app.index("_flushPaneRenderKeyTelemetry(tid, st)")
+    report_end = app.index("_nextPaneRenderRepairKey", report_start)
+    report = app[report_start:report_end]
+    dispose_start = app.index("_disposeTabRuntime(id)")
+    dispose_end = app.index("async removeWorkspace", dispose_start)
+    dispose = app[dispose_start:dispose_end]
+
+    assert "flushTimer: null" in app
+    assert "|| telemetry.flushTimer) return" in report
+    assert "telemetry.flushTimer = setTimeout(() =>" in report
+    assert "if (this.tabState[tid] !== st) return" in report
+    assert "this._flushPaneRenderKeyTelemetry(tid, st)" in report
+    assert "clearTimeout(st._renderKeyTelemetry.flushTimer)" in dispose
+    assert "st._renderKeyTelemetry.flushTimer = null" in dispose
+
+
 def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1888,14 +2062,15 @@ def test_scheduler_uses_activity_completion_instead_of_fixed_history_polling():
 
 def test_workspace_gate_does_not_destroy_retry_or_edit_before_send_rejects():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    retry_start = app.index("retryFailedMessage(m)")
-    retry = app[retry_start:app.index("onUserBubbleClick", retry_start)]
-    edit_start = app.index("commitEditMessage(m)")
-    edit = app[edit_start:app.index("_humanizeStreamError", edit_start)]
+    retry_start = app.index("\n    retryFailedMessage(m) {")
+    retry = app[retry_start:app.index("\n    onUserBubbleClick", retry_start)]
+    edit_start = app.index("\n    commitEditMessage(m) {")
+    edit = app[edit_start:app.index("\n    _humanizeStreamError", edit_start)]
 
     assert retry.index("if (this.workspaceSwitching) return") < retry.index(
-        "this.messages.splice")
-    assert edit.index("this.workspaceSwitching") < edit.index("msgs.splice")
+        "this._removePaneMessage")
+    assert edit.index("this.workspaceSwitching") < edit.index(
+        "this._truncatePaneMessagesFrom")
 
 
 def test_queue_sync_keeps_older_success_when_newer_read_fails():

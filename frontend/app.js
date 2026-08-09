@@ -28,6 +28,7 @@
   const DEDUP_WINDOW_MS = 10_000;
   const ring = window.__museErrors__ = [];
   const seen = new Map(); // sig -> last-ts
+  const telemetry = window.__museTelemetry__ = [];
 
   // Last fetch URL/method, captured by the wrapper below. Safari's
   // "TypeError: Load failed" has no info about which request died;
@@ -38,22 +39,10 @@
     return [rec.kind, rec.message || "", rec.filename || "", rec.lineno || ""].join("|");
   }
 
-  function _report(rec) {
-    const sig = _sig(rec);
-    const now = Date.now();
-    const last = seen.get(sig) || 0;
-    if (now - last < DEDUP_WINDOW_MS) return;
-    seen.set(sig, now);
-
-    rec.ts = new Date(now).toISOString();
-    rec.ua = navigator.userAgent;
-    rec.url = location.href;
-    rec.lastFetch = window.__museLastFetch__;
-
-    ring.push(rec);
-    if (ring.length > RING_MAX) ring.shift();
-
-    try { console.error("[muse-capture]", rec); } catch (_) { /* noop */ }
+  function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
+    targetRing.push(rec);
+    if (targetRing.length > RING_MAX) targetRing.shift();
+    try { console[consoleMethod](label, rec); } catch (_) { /* noop */ }
 
     // sendBeacon is fire-and-forget, survives page-unload, and Safari
     // supports it. Falls back to fetch+keepalive if sendBeacon refuses
@@ -72,6 +61,48 @@
       }
     } catch (_) { /* never let logging break the app */ }
   }
+
+  function _report(rec) {
+    const sig = _sig(rec);
+    const now = Date.now();
+    const last = seen.get(sig) || 0;
+    if (now - last < DEDUP_WINDOW_MS) return;
+    seen.set(sig, now);
+
+    rec.ts = new Date(now).toISOString();
+    rec.ua = navigator.userAgent;
+    rec.url = location.href;
+    rec.lastFetch = window.__museLastFetch__;
+    void _deliverClientErrorRecord(rec, ring, "[muse-capture]");
+  }
+
+  // Recoverable render-boundary diagnostics use a separate, content-free
+  // channel: they must be observable without being promoted to uncaught errors.
+  // A malformed pane is reported as one deterministic issue batch rather than
+  // one request per message, preserving the endpoint's client-error quota.
+  window.__museReportTelemetry__ = (record) => {
+    const allowedIssues = new Set(["duplicate", "missing"]);
+    const counts = new Map();
+    for (const item of ((record && record.issues) || [])) {
+      const issue = String((item && item.issue) || "");
+      const count = Number(item && item.count);
+      if (allowedIssues.has(issue) && Number.isInteger(count) && count > 0) {
+        counts.set(issue, (counts.get(issue) || 0) + count);
+      }
+    }
+    const rec = {
+      kind: record && record.kind === "message_render_key"
+        ? "message_render_key" : "frontend_diagnostic",
+      pane: String((record && record.pane) || "").slice(0, 128),
+      session: String((record && record.session) || "").slice(0, 128),
+      issues: Array.from(counts, ([issue, count]) => ({
+        issue, count: Math.min(count, 10_000),
+      }))
+        .sort((a, b) => a.issue < b.issue ? -1 : (a.issue > b.issue ? 1 : 0)),
+    };
+    if (!rec.issues.length) return;
+    void _deliverClientErrorRecord(rec, telemetry, "[muse-telemetry]", "warn");
+  };
 
   window.addEventListener("unhandledrejection", (ev) => {
     const r = ev.reason;
@@ -410,6 +441,16 @@ function portal() {
       // converts x/y to viewport-relative top/left coordinates until close.
       dragged: false, dragging: false,
     },
+    // Per-turn memory recall details are rendered in a root-level fixed
+    // popover. Keeping the card outside .chat-body is load-bearing: every pane
+    // intentionally clips overflow, so no descendant z-index can escape the
+    // transcript/composer/preview boundaries.
+    memoryRecallPopover: {
+      show: false, recall: null, style: "",
+    },
+    _memoryRecallAnchor: null,
+    _memoryRecallOwner: null,
+    _memoryRecallPositionFrame: 0,
     _previewSelectionBound: false,
     _previewSelectionTimer: null,
     _previewQuoteDrag: null,
@@ -552,9 +593,9 @@ function portal() {
     },
     activity: {
       show: false, loading: false, events: [],
-      // The global center opens on the cross-status timeline by default.
-      // An explicit user choice is still restored from localStorage.
-      view: "timeline",
+      // Custom groups are the primary organization surface. An explicit user
+      // choice is still restored from localStorage.
+      view: "groups",
       viewLoaded: false,
       summary: {
         running: 0, unread: 0, attention: 0,
@@ -566,6 +607,13 @@ function portal() {
       expanded: {},
       // Selected group keys. Empty array = no filter = show every group.
       filter: [],
+      customGroups: [],
+      groupEditor: {
+        open: false, id: "", name: "", color: "blue", saving: false,
+      },
+      moveMenu: { show: false, eventId: "", style: "" },
+      dragEventId: "",
+      dragOverGroupId: null,
     },
     _activityEtags: {},
     _activityFetchPromises: {},
@@ -578,6 +626,7 @@ function portal() {
     _activityLiveTimer: null,
     _activityLiveVisibilityBound: false,
     _activityPinPending: {},
+    _activityGroupPending: {},
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -1284,6 +1333,8 @@ function portal() {
         }
       }
       if (ev.key === "Escape") {
+        if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
+        if (this.activity.moveMenu.show) { this.closeActivityMoveMenu(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
@@ -1344,6 +1395,10 @@ function portal() {
       this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
+      window.addEventListener("resize", () => {
+        this._queueMemoryRecallPosition();
+        if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      });
       // (Cross-tab queue sync via localStorage `storage` events was removed
       // when the queue moved server-side: there's one authoritative copy now,
       // and each tab refreshes its mirror via _syncQueueFromServer on load /
@@ -1390,6 +1445,8 @@ function portal() {
       // picker, slash /resume, etc. without requiring each entry point
       // to remember to call _scrollTabIntoView.
       this.$watch("currentId", (tid) => {
+        this.closeMemoryRecallPopover();
+        this.closeActivityMoveMenu();
         if (this.previewQuote.show && this.previewQuote.sessionId
             && this.previewQuote.sessionId !== tid) {
           this.dismissTransientPreviewQuote(true);
@@ -1681,6 +1738,19 @@ function portal() {
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
     onChatInputBlur(ev) {
       this._resetImeCompositionState(ev);
+      const target = ev && (ev.target || ev.currentTarget);
+      const settledOwner = target && target._museImeSettledOwnerSid;
+      // The composer bridge intentionally ignores model writes while focused.
+      // When focus leaves (for example, the user clicks Send), commit exactly
+      // what is visibly in the native control before the click handler reads
+      // the draft. A composition settled for a different tab is excluded.
+      if (target && (!settledOwner || settledOwner === this.currentId)) {
+        if (this.input !== target.value) this.input = target.value;
+        const state = this.currentId && this.tabState && this.tabState[this.currentId];
+        if (state && state.draft) state.draft.input = target.value;
+        if (this.currentId) this._persistChatDraft(this.currentId, target.value);
+      }
+      if (target) delete target._museImeSettledOwnerSid;
       document.body.classList.remove("kb-open");
       document.documentElement.style.setProperty("--kb-inset", "0px");
       this._scheduleMobileRootReset();
@@ -3721,6 +3791,8 @@ function portal() {
       const data = await r.json();
       if (this.tabState[sid] !== st) return false;
       const win = this._historyEnvelopes(sid, data.messages || []);
+      this._markPaneRenderKeysDirty(st);
+      this._rebuildPaneMessageRenderKeys(sid, win);
       for (const m of win) {
         if (m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
       }
@@ -3738,6 +3810,7 @@ function portal() {
       // or older backend returns more than the cache cap, _capHistoryCache
       // advances _loadedOffset for every discarded head bubble.
       this._capMountedWindow(st, "around", uuid);
+      this._recordPaneRenderKeyShape(st);
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       if (sid === this.currentId) {
         this.messages = st.messages;
@@ -5232,41 +5305,36 @@ function portal() {
     // `isComposing` is the standard signal, while keyCode/which 229 and
     // key="Process" cover older Safari/WebView and Windows IME variants.
     //
-    // Chromium WebViews and Safari can emit compositionend just BEFORE the
-    // very same candidate-confirming Enter, with isComposing=false and
-    // keyCode=13. Track the textarea lifecycle directly and treat an Enter in
-    // that short event window as part of the commit. DOM-local fields avoid
-    // reactive writes while the native IME buffer is live.
-    onImeCompositionStart(ev) {
-      const target = ev && (ev.target || ev.currentTarget);
+    // The chat textarea deliberately has no x-model. While it owns focus,
+    // native DOM text is authoritative and reactive model effects do not
+    // write `textarea.value`. This is essential for Windows Pinyin and
+    // macOS marked text. Reassigning value during an active composition can
+    // detach Chromium from the OS IME; afterwards Latin keys still work but a
+    // newly selected Chinese IME produces no text until the page is rebuilt.
+    // Programmatic composer edits go through _setChatInput(), which also
+    // refuses DOM writes for the short marked-text window.
+    _markImeComposition(target) {
       if (!target) return;
       target._museImeComposing = true;
       target._museImeEndedAt = 0;
-
-      // Alpine's x-model effect is allowed to write `textarea.value` whenever
-      // the root `input` value changes.  That is normally harmless, but a
-      // programmatic draft/session reconciliation that lands while Windows
-      // Pinyin / macOS marked text is active makes Chromium replace the
-      // native composition buffer without emitting compositionend.  The
-      // textarea then remains the IME's stale target: plain Latin input still
-      // works, while switching back to Chinese can stay broken until the page
-      // is restarted.
-      //
-      // Keep the DOM-owned marked text authoritative for this short window.
-      // Input events still update Alpine's model; only model -> DOM writes are
-      // deferred.  We restore Alpine's original hook and synchronize the
-      // committed DOM value in compositionend/blur below.
-      if (!target._museImeOriginalForceModelUpdate
-          && typeof target._x_forceModelUpdate === "function") {
-        const original = target._x_forceModelUpdate;
-        target._museImeOriginalForceModelUpdate = original;
-        target._x_forceModelUpdate = value => {
-          if (target._museImeComposing) {
-            target._museImeDeferredModelValue = value;
-            return;
-          }
-          original(value);
-        };
+      delete target._museImeSettledOwnerSid;
+      if (!target._museImeOwnerSid) {
+        target._museImeOwnerSid = this.currentId || "";
+      }
+    },
+    onImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._markImeComposition(target);
+    },
+    onChatBeforeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      // A few embedded Chromium builds omit compositionstart but still expose
+      // the standard beforeinput signal. Marking here closes that gap before
+      // Alpine or any app handler can reconcile the draft.
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markImeComposition(target);
       }
     },
     onImeCompositionEnd(ev) {
@@ -5277,18 +5345,32 @@ function portal() {
     },
     _finishImeComposition(target) {
       if (!target) return;
+      // Chromium can emit compositionend and then blur for the same commit.
+      // onChatInput's missing-compositionend fallback can also run first. A
+      // second settlement must be a no-op; otherwise the shared textarea's
+      // old value is copied into whichever session became current meanwhile.
+      if (!target._museImeComposing && !target._museImeOwnerSid) return;
+      const ownerSid = target._museImeOwnerSid || this.currentId || "";
       target._museImeComposing = false;
-      const original = target._museImeOriginalForceModelUpdate;
-      if (typeof original === "function") {
-        target._x_forceModelUpdate = original;
-      }
-      delete target._museImeOriginalForceModelUpdate;
-      delete target._museImeDeferredModelValue;
+      delete target._museImeOwnerSid;
+      target._museImeSettledOwnerSid = ownerSid;
       // Safari/WebView may fire compositionend before its final non-composing
       // input event.  Commit the DOM value now; the later input is idempotent.
-      // This also deliberately lets the user's marked text win over a stale
-      // programmatic draft write that was deferred above.
+      // If a tab switch completed first, save the commit back to the textarea's
+      // original draft instead of leaking it into the newly active session.
+      if (ownerSid && ownerSid !== this.currentId) {
+        const ownerState = this.tabState && this.tabState[ownerSid];
+        if (ownerState && ownerState.draft) {
+          ownerState.draft.input = target.value;
+          this._persistChatDraft(ownerSid, target.value);
+        }
+        this.$nextTick(() => this._syncChatInputDom(this.input));
+        return;
+      }
       if (this.input !== target.value) this.input = target.value;
+      const state = ownerSid && this.tabState && this.tabState[ownerSid];
+      if (state && state.draft) state.draft.input = target.value;
+      if (ownerSid) this._persistChatDraft(ownerSid, target.value);
     },
     _resetImeCompositionState(ev) {
       const target = ev && (ev.target || ev.currentTarget);
@@ -5306,6 +5388,24 @@ function portal() {
       return !!(ev.isComposing || ev.keyCode === 229 || ev.which === 229
         || ev.key === "Process" || (target && target._museImeComposing)
         || commitEnter);
+    },
+    _syncChatInputDom(value = this.input, options = {}) {
+      const target = options.target || (this.$refs && this.$refs.chatInput);
+      if (!target || target._museImeComposing) return false;
+      // Ordinary reactive reconciliation must never replace a focused native
+      // editor. Explicit user-facing app actions call with force=true below.
+      if (!options.force && document.activeElement === target) return false;
+      const next = value == null ? "" : String(value);
+      if (target.value !== next) target.value = next;
+      return true;
+    },
+    _setChatInput(value) {
+      const next = value == null ? "" : String(value);
+      this.input = next;
+      // Explicit app actions (history, @ mention, clear, tab activation) may
+      // update a focused textarea, but still never overwrite marked text.
+      this._syncChatInputDom(next, { force: true });
+      return next;
     },
     _claimNonImeEnter(ev) {
       if (!ev || this._isImeComposingEvent(ev)) return false;
@@ -6682,6 +6782,20 @@ function portal() {
         // Monotonic per-tab sequence for optimistic/live messages. Historical
         // envelopes use transcript identity; live keys never depend on array index.
         _nextLiveKey: 1,
+        // Defensive render-key repair is pane-local and identity-based. These
+        // objects are diagnostics metadata, not reactive UI state.
+        _renderKeyByObject: new WeakMap(),
+        _renderKeyOwners: new Map(),
+        _renderKeyGeneration: 0,
+        _renderKeyNormalizedGeneration: -1,
+        _renderKeyShape: null,
+        _nextRenderRepairKey: 1,
+        _renderKeyTelemetry: {
+          lastReportedAt: -Infinity,
+          pendingDuplicate: 0,
+          pendingMissing: 0,
+          flushTimer: null,
+        },
         // Newer half of the bounded bidirectional window. Chronological order is
         // always: _earlierMessages + messages + _laterMessages.
         _laterMessages: [],
@@ -6876,6 +6990,29 @@ function portal() {
       if (st._hasServerLater === undefined) st._hasServerLater = false;
       if (st._fetchingLater === undefined) st._fetchingLater = false;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
+      if (!(st._renderKeyByObject instanceof WeakMap)) {
+        st._renderKeyByObject = new WeakMap();
+      }
+      if (!(st._renderKeyOwners instanceof Map)) st._renderKeyOwners = new Map();
+      if (!Number.isInteger(st._renderKeyGeneration)) st._renderKeyGeneration = 0;
+      if (!Number.isInteger(st._renderKeyNormalizedGeneration)) {
+        st._renderKeyNormalizedGeneration = -1;
+      }
+      if (!st._renderKeyShape || typeof st._renderKeyShape !== "object") {
+        st._renderKeyShape = null;
+      }
+      if (!Number.isInteger(st._nextRenderRepairKey)) st._nextRenderRepairKey = 1;
+      if (!st._renderKeyTelemetry || typeof st._renderKeyTelemetry !== "object") {
+        st._renderKeyTelemetry = {
+          lastReportedAt: -Infinity,
+          pendingDuplicate: 0,
+          pendingMissing: 0,
+          flushTimer: null,
+        };
+      }
+      if (st._renderKeyTelemetry.flushTimer === undefined) {
+        st._renderKeyTelemetry.flushTimer = null;
+      }
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
@@ -7732,7 +7869,17 @@ function portal() {
       const st = this._ensureTabState(id);
       const draft = st.draft;
       draft._activated = true;
-      this.input = draft.input || "";
+      const ta = this.$refs && this.$refs.chatInput;
+      // Switching ownership while an IME buffer is live must end the old
+      // editor session before the shared textarea receives the new draft.
+      // blur normally emits compositionend; the explicit reset is a fallback
+      // for WebViews that omit it when focus moves programmatically.
+      if (ta && ta._museImeComposing && ta._museImeOwnerSid
+          && ta._museImeOwnerSid !== id) {
+        ta.blur();
+        if (ta._museImeComposing) this._resetImeCompositionState({ target: ta });
+      }
+      this._setChatInput(draft.input || "");
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
       this.pendingQuotes = draft.pendingQuotes;
@@ -7751,6 +7898,7 @@ function portal() {
     // before ownership changes.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
+      this._ensurePaneMessageRenderKeys(id);
       const meta = (this.sessions || []).find(s => s.id === id);
       const selectedModel = st._modelExpected
         ? st._modelExpected.value : (meta && meta.model);
@@ -7822,12 +7970,195 @@ function portal() {
       if (!tid) return null;
       return (this.tabState && this.tabState[tid]) || null;
     },
+    _paneRenderKeyShape(st) {
+      return {
+        messages: st.messages, messagesLength: (st.messages || []).length,
+        messagesFirst: st.messages && st.messages[0],
+        messagesLast: st.messages && st.messages[st.messages.length - 1],
+        earlier: st._earlierMessages,
+        earlierLength: (st._earlierMessages || []).length,
+        earlierFirst: st._earlierMessages && st._earlierMessages[0],
+        earlierLast: st._earlierMessages
+          && st._earlierMessages[st._earlierMessages.length - 1],
+        later: st._laterMessages,
+        laterLength: (st._laterMessages || []).length,
+        laterFirst: st._laterMessages && st._laterMessages[0],
+        laterLast: st._laterMessages && st._laterMessages[st._laterMessages.length - 1],
+      };
+    },
+    _recordPaneRenderKeyShape(st) {
+      st._renderKeyShape = this._paneRenderKeyShape(st);
+      st._renderKeyNormalizedGeneration = st._renderKeyGeneration;
+    },
+    _paneRenderKeyShapeChanged(st) {
+      const before = st._renderKeyShape;
+      if (!before) return true;
+      const after = this._paneRenderKeyShape(st);
+      return before.messages !== after.messages
+        || before.messagesLength !== after.messagesLength
+        || before.messagesFirst !== after.messagesFirst
+        || before.messagesLast !== after.messagesLast
+        || before.earlier !== after.earlier
+        || before.earlierLength !== after.earlierLength
+        || before.earlierFirst !== after.earlierFirst
+        || before.earlierLast !== after.earlierLast
+        || before.later !== after.later
+        || before.laterLength !== after.laterLength
+        || before.laterFirst !== after.laterFirst
+        || before.laterLast !== after.laterLast;
+    },
+    _markPaneRenderKeysDirty(st) {
+      if (st) st._renderKeyGeneration++;
+    },
+    _flushPaneRenderKeyTelemetry(tid, st) {
+      if (!st || typeof window === "undefined" || !window.__museReportTelemetry__) {
+        return false;
+      }
+      const telemetry = st._renderKeyTelemetry;
+      const now = Date.now();
+      if (now - telemetry.lastReportedAt < 60_000) return false;
+      const issues = [
+        { issue: "duplicate", count: telemetry.pendingDuplicate },
+        { issue: "missing", count: telemetry.pendingMissing },
+      ].filter(item => item.count > 0);
+      if (!issues.length) return false;
+      if (telemetry.flushTimer) clearTimeout(telemetry.flushTimer);
+      telemetry.flushTimer = null;
+      window.__museReportTelemetry__({
+        kind: "message_render_key",
+        pane: String(tid || "pane"),
+        session: String(st._sid || tid || ""),
+        issues,
+      });
+      telemetry.lastReportedAt = now;
+      telemetry.pendingDuplicate = 0;
+      telemetry.pendingMissing = 0;
+      return true;
+    },
+    _reportPaneRenderKeyIssues(tid, st, issueCounts) {
+      if (!st || !issueCounts.size) return;
+      const telemetry = st._renderKeyTelemetry;
+      telemetry.pendingDuplicate = Math.min(10_000,
+        telemetry.pendingDuplicate + (issueCounts.get("duplicate") || 0));
+      telemetry.pendingMissing = Math.min(10_000,
+        telemetry.pendingMissing + (issueCounts.get("missing") || 0));
+      if (this._flushPaneRenderKeyTelemetry(tid, st)
+          || typeof window === "undefined" || !window.__museReportTelemetry__
+          || telemetry.flushTimer) return;
+      const delay = Math.max(0, 60_000 - (Date.now() - telemetry.lastReportedAt));
+      telemetry.flushTimer = setTimeout(() => {
+        telemetry.flushTimer = null;
+        if (this.tabState[tid] !== st) return;
+        this._flushPaneRenderKeyTelemetry(tid, st);
+      }, delay);
+    },
+    _nextPaneRenderRepairKey(tid, st, reserved) {
+      let key;
+      do {
+        key = String(tid || "pane") + ":render-repair:" + st._nextRenderRepairKey++;
+      } while (st._renderKeyOwners.has(key) || (reserved && reserved.has(key)));
+      return key;
+    },
+    _claimPaneMessageRenderKeys(
+      tid, messages, skipped = null, reservedKeys = null, initialIssues = null,
+    ) {
+      const st = this._ensureTabState(tid);
+      const list = [];
+      const objects = new Set();
+      for (const message of (Array.isArray(messages) ? messages : [])) {
+        if (!message || typeof message !== "object" || objects.has(message)
+            || (skipped && skipped.has(message))) continue;
+        objects.add(message);
+        list.push(message);
+      }
+      const reserved = reservedKeys ? new Set(reservedKeys) : new Set();
+      for (const message of list) {
+        if (st._renderKeyByObject.has(message)) continue;
+        const raw = message._k == null ? "" : String(message._k).trim();
+        if (raw) reserved.add(raw);
+      }
+      const issueCounts = initialIssues ? new Map(initialIssues) : new Map();
+      for (const message of list) {
+        const assigned = st._renderKeyByObject.get(message);
+        const assignedOwner = assigned && st._renderKeyOwners.get(assigned);
+        if (assigned && (!assignedOwner || assignedOwner === message)) {
+          message._k = assigned;
+          if (!assignedOwner) st._renderKeyOwners.set(assigned, message);
+          continue;
+        }
+        const raw = message._k == null ? "" : String(message._k).trim();
+        const owner = raw && st._renderKeyOwners.get(raw);
+        let key = raw;
+        if (!raw || (owner && owner !== message)) {
+          const issue = raw ? "duplicate" : "missing";
+          issueCounts.set(issue, (issueCounts.get(issue) || 0) + 1);
+          key = this._nextPaneRenderRepairKey(tid, st, reserved);
+        }
+        message._k = key;
+        st._renderKeyByObject.set(message, key);
+        st._renderKeyOwners.set(key, message);
+      }
+      this._reportPaneRenderKeyIssues(tid, st, issueCounts);
+      return list;
+    },
+    _rebuildPaneMessageRenderKeys(tid, messages = null) {
+      const st = this._ensureTabState(tid);
+      const oldByObject = st._renderKeyByObject;
+      const list = [];
+      const objects = new Set();
+      // Prefer the mounted window when overlapping pagination temporarily
+      // exposes the same object in more than one segment.
+      const sources = messages ? [messages]
+        : [st.messages || [], st._earlierMessages || [], st._laterMessages || []];
+      let duplicateOccurrences = 0;
+      for (const source of sources) {
+        for (let i = 0; i < source.length; i++) {
+          const message = source[i];
+          if (!message || typeof message !== "object") continue;
+          if (objects.has(message)) {
+            source.splice(i--, 1);
+            duplicateOccurrences++;
+            continue;
+          }
+          objects.add(message);
+          list.push(message);
+        }
+      }
+      const occurrenceIssues = duplicateOccurrences
+        ? new Map([["duplicate", duplicateOccurrences]]) : null;
+      const reserved = new Set();
+      for (const message of list) {
+        const assigned = oldByObject.get(message);
+        const raw = assigned || (message._k == null ? "" : String(message._k).trim());
+        if (raw) reserved.add(raw);
+      }
+      st._renderKeyByObject = new WeakMap();
+      st._renderKeyOwners = new Map();
+      const pending = [];
+      for (const message of list) {
+        const assigned = oldByObject.get(message);
+        if (assigned && !st._renderKeyOwners.has(assigned)) {
+          message._k = assigned;
+          st._renderKeyByObject.set(message, assigned);
+          st._renderKeyOwners.set(assigned, message);
+        } else {
+          pending.push(message);
+        }
+      }
+      this._claimPaneMessageRenderKeys(tid, pending, null, reserved, occurrenceIssues);
+      if (!messages) this._recordPaneRenderKeyShape(st);
+      return list;
+    },
+    _ensurePaneMessageRenderKeys(tid) {
+      const st = this._ensureTabState(tid);
+      if (st._renderKeyNormalizedGeneration === st._renderKeyGeneration
+          && !this._paneRenderKeyShapeChanged(st)) return false;
+      this._rebuildPaneMessageRenderKeys(tid);
+      return true;
+    },
     paneMessages(tid) {
-      // Pure read: must NOT mutate tabState (this runs inside an x-for render
-      // getter — creating state here via _ensureTabState both side-effects the
-      // store during render AND races tab teardown, which surfaced as an
-      // uncaught "reading 'length'" when a closing pane briefly resolved to an
-      // undefined iterable). Always hand Alpine a real array.
+      // Pure O(1) render lookup. Key normalization happens at pane data ingress
+      // and activation boundaries, never from this repeatedly-evaluated getter.
       if (!tid) return [];
       const st = this.tabState && this.tabState[tid];
       return (st && st.messages) || [];
@@ -9427,6 +9758,10 @@ function portal() {
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
         if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+        if (st._renderKeyTelemetry && st._renderKeyTelemetry.flushTimer) {
+          clearTimeout(st._renderKeyTelemetry.flushTimer);
+          st._renderKeyTelemetry.flushTimer = null;
+        }
         st.es = null;
         st._streamStartController = null;
         st._cancelBeforeStream = false;
@@ -12517,6 +12852,7 @@ function portal() {
         }
         const s = this._retainExpectedSessionSettings(await r.json());
         if (this.tabState[sid] !== st) return false;
+        if (st.streaming || st.es) return true;
         const loadedUpdated = Number(s.updated_at) || 0;
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
@@ -12564,6 +12900,12 @@ function portal() {
           // them as `sid:uuid:*` / `sid:hist:*`.
           all = this._preserveCanonicalMessageIdentity(st, all);
         }
+        const incomingCount = all.length;
+        const cacheCap = this._historyCacheCap();
+        const trimmedHead = Math.max(0, all.length - cacheCap);
+        if (trimmedHead) all = all.slice(trimmedHead);
+        this._markPaneRenderKeysDirty(st);
+        this._rebuildPaneMessageRenderKeys(sid, all);
         // Lazy-load thresholds — only render the tail of the conversation on
         // first paint; older messages stay in a "to-render" stash and get
         // mdRender'd on demand when the user clicks "Load earlier".
@@ -12695,8 +13037,8 @@ function portal() {
         // first bubble it returned (`s.offset`); everything before that
         // still lives on disk and pages in via _fetchOlderWindow. full /
         // no-window responses report offset 0 (whole chain in hand).
-        st._loadedOffset = Number.isInteger(s.offset) ? s.offset : 0;
-        st._total = Number.isInteger(s.total) ? s.total : all.length;
+        st._loadedOffset = (Number.isInteger(s.offset) ? s.offset : 0) + trimmedHead;
+        st._total = Number.isInteger(s.total) ? s.total : incomingCount;
         st._preTotal = Number.isInteger(s.pre_total) ? s.pre_total : 0;
         // Trimming may evict the oldest cached bubbles and advance the cursor,
         // so it must run after the response coordinate has been installed.
@@ -12704,6 +13046,7 @@ function portal() {
         // visible slice exceeds the DOM cap, retain its tail so the actual
         // latest reply remains mounted.
         this._capMountedWindow(st, "newer");
+        this._recordPaneRenderKeyShape(st);
         // More history exists if either the in-memory stash has older
         // bubbles OR the server holds bubbles before our window.
         st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
@@ -12931,14 +13274,21 @@ function portal() {
         // was deleted): our st is now orphaned. Stop pushing — the new
         // loadSession owns the reveal. Prevents double-fill / duplicate keys.
         if (this.tabState[sid] !== st || st.streaming || st.es) return;
-        st.messages.push(...visible.slice(i, i + CH));
-        i += CH;
+        const chunk = visible.slice(i, i + CH);
+        this._claimPaneMessageRenderKeys(sid, chunk);
+        st.messages.push(...chunk);
+        i += chunk.length;
         // Tab switched away mid-reveal: the array is no longer on screen and a
         // later return won't re-run loadSession (st._loaded is set by the
         // caller), so finish filling it in one shot to keep it complete, then
         // stop yielding.
         if (sid !== this.currentId) {
-          if (i < visible.length) st.messages.push(...visible.slice(i));
+          if (i < visible.length) {
+            const rest = visible.slice(i);
+            this._claimPaneMessageRenderKeys(sid, rest);
+            st.messages.push(...rest);
+          }
+          this._recordPaneRenderKeyShape(st);
           return;
         }
         if (i < visible.length) {
@@ -12946,7 +13296,10 @@ function portal() {
             ? requestAnimationFrame(() => r()) : setTimeout(r, 16)));
         }
       }
-      if (this.tabState[sid] === st) this._capMountedWindow(st, "older");
+      if (this.tabState[sid] === st) {
+        this._capMountedWindow(st, "older");
+        this._recordPaneRenderKeyShape(st);
+      }
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
     // markdown loadSession skipped so first paint wasn't blocked on the whole
@@ -13169,7 +13522,16 @@ function portal() {
       return result;
     },
     _assignLiveKey(st, m) {
-      if (!m._k) m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
+      // A late async callback may still hold a disposed pane state after the
+      // same session is reopened. Never claim keys in the replacement pane.
+      if (this.tabState[st._sid] !== st) return m;
+      this._ensurePaneMessageRenderKeys(st._sid);
+      if (!m._k) {
+        do {
+          m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
+        } while (st._renderKeyOwners.has(m._k));
+      }
+      this._claimPaneMessageRenderKeys(st._sid, [m]);
       return m;
     },
     _allPaneMessages(st) {
@@ -13180,14 +13542,52 @@ function portal() {
         || (st._earlierMessages || []).includes(m)
         || (st._laterMessages || []).includes(m));
     },
+    _releasePaneMessageRenderKeys(st, messages) {
+      if (!st || !Array.isArray(messages)) return;
+      for (const message of messages) {
+        const key = message && st._renderKeyByObject.get(message);
+        if (key && st._renderKeyOwners.get(key) === message) {
+          st._renderKeyOwners.delete(key);
+        }
+      }
+    },
     _removePaneMessage(st, m) {
       if (!st || !m) return false;
       for (const list of [st.messages, st._earlierMessages, st._laterMessages]) {
         if (!list) continue;
         const idx = list.indexOf(m);
-        if (idx >= 0) { list.splice(idx, 1); return true; }
+        if (idx >= 0) {
+          list.splice(idx, 1);
+          if (!this._containsPaneMessage(st, m)) this._releasePaneMessageRenderKeys(st, [m]);
+          this._recordPaneRenderKeyShape(st);
+          return true;
+        }
       }
       return false;
+    },
+    _truncatePaneMessagesFrom(st, m) {
+      if (!st || !m) return false;
+      const lists = [st._earlierMessages, st.messages, st._laterMessages];
+      const removed = [];
+      let found = false;
+      for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        if (found) {
+          removed.push(...list.splice(0));
+          continue;
+        }
+        const idx = list.indexOf(m);
+        if (idx < 0) continue;
+        removed.push(...list.splice(idx));
+        found = true;
+      }
+      if (!found) return false;
+      st._hasServerLater = false;
+      st._total = (st._loadedOffset || 0) + this._allPaneMessages(st).length;
+      this._releasePaneMessageRenderKeys(st,
+        removed.filter(message => !this._containsPaneMessage(st, message)));
+      this._recordPaneRenderKeyShape(st);
+      return true;
     },
     _appendLiveMessage(st, m) {
       // Alpine must see footer dependencies when the live object first enters
@@ -13211,6 +13611,7 @@ function portal() {
       target.push(m);
       if (target === st.messages) this._capMountedWindow(st, "newer");
       this._capHistoryCache(st);
+      this._recordPaneRenderKeyShape(st);
       return target[target.length - 1];
     },
     // Keep the phone DOM deliberately small. Rich tool/diff/code bubbles can
@@ -13243,17 +13644,19 @@ function portal() {
         st._earlierMessages = (st._earlierMessages || []).concat(head);
       }
       this._capHistoryCache(st, direction);
+      this._recordPaneRenderKeyShape(st);
       return { head, tail };
     },
     _capHistoryCache(st, direction = "newer") {
-      if (!st) return;
+      if (!st) return new Set();
       const cap = this._historyCacheCap();
+      const dropped = [];
       let held = (st._earlierMessages || []).length + (st.messages || []).length
         + (st._laterMessages || []).length;
       const dropEarlier = () => {
         if (!(st._earlierMessages && st._earlierMessages.length) || held <= cap) return;
         const drop = Math.min(held - cap, st._earlierMessages.length);
-        st._earlierMessages.splice(0, drop);
+        dropped.push(...st._earlierMessages.splice(0, drop));
         st._loadedOffset = (st._loadedOffset || 0) + drop;
         held -= drop;
       };
@@ -13263,7 +13666,7 @@ function portal() {
         // front creates an unrecoverable hole before loadLaterMessages' next
         // item; dropping the far future preserves one contiguous range.
         const drop = Math.min(held - cap, st._laterMessages.length);
-        st._laterMessages.splice(st._laterMessages.length - drop, drop);
+        dropped.push(...st._laterMessages.splice(st._laterMessages.length - drop, drop));
         st._hasServerLater = true;
         held -= drop;
       };
@@ -13289,6 +13692,15 @@ function portal() {
         dropEarlier();
         dropLater();
       }
+      if (dropped.length) {
+        const retained = new Set();
+        for (const list of [st._earlierMessages, st.messages, st._laterMessages]) {
+          for (const message of (list || [])) retained.add(message);
+        }
+        this._releasePaneMessageRenderKeys(
+          st, dropped.filter(message => !retained.has(message)));
+      }
+      return new Set(dropped);
     },
     _captureMessageAnchor(scrollEl, m) {
       const key = m && m._k;
@@ -13298,11 +13710,13 @@ function portal() {
       const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(key)}"]`);
       if (!el) return null;
-      return { key, top: el.getBoundingClientRect().top };
+      return { key, tid: this.currentId || "", top: el.getBoundingClientRect().top };
     },
     _restoreMessageAnchor(scrollEl, anchor) {
       if (!scrollEl || !anchor) return;
-      const el = scrollEl.querySelector(
+      const pane = scrollEl.querySelector(
+        `.msg-pane[data-tid="${CSS.escape(anchor.tid || "")}"]`);
+      const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(anchor.key)}"]`);
       if (!el) return;
       scrollEl.scrollTop += el.getBoundingClientRect().top - anchor.top;
@@ -13427,7 +13841,9 @@ function portal() {
         }
         if (!r.ok) return 0;
         const data = await r.json();
+        if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
+        this._ensurePaneMessageRenderKeys(sid);
         // Prepend (older bubbles go to the front of the stash). mdRender is
         // still deferred until a bubble is paged into messages[].
         st._earlierMessages = win.concat(st._earlierMessages || []);
@@ -13437,7 +13853,9 @@ function portal() {
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "older");
+        const dropped = this._capHistoryCache(st, "older");
+        this._claimPaneMessageRenderKeys(sid, win, dropped);
+        this._recordPaneRenderKeyShape(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         st._hasMoreHistory =
@@ -13483,13 +13901,16 @@ function portal() {
         const data = await r.json();
         if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
+        this._ensurePaneMessageRenderKeys(sid);
         st._laterMessages = (st._laterMessages || []).concat(win);
         if (Number.isInteger(data.total)) st._total = data.total;
         if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "newer");
+        const dropped = this._capHistoryCache(st, "newer");
+        this._claimPaneMessageRenderKeys(sid, win, dropped);
+        this._recordPaneRenderKeyShape(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         return win.length;
@@ -13588,6 +14009,7 @@ function portal() {
       if ((!st._earlierMessages || !st._earlierMessages.length)
           && st._loadedOffset > 0) {
         await this._fetchOlderWindow(sid);
+        if (this.tabState[sid] !== st) return;
       }
       if (!st._earlierMessages || !st._earlierMessages.length) {
         // Nothing local and nothing (more) on the server: recompute flags
@@ -13617,8 +14039,10 @@ function portal() {
         if (end < batch.length) {
           await new Promise(r => (typeof requestAnimationFrame !== "undefined"
             ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
+          if (this.tabState[sid] !== st) return;
         }
       }
+      if (this.tabState[sid] !== st) return;
       // These are OLD history bubbles being revealed, not new arrivals — flag
       // them so the .msg entrance animation (msg-in) doesn't replay across the
       // whole batch the instant they mount, which janks the scroll-to-top load.
@@ -13632,6 +14056,8 @@ function portal() {
       // also removes tall bubbles from the bottom.
       const anchor = this._captureMessageAnchor(scrollEl, st.messages[0]);
       st.messages.unshift(...batch);
+      this._markPaneRenderKeysDirty(st);
+      this._ensurePaneMessageRenderKeys(sid);
       this._capMountedWindow(st, "older");
       if (isCurrent) this.messages = st.messages;
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
@@ -13803,6 +14229,94 @@ function portal() {
         this._applyRenamedSession(cur.id, name);
         this.toast(this.t("toast.renamed"), "success");
       }
+    },
+
+    toggleMemoryRecallPopover(ev, message) {
+      if (this.memoryRecallPopover.show && this._memoryRecallOwner === message) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const recall = message?.memoryRecall;
+      const anchor = ev?.currentTarget;
+      if (!recall || !anchor) return;
+      if (this.previewQuote.show && this.previewQuote.mode !== "ask") {
+        this.dismissPreviewQuote(true);
+      }
+      this._memoryRecallOwner = message;
+      this._memoryRecallAnchor = anchor;
+      this.memoryRecallPopover = {
+        show: true,
+        recall,
+        style: "position:fixed;left:12px;top:12px;visibility:hidden;",
+      };
+      this.$nextTick(() => this._positionMemoryRecallPopover());
+    },
+
+    _queueMemoryRecallPosition() {
+      if (!this.memoryRecallPopover.show || this._memoryRecallPositionFrame) return;
+      this._memoryRecallPositionFrame = requestAnimationFrame(() => {
+        this._memoryRecallPositionFrame = 0;
+        this._positionMemoryRecallPopover();
+      });
+    },
+
+    _positionMemoryRecallPopover() {
+      if (!this.memoryRecallPopover.show) return;
+      const anchor = this._memoryRecallAnchor;
+      const popover = document.querySelector(".memory-recall-global");
+      if (!anchor?.isConnected || !popover) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const pad = 12;
+      const gap = 8;
+      const anchorRect = anchor.getBoundingClientRect();
+      if (anchorRect.bottom < 0 || anchorRect.top > viewportHeight) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const width = Math.max(1, Math.min(420, viewportWidth - pad * 2));
+      const maxHeight = Math.max(1, Math.min(420, viewportHeight - pad * 2));
+      // Measure at the final width.  Measuring the unconstrained portal first
+      // makes long memory text look like one short line; after width is
+      // applied it wraps taller and can fall below the viewport even though
+      // the initial geometry appeared to fit.
+      popover.style.width = `${Math.round(width)}px`;
+      popover.style.maxHeight = `${Math.round(maxHeight)}px`;
+      popover.style.left = `${pad}px`;
+      popover.style.top = `${pad}px`;
+      const measuredHeight = Math.min(
+        maxHeight,
+        Math.max(1, popover.getBoundingClientRect().height || popover.scrollHeight),
+      );
+      const centered = anchorRect.left + anchorRect.width / 2 - width / 2;
+      const left = Math.max(pad, Math.min(centered, viewportWidth - width - pad));
+      const roomAbove = anchorRect.top - pad - gap;
+      const roomBelow = viewportHeight - anchorRect.bottom - pad - gap;
+      const openAbove = roomAbove >= measuredHeight || roomAbove > roomBelow;
+      const top = openAbove
+        ? Math.max(pad, anchorRect.top - gap - measuredHeight)
+        : Math.min(viewportHeight - pad - measuredHeight, anchorRect.bottom + gap);
+      this.memoryRecallPopover.style = [
+        "position:fixed",
+        `left:${Math.round(left)}px`,
+        `top:${Math.round(Math.max(pad, top))}px`,
+        `width:${Math.round(width)}px`,
+        `max-height:${Math.round(maxHeight)}px`,
+        "visibility:visible",
+      ].join(";");
+    },
+
+    closeMemoryRecallPopover() {
+      if (this._memoryRecallPositionFrame) {
+        cancelAnimationFrame(this._memoryRecallPositionFrame);
+        this._memoryRecallPositionFrame = 0;
+      }
+      this.memoryRecallPopover = { show: false, recall: null, style: "" };
+      this._memoryRecallAnchor = null;
+      this._memoryRecallOwner = null;
     },
 
     // ===== settings modal =====
@@ -23050,7 +23564,8 @@ function portal() {
     insertFileMention(path, isDir = false) {
       const mentionPath = this._mentionPath(path, isDir);
       const mention = "@" + mentionPath + " ";
-      this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
+      this._setChatInput((this.input || "")
+        + (this.input && !this.input.endsWith(" ") ? " " : "") + mention);
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       this.toast(this.t("toast.mention_added", { path: mentionPath }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
@@ -23142,13 +23657,14 @@ function portal() {
       const c = this.slashResults[i];
       if (!c) return;
       // Replace current input with the canonical form so user sees what's submitted
-      this.input = "/" + c.name + (c.name === "model" || c.name === "resume" ? " " : "");
+      this._setChatInput("/" + c.name
+        + (c.name === "model" || c.name === "resume" ? " " : ""));
       this.slashShow = false;
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       // For commands with NO argument needed, auto-execute on selection
       if (!["model", "resume"].includes(c.name)) {
         this._runSlash(c.name, "");
-        this.input = "";
+        this._setChatInput("");
       }
     },
 
@@ -23227,7 +23743,7 @@ function portal() {
           this._activateTabState(meta.id);
           await this.loadSession(meta.id);
           // Pre-fill input with the compact prompt — user reviews then sends
-          this.input = this.t("slash.compact_prompt");
+          this._setChatInput(this.t("slash.compact_prompt"));
           this.toast(this.t("slash.compact_ok"), "success", 2500);
           return;
         }
@@ -23328,7 +23844,7 @@ function portal() {
       if (this.settings && this.settings.show) this.settings.show = false;
       // Close skills drawer if open
       if (this.skillsDrawerOpen) this.skillsDrawerOpen = false;
-      this.input = prompt;
+      this._setChatInput(prompt);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -23402,7 +23918,7 @@ function portal() {
         || (zh ? `用 ${s.name} MCP 帮我：` : `Use the ${s.name} MCP to: `);
       this.mcpDrawerOpen = false;
       if (this.settings && this.settings.show) this.settings.show = false;
-      this.input = prompt;
+      this._setChatInput(prompt);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -23660,7 +24176,7 @@ function portal() {
       draft._historyDraft = "";
     },
     _showChatHistoryInput(text, ev) {
-      this.input = text;
+      this._setChatInput(text);
       ev.preventDefault();
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
@@ -23731,12 +24247,25 @@ function portal() {
       this.mentionShow = false;
     },
     onChatInput(ev) {
+      const ta = ev.target;
+      // Do not depend on Alpine directive listener order. The native control
+      // is the source of truth while focused, especially during composition.
+      if (this.input !== ta.value) this.input = ta.value;
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markImeComposition(ta);
+      } else if (ta._museImeComposing
+                 && ev.inputType !== "insertCompositionText") {
+        // Some Android/embedded Chromium builds commit through input without
+        // a compositionend event (and may label the final event insertText,
+        // not insertFromComposition). Clear the guard after consuming it.
+        this._finishImeComposition(ta);
+        ta._museImeEndedAt = Number(ev.timeStamp) || 0;
+      }
       // A real edit forks away from the recalled entry. Programmatic history
-      // navigation updates x-model directly and does not emit an input event.
+      // navigation goes through _setChatInput and does not emit an input event.
       this._resetChatInputHistory();
       this._captureComposerState(this.currentId, { persist: false });
       this._schedulePersistChatDraft(this.currentId, this.input || "");
-      const ta = ev.target;
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
 
@@ -23840,7 +24369,7 @@ function portal() {
       const before = this.input.slice(0, this.mentionAnchor);
       const after = this.input.slice(ta.selectionStart);
       const mentionPath = this._mentionPath(item.path, !!item.is_dir);
-      this.input = before + "@" + mentionPath + " " + after;
+      this._setChatInput(before + "@" + mentionPath + " " + after);
       this._cancelMentionLookup();
       this.$nextTick(() => {
         const newPos = (before + "@" + mentionPath + " ").length;
@@ -23870,13 +24399,13 @@ function portal() {
         const ta = this.$refs.chatInput;
         if (ta) {
           const s = ta.selectionStart, e = ta.selectionEnd;
-          this.input = this.input.slice(0, s) + "\n" + this.input.slice(e);
+          this._setChatInput(this.input.slice(0, s) + "\n" + this.input.slice(e));
           this.$nextTick(() => {
             ta.setSelectionRange(s + 1, s + 1);
             this.autoGrow(ta);
           });
         } else {
-          this.input += "\n";
+          this._setChatInput(this.input + "\n");
         }
         return;
       }
@@ -23906,6 +24435,7 @@ function portal() {
       }
     },
     onChatScroll() {
+      this._queueMemoryRecallPosition();
       const el = this.$refs.chatBody;
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
@@ -24335,7 +24865,7 @@ function portal() {
           if (ownsSendDraft() && sendDraft.input === composerInput) {
             sendDraft.input = "";
             this._resetChatInputHistory(sendDraft);
-            if (this.currentId === sendSid) this.input = "";
+            if (this.currentId === sendSid) this._setChatInput("");
             this._persistChatDraft(sendSid, "");
           }
           this.$nextTick(() => { if (this.currentId === sendSid && this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
@@ -24491,7 +25021,10 @@ function portal() {
         const roles = sendState.messages.map(m => m.role);
         const lastUserIdx = roles.lastIndexOf("user");
         if (lastUserIdx >= 0 && lastUserIdx < sendState.messages.length - 1) {
-          sendState.messages.splice(lastUserIdx + 1);
+          const removed = sendState.messages.splice(lastUserIdx + 1);
+          this._releasePaneMessageRenderKeys(sendState,
+            removed.filter(message => !this._containsPaneMessage(sendState, message)));
+          this._recordPaneRenderKeyShape(sendState);
         }
       }
       // (isContinuation: keep the existing messages intact — the watcher's
@@ -26534,9 +27067,9 @@ function portal() {
       if (!m || m.role !== "user" || !m._failed) return;
       if (this.workspaceSwitching) return;
       // Drop the failed bubble, put text back in input, and send.
-      const idx = this.messages.indexOf(m);
-      if (idx >= 0) this.messages.splice(idx, 1);
-      this.input = this.userVisibleText(m);
+      const st = this.tabState[this.currentId];
+      if (!st || !this._removePaneMessage(st, m)) return;
+      this._setChatInput(this.userVisibleText(m));
       this.pendingQuotes.splice(
         0, this.pendingQuotes.length,
         ...this.userSelectionQuotes(m).map(q => ({ ...q, id: this._uuid() })),
@@ -26594,10 +27127,9 @@ function portal() {
       // (original message + all replies that followed) is discarded from
       // the in-memory view. The JSONL on disk is NOT modified; a reload
       // will show both branches, which is acceptable for now.
-      const msgs = this.messages;
-      const idx = msgs.indexOf(m);
-      if (idx >= 0) msgs.splice(idx);
-      this.input = newText;
+      const st = this.tabState[this.currentId];
+      if (!this._truncatePaneMessagesFrom(st, m)) return;
+      this._setChatInput(newText);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) this.autoGrow(ta);
@@ -26936,6 +27468,9 @@ function portal() {
             this.activity.events = data.events;
             this._syncScheduledActivitySnapshot(data.events);
           }
+          if (!opts.summaryOnly && Array.isArray(data.custom_groups)) {
+            this.activity.customGroups = data.custom_groups;
+          }
           this._syncAppBadge();
           return true;
         } catch (_) { return false; }
@@ -26945,11 +27480,12 @@ function portal() {
       finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
     },
     async openActivityCenter() {
+      this.closeMemoryRecallPopover();
       if (!this.activity.viewLoaded) {
         this.activity.viewLoaded = true;
         try {
           const saved = localStorage.getItem("muselab_activity_view");
-          if (saved === "status" || saved === "timeline") {
+          if (["status", "groups", "timeline"].includes(saved)) {
             this.activity.view = saved;
           } else if (saved === "finished") {
             // Migrate the short-lived terminal-only view to the corrected
@@ -26963,8 +27499,17 @@ function portal() {
       await this.fetchActivity();
       this.activity.loading = false;
     },
+    closeActivityCenter() {
+      this.activity.show = false;
+      this.closeActivityMoveMenu();
+      this.cancelActivityGroupEditor();
+      this.onActivityDragEnd();
+    },
     setActivityView(view) {
-      if (view !== "status" && view !== "timeline") return;
+      if (!["status", "groups", "timeline"].includes(view)) return;
+      this.closeActivityMoveMenu();
+      this.cancelActivityGroupEditor();
+      this.onActivityDragEnd();
       this.activity.view = view;
       try { localStorage.setItem("muselab_activity_view", view); } catch (_) {}
     },
@@ -26980,10 +27525,35 @@ function portal() {
       ];
     },
     ACTIVITY_GROUP_CAP: 5,
-    ACTIVITY_TIMELINE_CAP: 10,
+    ACTIVITY_TIMELINE_CAP: 15,
+    ACTIVITY_GROUP_COLORS: [
+      "blue", "violet", "cyan", "green", "amber", "rose", "gray",
+    ],
+    activityCustomGroupSections() {
+      const sections = (this.activity.customGroups || []).map(group => ({
+        key: `custom:${group.id}`,
+        label: group.name,
+        custom: true,
+        groupId: group.id,
+        color: group.color || "blue",
+      }));
+      sections.push({
+        key: "custom:__ungrouped__",
+        label: this.lang === "zh" ? "未分组" : "Ungrouped",
+        custom: true,
+        groupId: "",
+        color: "gray",
+        builtin: true,
+      });
+      return sections;
+    },
     activityMatchesGroup(item, key) {
       if (!item) return false;
       if (key === "timeline") return true;
+      if (key === "custom:__ungrouped__") return !String(item.group_id || "");
+      if (key.startsWith("custom:")) {
+        return String(item.group_id || "") === key.slice("custom:".length);
+      }
       if (key === "review") return item.state === "completed" && !item.read;
       if (key === "running") return ["running", "waiting_approval", "paused"].includes(item.state);
       if (key === "failed") return item.state === "failed";
@@ -26997,12 +27567,25 @@ function portal() {
     },
     activityAllEvents(group) {
       const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
+      const attentionRank = item => {
+        if (this.activityRequiresAction(item)) return 0;
+        if (this.activityIsUnreadResult(item)) return 1;
+        if (["running", "waiting_approval", "paused"].includes(item.state)) return 2;
+        return 3;
+      };
       return (this.activity.events || [])
         .filter(item => this.activityMatchesGroup(item, group.key))
         .sort((a, b) => {
           if (group.key === "timeline") {
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
+          if (group.custom) {
+            const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
+            if (pinRank) return pinRank;
+            const rank = attentionRank(a) - attentionRank(b);
+            if (rank) return rank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
           if (group.key === "running") {
@@ -27029,6 +27612,7 @@ function portal() {
       this.activity.expanded[key] = !this.activity.expanded[key];
     },
     activityGroupCount(group) {
+      if (group?.custom) return this.activityAllEvents(group).length;
       const count = this.activity.summary?.groups?.[group.key];
       return Number.isFinite(Number(count))
         ? Number(count) : this.activityAllEvents(group).length;
@@ -27041,6 +27625,9 @@ function portal() {
             ? "全部任务（置顶优先 · 时间倒序）"
             : "All tasks (pinned, then newest)",
         }];
+      }
+      if (this.activity.view === "groups") {
+        return this.activityCustomGroupSections();
       }
       const groups = this.activityGroups();
       const on = this.activity.filter || [];
@@ -27067,6 +27654,11 @@ function portal() {
       return !!item && ["waiting_approval", "paused"].includes(item.state);
     },
     activityGroupUnread(group) {
+      if (group?.custom) {
+        return this.activityAllEvents(group)
+          .filter(item => this.activityIsUnreadResult(item)
+            || this.activityRequiresAction(item)).length;
+      }
       const count = this.activity.summary?.group_unread?.[group.key];
       if (Number.isFinite(Number(count))) return Number(count);
       return this.activityAllEvents(group)
@@ -27163,6 +27755,224 @@ function portal() {
         this._activityPinPending = pending;
       }
     },
+    openActivityGroupEditor(group = null) {
+      const palette = this.ACTIVITY_GROUP_COLORS;
+      const fallback = palette[(this.activity.customGroups || []).length % palette.length];
+      this.closeActivityMoveMenu();
+      this.activity.groupEditor = {
+        open: true,
+        id: group?.groupId || group?.id || "",
+        name: group?.label || group?.name || "",
+        color: group?.color || fallback,
+        saving: false,
+      };
+      this.$nextTick(() => {
+        const input = document.querySelector(".activity-group-editor input");
+        if (input) input.focus();
+      });
+    },
+    cancelActivityGroupEditor() {
+      this.activity.groupEditor = {
+        open: false, id: "", name: "", color: "blue", saving: false,
+      };
+    },
+    async saveActivityGroup() {
+      const draft = this.activity.groupEditor;
+      const name = String(draft.name || "").trim();
+      if (!name || draft.saving) return;
+      draft.saving = true;
+      const editing = !!draft.id;
+      try {
+        const { ok, data, error } = await this.api(
+          editing
+            ? `/api/activity/groups/${encodeURIComponent(draft.id)}`
+            : "/api/activity/groups",
+          {
+            method: editing ? "PATCH" : "POST",
+            json: { name, color: draft.color || "blue" },
+          },
+        );
+        if (!ok || !Array.isArray(data?.custom_groups)) {
+          throw new Error(error || "activity group save failed");
+        }
+        this.activity.customGroups = data.custom_groups;
+        this._activityRevision = Math.max(
+          this._activityRevision, Number(data.revision) || 0,
+        );
+        this.cancelActivityGroupEditor();
+      } catch (error) {
+        draft.saving = false;
+        this.toast(
+          this.lang === "zh"
+            ? `保存分组失败：${String(error?.message || error)}`
+            : `Could not save group: ${String(error?.message || error)}`,
+          "error",
+        );
+      }
+    },
+    async deleteActivityGroup(group) {
+      if (!group?.groupId) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "删除分组？" : "Delete group?",
+        body: this.lang === "zh"
+          ? `“${group.label}”中的会话会移回“未分组”，会话本身不会删除。`
+          : `Sessions in “${group.label}” will move to Ungrouped. No session will be deleted.`,
+        okText: this.lang === "zh" ? "删除分组" : "Delete group",
+        danger: true,
+      });
+      if (!ok) return;
+      const groupId = group.groupId;
+      const { ok: deleted, data, error } = await this.api(
+        `/api/activity/groups/${encodeURIComponent(groupId)}`,
+        { method: "DELETE" },
+      );
+      if (!deleted) {
+        this.toast(
+          this.lang === "zh" ? "删除分组失败" : (error || "Could not delete group"),
+          "error",
+        );
+        return;
+      }
+      this.activity.customGroups = data?.custom_groups || [];
+      for (const item of this.activity.events) {
+        if (String(item.group_id || "") === groupId) delete item.group_id;
+      }
+      this.activity.events = [...this.activity.events];
+      this.activity.expanded = {};
+      this._activityRevision = Math.max(
+        this._activityRevision, Number(data?.revision) || 0,
+      );
+    },
+    async moveActivityGroup(group, delta) {
+      if (!group?.groupId || !delta) return;
+      const previous = [...(this.activity.customGroups || [])];
+      const at = previous.findIndex(row => row.id === group.groupId);
+      const target = at + delta;
+      if (at < 0 || target < 0 || target >= previous.length) return;
+      const next = [...previous];
+      const [moved] = next.splice(at, 1);
+      next.splice(target, 0, moved);
+      this.activity.customGroups = next;
+      const { ok, data } = await this.api("/api/activity/groups/order", {
+        method: "PUT",
+        json: { ids: next.map(row => row.id) },
+      });
+      if (!ok) {
+        this.activity.customGroups = previous;
+        this.toast(this.lang === "zh" ? "分组排序失败" : "Could not reorder groups", "error");
+        return;
+      }
+      if (Array.isArray(data?.custom_groups)) {
+        this.activity.customGroups = data.custom_groups;
+      }
+      this._activityRevision = Math.max(
+        this._activityRevision, Number(data?.revision) || 0,
+      );
+    },
+    activityGroupCanMove(group, delta) {
+      if (!group?.groupId) return false;
+      const at = (this.activity.customGroups || [])
+        .findIndex(row => row.id === group.groupId);
+      return at >= 0 && at + delta >= 0
+        && at + delta < (this.activity.customGroups || []).length;
+    },
+    openActivityMoveMenu(ev, item) {
+      if (!item?.id) return;
+      const rect = ev?.currentTarget?.getBoundingClientRect();
+      if (!rect) return;
+      const width = Math.min(230, window.innerWidth - 16);
+      const estimatedHeight = Math.min(
+        360, 48 + ((this.activity.customGroups || []).length + 1) * 34,
+      );
+      const left = Math.max(
+        8, Math.min(rect.right - width, window.innerWidth - width - 8),
+      );
+      const top = rect.bottom + 6 + estimatedHeight <= window.innerHeight - 8
+        ? rect.bottom + 6
+        : Math.max(8, rect.top - estimatedHeight - 6);
+      this.activity.moveMenu = {
+        show: true,
+        eventId: String(item.id),
+        style: `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
+      };
+    },
+    closeActivityMoveMenu() {
+      this.activity.moveMenu = { show: false, eventId: "", style: "" };
+    },
+    activityMoveMenuItem() {
+      const eventId = this.activity.moveMenu.eventId;
+      return this.activity.events.find(row => String(row.id) === eventId) || null;
+    },
+    async assignActivityGroup(item, groupId = "") {
+      if (!item?.id) return false;
+      const eventId = String(item.id);
+      if (this._activityGroupPending[eventId]) return false;
+      const target = String(groupId || "");
+      const previous = String(item.group_id || "");
+      this.closeActivityMoveMenu();
+      if (target === previous) return true;
+      this._activityGroupPending = {
+        ...this._activityGroupPending,
+        [eventId]: true,
+      };
+      if (target) item.group_id = target;
+      else delete item.group_id;
+      this.activity.events = [...this.activity.events];
+      this._activityAppliedSeq = ++this._activityRequestSeq;
+      try {
+        const { ok, data, error } = await this.api(
+          `/api/activity/${encodeURIComponent(eventId)}/group`,
+          { method: "PUT", json: { group_id: target } },
+        );
+        if (!ok || !data?.item) throw new Error(error || "group assignment failed");
+        const at = this.activity.events.findIndex(row => row.id === eventId);
+        if (at >= 0) this.activity.events.splice(at, 1, data.item);
+        this.activity.events = [...this.activity.events];
+        if (Array.isArray(data.custom_groups)) {
+          this.activity.customGroups = data.custom_groups;
+        }
+        this._activityRevision = Math.max(
+          this._activityRevision, Number(data.revision) || 0,
+        );
+        return true;
+      } catch (_) {
+        const latest = this.activity.events.find(row => row.id === eventId);
+        if (latest) {
+          if (previous) latest.group_id = previous;
+          else delete latest.group_id;
+        }
+        this.activity.events = [...this.activity.events];
+        this.toast(this.lang === "zh" ? "移动会话失败" : "Could not move session", "error");
+        return false;
+      } finally {
+        const pending = { ...this._activityGroupPending };
+        delete pending[eventId];
+        this._activityGroupPending = pending;
+      }
+    },
+    onActivityDragStart(ev, item) {
+      if (this.activity.view !== "groups" || !item?.id) return;
+      this.activity.dragEventId = String(item.id);
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", String(item.id));
+      }
+    },
+    onActivityDragEnd() {
+      this.activity.dragEventId = "";
+      this.activity.dragOverGroupId = null;
+    },
+    onActivityGroupDragOver(group) {
+      if (!this.activity.dragEventId) return;
+      this.activity.dragOverGroupId = group.groupId || "";
+    },
+    async onActivityGroupDrop(group) {
+      const eventId = this.activity.dragEventId;
+      this.onActivityDragEnd();
+      if (!eventId) return;
+      const item = this.activity.events.find(row => String(row.id) === eventId);
+      if (item) await this.assignActivityGroup(item, group.groupId || "");
+    },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
       if (this._activityLiveSource) {
@@ -27216,6 +28026,9 @@ function portal() {
       if (generation && generation !== this._activityGeneration) {
         this._activityGeneration = generation;
         this._activityRevision = 0;
+      }
+      if (Array.isArray(payload?.custom_groups)) {
+        this.activity.customGroups = payload.custom_groups;
       }
       const revision = Number(payload?.revision) || 0;
       if (revision && revision <= this._activityRevision) return;
@@ -27353,7 +28166,7 @@ function portal() {
     },
     async openActivityEvent(item) {
       if (!item) return;
-      this.activity.show = false;
+      this.closeActivityCenter();
       const ack = this.ackActivityEvent(item);
       const sid = item.session_id || item.thread_id;
       const opened = sid
