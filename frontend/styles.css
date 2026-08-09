@@ -168,6 +168,10 @@
   --t-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1);
   --t-base: 180ms cubic-bezier(0.4, 0, 0.2, 1);
   --t-slow: 260ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Frost login gate: 半透明色调以 source-atop 盖在霜纹理上，让白霜在浅/暖底
+     上仍可见。深色底白霜本身高对比，无需着色。 */
+  --frost-tint: transparent;
 }
 
 * { box-sizing: border-box; }
@@ -274,6 +278,9 @@ html[data-theme="light"] {
   --c-tool-fg: #92670f;
   --c-thinking-bg: #eef2fb;
   --c-thinking-fg: #3a52a0;
+
+  /* 冷蓝色调：白霜在浅底上需要偏蓝才看得清。 */
+  --frost-tint: rgba(86, 124, 184, 0.32);
 }
 
 /* =========================================================================
@@ -345,6 +352,9 @@ html[data-theme="eyecare"] {
   --c-tool-fg: #6f5226;
   --c-thinking-bg: #e8e8d8;
   --c-thinking-fg: #5a6a4a;
+
+  /* 柔和冷蓝：霜天生偏冷，暖底上用稍低 alpha 避免突兀。 */
+  --frost-tint: rgba(104, 134, 172, 0.28);
 }
 
 
@@ -579,6 +589,77 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   font-size: var(--fs-xs); color: var(--c-fg-3); margin: 4px 0 0;
   line-height: 1.5;
 }
+
+/* ==========================================================================
+   Frost login gate - 冰雪擦除人机验证
+   .frost-canvas 全屏盖在 .login-card 之上（z2），擦除到 42% 才解锁下层输入；
+   .frost-progress 浮于最顶层（z3）始终可见，pointer-events:none 不挡擦除。
+   画布像素 + is-passive 类由 modules/frost-gate.mjs 命令式管理。
+   ========================================================================== */
+.frost-canvas {
+  position: fixed; inset: 0; z-index: 2;
+  width: 100vw; height: 100vh;
+  cursor: grab; touch-action: none;
+}
+.frost-canvas:active { cursor: grabbing; }
+/* 验证通过且未在擦除时放开指针事件，让下层 token 输入可点。is-passive 由
+   frost-gate.mjs 直管（依赖 verified && !drawing，验证后仍可继续擦以对抗回霜）。 */
+.frost-canvas.is-passive { pointer-events: none; }
+
+/* 表单容器沉到霜下面，擦除后显出 mascot/logo/输入框。 */
+.login-card {
+  position: relative; z-index: 1;
+  display: flex; flex-direction: column; align-items: center;
+  gap: var(--sp-4);
+}
+.login-frost .login-card input:disabled {
+  opacity: 0.5; cursor: not-allowed;
+}
+
+/* 底部居中的进度浮层：始终可见，反馈擦除比例。 */
+.frost-progress {
+  position: fixed; left: 50%; bottom: clamp(24px, 6vh, 64px);
+  transform: translateX(-50%);
+  z-index: 3;
+  display: grid; grid-template-columns: 1fr auto; align-items: center;
+  gap: 6px 12px;
+  width: min(360px, calc(100vw - 32px));
+  padding: 12px 16px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-2);   /* fallback；支持 color-mix 的浏览器走半透明毛玻璃 */
+  background: color-mix(in srgb, var(--c-bg-2) 80%, transparent);
+  backdrop-filter: blur(12px) saturate(1.1);
+  -webkit-backdrop-filter: blur(12px) saturate(1.1);
+  box-shadow: var(--shadow-lg);
+  color: var(--c-fg-1);
+  pointer-events: none;
+}
+.frost-progress-label {
+  font-size: var(--fs-sm); font-weight: var(--fw-medium);
+  color: var(--c-fg-1);
+}
+.frost-progress-pct {
+  font-size: var(--fs-sm); font-weight: var(--fw-semibold);
+  color: var(--c-accent); font-variant-numeric: tabular-nums;
+}
+.frost-progress-meter {
+  grid-column: 1 / -1;
+  height: 6px; border-radius: 999px;
+  background: var(--c-bg-4); overflow: hidden;
+}
+.frost-progress-meter > span {
+  display: block; height: 100%; width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--c-accent-hover), var(--c-accent));
+  transition: width var(--t-base);
+}
+.frost-progress.is-done .frost-progress-pct { color: var(--c-success); }
+.frost-progress.is-done .frost-progress-meter > span { background: var(--c-success); }
+
+/* 浅/暖底上白霜对比偏弱，轻微提对比+饱和让纹理更清晰；深色无需处理。 */
+html[data-theme="light"] .frost-canvas,
+html[data-theme="eyecare"] .frost-canvas { filter: contrast(1.05) saturate(1.1); }
 
 /* ==========================================================================
    Layout

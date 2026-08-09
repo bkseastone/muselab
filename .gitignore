@@ -81,3 +81,5 @@ docker-empty-claude/
 # 仅保留架构报告供浏览, 忽略缓存与原始图数据.
 graphify-out/*
 !graphify-out/GRAPH_REPORT.md
+
+tests/

@@ -219,6 +219,11 @@ function portal() {
   return {
     // ===== auth =====
     authed: false, tokenInput: "", token: "", loginErr: "",
+    // 冰霜人机验证：画布像素由 modules/frost-gate.mjs 命令式管理；这几个响应式
+    // 字段只驱动进度条与登录按钮的禁用态。_frostGate/_frostChallenge* 同
+    // _connHeartbeat/_persistentCachePromise 一样作为非模板绑定的 _ 私有句柄。
+    frostVerified: false, frostPercent: "0%", frostPctRaw: 0, frostLabel: "",
+    _frostGate: null, _frostChallenge: null, _frostChallengePromise: null,
     // App-readiness layers:
     //   appReady=false → full-screen splash (initial load / hard refresh).
     //     Cleared once contextInfo + sessions list have arrived OR after
@@ -4700,16 +4705,90 @@ function portal() {
       }
     },
 
+    // ===== 冰霜人机验证 gate =====
+    // 登录模板渲染时（x-init）调用：动态加载 frost-gate.mjs 并挂到画布上。
+    // 画布像素、is-passive 类、回霜定时器全由模块命令式管理；这里只持实例 +
+    // 通过 onUpdate 回调驱动响应式进度条/按钮禁用态。
+    async initFrostGate() {
+      if (this._frostGate) return;
+      const canvas = this.$refs.frostCanvas;
+      if (!canvas) return;
+      const { createFrostGate } = await import("/static/modules/frost-gate.mjs");
+      // await 期间模板可能已被移除（saved-token 直接 authed），二次确认还挂在 DOM 上。
+      if (!document.body.contains(canvas)) return;
+      this._frostGate = createFrostGate(canvas, {
+        onUpdate: (s) => this._onFrostUpdate(s),
+      });
+      this.frostLabel = this.t("login.frost_progress");
+      this._loadFrostChallenge().catch(() => {});
+    },
+
+    destroyFrostGate() {
+      if (this._frostGate) {
+        this._frostGate.destroy();
+        this._frostGate = null;
+      }
+      this._frostChallenge = null;
+      this._frostChallengePromise = null;
+      this.frostVerified = false;
+      this.frostPercent = "0%";
+      this.frostPctRaw = 0;
+    },
+
+    _onFrostUpdate(s) {
+      this.frostVerified = s.verified;
+      this.frostPctRaw = Math.max(0, Math.min(100, Math.round(s.coverage * 100)));
+      this.frostPercent = this.frostPctRaw + "%";
+      this.frostLabel = s.verified
+        ? this.t("login.frost_done")
+        : this.t("login.frost_progress");
+      // 验证通过的瞬间聚焦 token 输入框，省去用户手动点选被冰霜覆盖的输入框。
+      if (s.verified) this.$nextTick(() => this.$refs.tokenInput?.focus());
+    },
+
+    async _loadFrostChallenge() {
+      if (this._frostChallengePromise) return this._frostChallengePromise;
+      this._frostChallengePromise = fetch("/api/login-challenge", {
+        method: "POST",
+      }).then(async (r) => {
+        const p = await r.json();
+        if (!r.ok) throw new Error(p.detail || this.t("login.frost_charging"));
+        this._frostChallenge = p;
+        return p;
+      }).catch((e) => {
+        // 失败后清掉缓存，让下一次 login() 重新拉取，而不是一直返回 rejected promise。
+        this._frostChallengePromise = null;
+        throw e;
+      });
+      return this._frostChallengePromise;
+    },
+
     async login() {
       this.loginErr = "";
+      if (!this._frostGate || !this._frostGate.verified) {
+        this.loginErr = this.t("login.frost_first");
+        return;
+      }
       this.token = this.tokenInput.trim();
       try {
-        // Authenticate independently of a possibly stale persisted workspace.
-        // fetchSessionWorkspaces() below validates/falls back that directory.
-        const r = await fetch("/api/files/list?path=", {
-          headers: { "X-Auth-Token": this.token },
+        // 先过冰霜人机验证，再比对 token：/api/login 同时校验 proof 与 token，
+        // 取代原先直接打 /api/files/list 探测 token。proof 单次有效，失败后须
+        // 重新取 challenge + 重新擦霜（见 catch）。token 走 body 而非 URL，避免
+        // 泄漏进 access log / Referer。
+        await this._loadFrostChallenge();
+        const proof = this._frostGate.proof(this._frostChallenge);
+        const r = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ challenge: proof, token: this.token }),
         });
-        if (!r.ok) throw new Error("token 错误");
+        if (!r.ok) {
+          const p = await r.json().catch(() => ({}));
+          throw new Error(p.detail || this.t("login.err"));
+        }
+        // 登录成功：先拆冰霜画布（清定时器/监听），再翻转 authed，让
+        // <template x-if="!authed"> 把登录块从 DOM 移除。
+        this.destroyFrostGate();
         this._setLS("muselab_token", this.token);
         this.authed = true;
         this.loadPrefs();
@@ -4743,7 +4822,15 @@ function portal() {
         // / stale-JS reload / presence reporting / bell badge refresh until a
         // manual refresh. Shared with _bootApp; safe to call once here.
         this._startLiveConnections();
-      } catch (e) { this.loginErr = e.message; }
+      } catch (e) {
+        this.loginErr = e.message;
+        // proof 单次有效且失败已计入服务端 rate-limit；重置画布 + 重新取
+        // challenge，让用户重新擦霜再试。
+        this._frostChallengePromise = null;
+        this._frostChallenge = null;
+        this._loadFrostChallenge().catch(() => {});
+        if (this._frostGate) this._frostGate.reset();
+      }
     },
 
     _restorePendingMobileTab() {

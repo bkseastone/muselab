@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi import Body, Depends, FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from .auth import require_token
+from .auth_challenge import router as auth_challenge_router
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
@@ -383,6 +384,7 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+app.include_router(auth_challenge_router)
 app.include_router(files_router)
 app.include_router(file_events_router)
 app.include_router(chat_router)

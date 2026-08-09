@@ -264,18 +264,27 @@
        真的从 DOM 移除。否则它一直挂着，iOS 17+ 会把整页识别成"账户上下文"，
        chat textarea 一聚焦就被 AutoFill 快译条占一行。 -->
   <template x-if="!authed && appReady">
-    <div class="login">
-      <span class="muse-mascot lg" :class="{'greet': mascotGreet}">
-        <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-      </span>
-      <h2 class="login-logo">muse<span class="accent">lab</span></h2>
-      <p class="login-tagline" x-text="t('login.tagline')"></p>
-      <p class="login-sub" x-html="t('login.sub')"></p>
-      <input type="password" :placeholder="t('login.token_placeholder')" x-model="tokenInput"
-             @keydown.enter="login()" autofocus />
-      <button @click="login()" class="btn-primary" x-text="t('login.go')"></button>
-      <p class="err" x-text="loginErr"></p>
-      <p class="login-hint" x-show="loginErr" x-text="t('login.hint_on_err')"></p>
+    <div class="login login-frost" x-init="$nextTick(() => initFrostGate())">
+      <canvas class="frost-canvas" x-ref="frostCanvas" aria-hidden="true"></canvas>
+      <div class="login-card">
+        <span class="muse-mascot lg" :class="{'greet': mascotGreet}">
+          <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+        </span>
+        <h2 class="login-logo">muse<span class="accent">lab</span></h2>
+        <p class="login-tagline" x-text="t('login.tagline')"></p>
+        <p class="login-sub" x-html="t('login.sub')"></p>
+        <input type="password" :placeholder="t('login.token_placeholder')" x-model="tokenInput"
+               :disabled="!frostVerified" @keydown.enter="login()"
+               x-ref="tokenInput" />
+        <button @click="login()" class="btn-primary" :disabled="!frostVerified" x-text="t('login.go')"></button>
+        <p class="err" x-text="loginErr"></p>
+        <p class="login-hint" x-show="loginErr" x-text="t('login.hint_on_err')"></p>
+      </div>
+      <div class="frost-progress" :class="{ 'is-done': frostVerified }" aria-live="polite">
+        <span class="frost-progress-label" x-text="frostLabel"></span>
+        <span class="frost-progress-pct" x-text="frostPercent"></span>
+        <div class="frost-progress-meter"><span :style="`width:${frostPctRaw}%`"></span></div>
+      </div>
     </div>
   </template>
 
