@@ -942,19 +942,25 @@ html[data-theme="eyecare"] .frost-canvas { filter: contrast(1.05) saturate(1.1);
   .pane.files .pane-head .files-palette-mobile { display: inline-flex; }
   .chat-head-palette { display: none; }
 
-  /* Preview pane head on mobile: keep @-mention + download + reload
-     (marker class `.preview-keep-mobile`). Edit/save is desktop-only —
-     no on-phone code editing; collapse-left / collapse-right are
-     meaningless in single-pane mobile mode. Reload was added back
-     after user feedback — when Muse rewrites a file mid-conversation
-     the basename auto-refresh covers the common case, but external
-     edits (`git pull`, another device's edit) still need a manual
-     reload tap. */
+  /* Preview pane head on mobile: keep @-mention + download + reload +
+     edit/save (all carry the `.preview-keep-mobile` marker class).
+     collapse-left / collapse-right are meaningless in single-pane mobile
+     mode. Reload was added back after user feedback — when Muse rewrites a
+     file mid-conversation the basename auto-refresh covers the common case,
+     but external edits (`git pull`, another device's edit) still need a
+     manual reload tap. */
   .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
-  /* Only hide the header's direct edit/save action. Descendant primary
-     buttons belong to popovers (notably Terminal → New terminal) and must
-     remain visible on mobile. */
-  .pane.preview > .pane-head > .btn-primary { display: none; }
+  /* The edit + save buttons carry `.preview-keep-mobile` so they survive
+     the icon-btn filter above and stay reachable on phones (mobile md
+     editing is supported). Other direct .btn-primary actions belong to
+     popovers (notably Terminal → New terminal) and stay visible; only
+     unmarked header-level primary buttons are hidden. */
+  .pane.preview > .pane-head > .btn-primary:not(.preview-keep-mobile) { display: none; }
+  /* Mobile editor: hide the edit/split/preview switcher. Mobile forces
+     full-width edit (see toggleEdit in app.js) and split/preview run the
+     heavy live mdRender on every keystroke - the phone heat/jank source.
+     Users view the rendered file by exiting edit back to preview. */
+  .editor-toolbar { display: none !important; }
   /* Path + mtime strip: keep it on mobile (the user wants it visible), but
      give it its OWN ROW.
 

@@ -23439,7 +23439,12 @@ function portal() {
       // preview + view-switch toolbar). For md, restore the persisted layout
       // choice and seed the preview HTML so it's there on first paint.
       this.editorIsMd = this._isMdPath(targetPath);
-      if (this.editorIsMd) {
+      // Mobile forces full-width edit: the split pane is too narrow on a
+      // phone, and the live mdRender (marked + DOMPurify + KaTeX on every
+      // keystroke) is the main heat/jank source. Desktop keeps the persisted
+      // split/edit/preview layout and seeds live-preview for first paint;
+      // mobile (and all non-md files) fall through to plain full-width edit.
+      if (this.editorIsMd && !this._isMobileLayout()) {
         const saved = localStorage.getItem("muselab_editor_view");
         this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
           ? saved : "split";
