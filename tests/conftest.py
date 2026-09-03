@@ -1,12 +1,45 @@
 """Shared pytest fixtures: spin up a backend.main app against a temp ROOT and
 fresh sessions dir, with a known token. Each test gets a clean filesystem."""
+import asyncio
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 
 TEST_TOKEN = "test-token-1234567890abcdef-secure-min-32"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Give every xdist worker private module-import-time runtime state.
+
+    Several backend modules create SQLite registries when tests are collected,
+    before function-scoped fixtures can replace MUSELAB_ROOT. Sharing the
+    caller's root made parallel workers race the same database and could also
+    touch a developer's live workspace. A fresh worker root keeps collection
+    parallel, deterministic and hermetic.
+    """
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "").strip()
+    if not worker_id or worker_id == "master":
+        return
+
+    worker_root = Path(tempfile.mkdtemp(
+        prefix=f"muselab-pytest-{worker_id}-",
+    ))
+    sessions = worker_root / "sessions"
+    memory = worker_root / "memory"
+    sessions.mkdir()
+    memory.mkdir()
+    os.environ["MUSELAB_ROOT"] = str(worker_root)
+    os.environ["MUSELAB_SESSIONS_DIR"] = str(sessions)
+    os.environ["MUSELAB_MEMORY_DIR"] = str(memory)
+    os.environ["MUSELAB_ENV_PATH"] = str(worker_root / "runtime.env")
+    config.add_cleanup(
+        lambda: shutil.rmtree(worker_root, ignore_errors=True)
+    )
 
 
 @pytest.fixture()
@@ -57,19 +90,17 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_IMAGE_BASE_URL", raising=False)
 
-    # NOTE (audit I/312 — fragility, intentionally left as-is for now):
     # Deleting every `backend.*` module forces a full re-import of the whole
     # tree on each test, which re-runs module-level init (e.g. backend.chat
     # snapshots SESS_DIR/active_turns at import) so the monkeypatched ROOT /
     # SESS_DIR / env take effect. The downside is that any module-level mutable
     # global (chat._clients, scheduler._state, …) is recreated per test — which
-    # mostly isolates state, but couples correctness to import order and means a
-    # module that caches a path/handle BEFORE the relevant monkeypatch silently
-    # leaks (see the SESS_DIR ordering dance below; test_scheduler.py:20 also
-    # resets _state by hand). The proper fix is to move that global state into
-    # injectable objects (e.g. an app-scoped registry) so tests construct a
-    # fresh instance instead of nuking sys.modules — that's a larger refactor
-    # touching backend/, out of scope for this CI/test-hardening pass.
+    # isolates state but makes the fixture the owner of each imported
+    # generation. The teardown below closes the same runtime resources that
+    # the application lifespan owns in production.
+    # Keep path monkeypatches before their owning module's import (see the
+    # SESS_DIR ordering below; test_scheduler.py also resets its explicit
+    # state holder).
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
 
@@ -139,13 +170,32 @@ def app_module(monkeypatch, temp_root, tmp_path):
               "MUSELAB_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
 
-    return main_mod
+    # Tests intentionally bypass the application's lifespan in order to keep
+    # endpoint fixtures small. They must therefore own the equivalent runtime
+    # teardown before the next test evicts this module tree from sys.modules.
+    from backend import chat as chat_mod
+    from backend import memory_client as memory_mod
+
+    async def shutdown_test_runtime() -> None:
+        try:
+            await chat_mod.shutdown_runtime()
+        finally:
+            await memory_mod.aclose()
+
+    try:
+        yield main_mod
+    finally:
+        asyncio.run(shutdown_test_runtime())
 
 
 @pytest.fixture()
 def client(app_module):
     from fastapi.testclient import TestClient
-    return TestClient(app_module.app)
+    test_client = TestClient(app_module.app)
+    try:
+        yield test_client
+    finally:
+        test_client.close()
 
 
 @pytest.fixture()

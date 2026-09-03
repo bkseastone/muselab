@@ -9,7 +9,7 @@ muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 3. **持久化运行状态**：会话、调度、Activity、Push 和生图任务。
 4. **浏览器偏好**：语言、布局、打开的 Tab 等本地 UI 状态。
 
-手动修改 `.env` 后应重启服务。设置面板保存的 provider key、默认模型和默认权限会原子更新 `MUSELAB_ENV_PATH` 指向的文件与当前进程，通常无需重启。设置面板不会开放 token、根目录或监听地址。
+手动修改 `.env` 后应重启服务。设置面板保存的 provider key、默认模型、默认权限和忙时发送方式会原子更新 `MUSELAB_ENV_PATH` 指向的文件与当前进程，通常无需重启。设置面板不会开放 token、根目录或监听地址。
 
 ## 必需与网络设置
 
@@ -25,6 +25,7 @@ muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 | `MUSELAB_MODEL` | 新会话默认模型；未设置时使用内置 Claude 默认值 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | 设置面板保存的默认模型，与 `MUSELAB_MODEL` 同步 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_PERMISSION` | 新会话默认 SDK 权限模式 | `bypassPermissions` |
+| `MUSELAB_BUSY_SEND_MODE` | 会话忙碌时的发送方式：`adjust` 在下一个安全的工具边界调整当前任务；`queue` 等当前 turn 完成后再执行 | `adjust` |
 | `MUSELAB_MEMORY_DIR` | 可选的长期记忆 Registry／配置目录 | `$MUSELAB_ROOT/.muselab/memory` |
 
 `MUSELAB_ROOT` 必须存在。`/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等系统级根路径会被拒绝；用户自己的 home 或其子目录可以使用。旧版本文档曾称它为 archive root；环境变量名为兼容已有部署而保留，当前产品概念统一为“主工作区”。
@@ -87,6 +88,8 @@ muselab 只作为 Images API 客户端，不再启动本地生图模型或 Codex
 |---|---|---|
 | `MUSELAB_PROMPT_CACHE_TTL` | Claude prompt cache TTL | `1h` |
 | `MUSELAB_BUDGET_USD` | 月度 UI 软预算，不会硬中断 | `0` |
+| `MUSELAB_PERF_LOG` | 输出核心链路的隐私受限性能摘要；设为 `0` 可关闭 | `1` |
+| `MUSELAB_SLOW_REQUEST_MS` | 慢 HTTP 请求和工作区操作的耗时阈值，限制在 25–60000 毫秒 | `500` |
 | `MUSELAB_MAX_UPLOAD_MB` | Files API 单文件上传上限 MiB | `100` |
 | `MUSELAB_MAX_TURNS` | 每会话最大回合数，`0` 表示不额外限制 | `0` |
 | `MUSELAB_THINKING_BUDGET` | 扩展思考 token 预算 | `10000` |

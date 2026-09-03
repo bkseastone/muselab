@@ -15,12 +15,8 @@ ScheduleWakeup
 SendMessage
 Skill
 Task
-TaskCreate
-TaskGet
-TaskList
 TaskOutput
 TaskStop
-TaskUpdate
 ToolSearch
 WebFetch
 WebSearch

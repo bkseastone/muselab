@@ -409,7 +409,7 @@ def test_interrupted_turn_sidecar_round_trip(app_module, client, auth, tmp_path)
 
     # Drop a fake sidecar (mimics what _write_active_turn_sidecar does
     # on turn start, then a process death before _delete... could fire).
-    fake_sid = "TEST-CRASHED-TURN-001"
+    fake_sid = "11111111-2222-4333-8444-555555555555"
     sidecar_path = chat_mod._active_turn_path(fake_sid)
     sidecar_path.write_text(json.dumps({
         "sid": fake_sid,
@@ -567,7 +567,9 @@ def test_organize_session_does_not_seed_profile_or_personal_directories(
     assert "initial_message" in body
     assert "zh" in body["initial_message"]
     assert "en" in body["initial_message"]
-    assert "workspace-curator skill" in body["initial_message"]["en"]
+    assert "read-only scan" in body["initial_message"]["en"]
+    assert "explicit confirmation" in body["initial_message"]["en"]
+    assert "CLAUDE.md" in body["initial_message"]["en"]
     assert not claude_md.exists()
     for name in ("health", "work", "money", "people", "archives"):
         assert not (temp_root / name).exists()
@@ -584,7 +586,9 @@ def test_profile_intake_is_a_side_effect_free_compatibility_forward(
     )
     assert r.status_code == 200
     body = r.json()
-    assert "workspace-curator skill" in body["initial_message"]["en"]
+    assert "read-only scan" in body["initial_message"]["en"]
+    assert "explicit confirmation" in body["initial_message"]["en"]
+    assert "CLAUDE.md" in body["initial_message"]["en"]
     assert not claude_md.exists()
     for name in ("health", "work", "money", "people", "archives"):
         assert not (temp_root / name).exists()

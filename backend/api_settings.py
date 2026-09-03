@@ -12,13 +12,14 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from claude_agent_sdk.types import PermissionMode
 from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
+from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
 # by main.py for the CLI version probe at /api/meta. Both modules import
 # from settings.locate_executable; we keep the underscored alias here so
@@ -29,6 +30,7 @@ MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+router.include_router(hook_settings_router)
 
 # Path to the .env file we read/write at runtime. Defaults to the repo
 # root's `.env`. The MUSELAB_ENV_PATH override is critical for test
@@ -72,6 +74,7 @@ _CUSTOM_ENV_RE = re.compile(r"^MUSELAB_PROVIDER_[A-Z0-9_]+_API_KEY$")
 DEFAULT_KEYS = [
     "MUSELAB_DEFAULT_MODEL",
     "MUSELAB_DEFAULT_PERMISSION",
+    "MUSELAB_BUSY_SEND_MODE",
 ]
 
 
@@ -105,6 +108,7 @@ class SettingsIn(BaseModel):
     # Defaults
     default_model: str | None = None
     default_permission: PermissionMode | None = None
+    busy_send_mode: Literal["adjust", "queue"] | None = None
     # (Removed 2026-05-28) notify_scheduled / notify_normal —
     # The 4-toggle notification panel collapsed to a single client-side
     # "notify me" switch. Subscription state IS the on/off; no per-class
@@ -202,6 +206,7 @@ _SETTING_DEFAULTS: dict[str, str] = {
     "MUSELAB_MODEL":                "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_MODEL":        "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_PERMISSION":   "bypassPermissions",
+    "MUSELAB_BUSY_SEND_MODE":       "adjust",
 }
 
 
@@ -276,6 +281,7 @@ def get_settings() -> dict:
                 "MUSELAB_DEFAULT_MODEL",
                 os.environ.get("MUSELAB_MODEL", _SETTING_DEFAULTS["MUSELAB_MODEL"])),
             "permission": _current("MUSELAB_DEFAULT_PERMISSION"),
+            "busy_send_mode": _current("MUSELAB_BUSY_SEND_MODE"),
         },
         # `params` retained as an empty dict for FE backwards-compat — old
         # builds spread `d.params` into draftParams and would TypeError on
@@ -370,6 +376,9 @@ def put_settings(req: SettingsIn) -> dict:
     if req.default_permission is not None and _changed(
             "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
         updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
+    if req.busy_send_mode is not None and _changed(
+            "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
+        updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
     if req.provider_disabled is not None:
         raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
         disabled_models = set(raw.split(",")) if raw else set()
@@ -1140,15 +1149,15 @@ def _list_plugin_skills() -> list[dict]:
 
 @router.get("/skills", dependencies=[Depends(require_token)])
 def list_skills() -> dict:
-    """List all skills discoverable from project, user, and plugin scopes.
+    """List Skills visible to the read-only dynamic frontend browser.
 
-    project = muselab's own preset skills (this repo's skills/)
-    user    = ~/.claude/skills/ (shared with Claude Code CLI)
+    project = optional repository extension Skills (this repo's skills/)
+    user    = ~/.claude/skills/ (including reviewed generated Skills)
     plugin  = ~/.claude/plugins/marketplaces/*/plugins/*/skills/
 
-    Same-named skills across scopes are returned as separate entries —
-    the UI shows scope badges so users can see when a skill is shadowed
-    (e.g. they have a user-scope mermaid-helper AND a project preset)."""
+    Same-named Skills across scopes are returned as separate entries so their
+    provenance remains inspectable. Active-workspace discovery itself remains
+    SDK-native through setting_sources=["user", "project", "local"]."""
     skills = (_list_skills_in(SKILL_PROJECT_DIR, "project") +
               _list_skills_in(SKILL_USER_DIR, "user") +
               _list_plugin_skills())

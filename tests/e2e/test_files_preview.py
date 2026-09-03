@@ -31,6 +31,55 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def _install_fake_mux_chat_transport(page: Page, turn_bodies: list[dict]) -> None:
+    page.add_init_script(
+        """
+        (() => {
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              setTimeout(() => {
+                if (this.readyState === 2) return;
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event('open'));
+                this.dispatchEvent(new Event('open'));
+              }, 0);
+            }
+            close() { this.readyState = 2; }
+          }
+          window.EventSource = FakeEventSource;
+        })();
+        """
+    )
+
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"preview-mux-ticket"}',
+        ),
+    )
+
+    def handle_turn_start(route) -> None:
+        body = route.request.post_data_json
+        turn_bodies.append(body)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": body["session_id"],
+                "turn_id": f"preview-turn-{len(turn_bodies)}",
+                "started_at": 1_700_000_000,
+            }),
+        )
+
+    page.route("**/api/chat/turns/start", handle_turn_start)
+
+
 def _select_rendered_preview_text(page: Page) -> str:
     # Alpine can publish ``previewMode`` one render tick before the Markdown
     # body is mounted.  Wait for the actual selectable surface so callers do
@@ -173,7 +222,7 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["restored"]["previewDisplay"] == "flex"
     assert result["restored"]["chat"]["right"] <= result["restored"]["preview"]["left"]
     assert result["restored"]["sameChatNode"] is True
-    assert result["prefs"]["schema"] == 9
+    assert result["prefs"]["schema"] == 10
     assert result["prefs"]["previewOpen"] is True
     assert result["prefs"]["previewWidth"] == 440
     assert "rightOpen" not in result["prefs"]
@@ -186,6 +235,214 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["chatFullscreen"]["chat"]["width"] == 1440
     assert result["chatFullscreen"]["previewDisplay"] == "none"
     assert result["chatFullscreen"]["sameChatNode"] is True
+
+
+def test_file_pane_picker_and_drop_show_real_upload_progress(
+        page: Page, backend_url, auth_token):
+    """Both workspace-file entry points expose intermediate byte progress."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Network.enable")
+    cdp.send("Network.emulateNetworkConditions", {
+        "offline": False,
+        "latency": 40,
+        "downloadThroughput": 8 * 1024 * 1024,
+        "uploadThroughput": 64 * 1024,
+        "connectionType": "cellular3g",
+    })
+
+    def wait_for_intermediate_progress() -> dict:
+        page.wait_for_function(
+            """() => {
+              const app = document.querySelector('#app')?._x_dataStack?.[0];
+              const p = app?.fileUploadProgress;
+              return p?.visible && p.known && p.percent > 0 && p.percent < 100;
+            }""",
+            timeout=10_000,
+        )
+        return page.evaluate(
+            """() => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              const bar = document.querySelector('.file-upload-progress');
+              return {
+                percent: app.fileUploadProgress.percent,
+                visible: !!bar?.getClientRects().length,
+                ariaNow: bar?.querySelector('[role="progressbar"]')
+                  ?.getAttribute('aria-valuenow'),
+              };
+            }"""
+        )
+
+    def wait_for_uploaded(name: str) -> None:
+        page.wait_for_function(
+            """async name => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              const response = await fetch('/api/files/list?path=', {
+                headers: app.fileHdr(),
+              });
+              if (!response.ok) return false;
+              const data = await response.json();
+              return data.entries.some(entry => entry.name === name);
+            }""",
+            arg=name,
+            timeout=10_000,
+        )
+
+    picker_name = "picker-progress.bin"
+    page.locator(
+        '.pane.files input[type="file"][x-ref="upload"]'
+    ).set_input_files({
+        "name": picker_name,
+        "mimeType": "application/octet-stream",
+        "buffer": b"p" * (192 * 1024),
+    })
+    picker_progress = wait_for_intermediate_progress()
+    assert picker_progress["visible"] is True
+    assert 0 < picker_progress["percent"] < 100
+    assert picker_progress["ariaNow"] is not None
+    wait_for_uploaded(picker_name)
+    page.wait_for_function(
+        """() => !document.querySelector('#app')._x_dataStack[0]
+          .fileUploadProgress.visible""",
+        timeout=10_000,
+    )
+
+    drop_name = "drop-progress.bin"
+    page.evaluate(
+        """({name, size}) => {
+          const bytes = new Uint8Array(size);
+          bytes.fill(100);
+          const transfer = new DataTransfer();
+          transfer.items.add(new File(
+            [bytes], name, {type: 'application/octet-stream'}));
+          document.querySelector('.filelist').dispatchEvent(new DragEvent('drop', {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: transfer,
+          }));
+        }""",
+        {"name": drop_name, "size": 192 * 1024},
+    )
+    drop_progress = wait_for_intermediate_progress()
+    assert drop_progress["visible"] is True
+    assert 0 < drop_progress["percent"] < 100
+    assert drop_progress["ariaNow"] is not None
+    wait_for_uploaded(drop_name)
+
+
+def test_refresh_restores_file_without_reopening_hidden_preview(
+        page: Page, backend_url, auth_token):
+    """Background file restoration preserves the user's hidden right rail."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    prepared = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const opened = await app.openFile({path: 'README.md', name: 'README.md'});
+          app.desktopFullPane = '';
+          app.previewOpen = false;
+          app.savePrefs();
+          return {
+            opened,
+            selected: app.selected,
+            previewOpen: app.previewOpen,
+            savedPreviewOpen: JSON.parse(
+              localStorage.getItem('muselab_prefs') || '{}').previewOpen,
+          };
+        }"""
+    )
+    assert prepared == {
+        "opened": True,
+        "selected": "README.md",
+        "previewOpen": False,
+        "savedPreviewOpen": False,
+    }
+
+    # A fresh boot should reload the selected file in the background without
+    # treating restoration as a user click that reveals the preview rail.
+    _login(page, backend_url, auth_token)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          return app && app.selected === 'README.md' && !app.previewOpen;
+        }"""
+    )
+    restored = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const preview = document.querySelector('.pane.preview');
+          return {
+            selected: app.selected,
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(preview).display,
+          };
+        }"""
+    )
+    assert restored == {
+        "selected": "README.md",
+        "previewOpen": False,
+        "previewDisplay": "none",
+    }
+
+    # A plain internal load is layout-neutral by default. Only an explicitly
+    # user-owned call with reveal:true may reopen the hidden rail.
+    reveal_contract = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.openFile({path: 'README.md', name: 'README.md'});
+          const afterBackground = {
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+          await app.reloadPreview();
+          const afterReload = {
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+          await app._maybeReloadPreview('README.md');
+          const afterToolReload = {
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+          await app.onNodeClick({}, {
+            path: 'README.md', name: 'README.md', is_dir: false,
+          });
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          return {
+            afterBackground,
+            afterReload,
+            afterToolReload,
+            selected: app.selected,
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+        }"""
+    )
+    assert reveal_contract == {
+        "afterBackground": {
+            "previewOpen": False,
+            "previewDisplay": "none",
+        },
+        "afterReload": {
+            "previewOpen": False,
+            "previewDisplay": "none",
+        },
+        "afterToolReload": {
+            "previewOpen": False,
+            "previewDisplay": "none",
+        },
+        "selected": "README.md",
+        "previewOpen": True,
+        "previewDisplay": "flex",
+    }
 
 
 def test_os_file_drop_uses_whole_window_root_except_explicit_directory(
@@ -401,7 +658,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
-            messageCount: app.messages.length,
+            messageCount: app._ensureTabState(app.currentId).messages.length,
           };
         }"""
     )
@@ -423,7 +680,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
-            messageCount: app.messages.length,
+            messageCount: app._ensureTabState(app.currentId).messages.length,
           };
         }"""
     )
@@ -515,7 +772,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             session: app.currentId,
             sessionCount: app.sessions.length,
             openTabs: [...app.openTabIds],
-            messageCount: app.messages.length,
+            messageCount: app._ensureTabState(app.currentId).messages.length,
             askSessionId: app.previewQuote.askSessionId,
             popover: app.previewQuote.show,
           };
@@ -696,12 +953,16 @@ def test_selection_side_question_window_drags_by_header_and_stays_in_view(
         ".preview-selection-ask-head"
     )
     expect(form_head).to_be_visible()
+    # Visibility only proves x-if rendered. Wait for openPreviewSelectionAsk's
+    # nextTick initializer before pointer input can race its position reset.
+    expect(page.locator(
+        ".preview-selection-ask:visible textarea")).to_be_focused()
     before = popover.bounding_box()
     head_box = form_head.bounding_box()
     assert before is not None and head_box is not None
     start_x = head_box["x"] + 32
     start_y = head_box["y"] + head_box["height"] / 2
-    target_left = 80
+    target_left = max(12, min(80, 1000 - before["width"] - 12))
     target_top = 120
     page.mouse.move(start_x, start_y)
     page.mouse.down()
@@ -836,6 +1097,9 @@ def test_selection_side_question_window_supports_touch_drag(
     popover = page.locator(".preview-selection-popover")
     head = page.locator(".preview-selection-ask .preview-selection-ask-head")
     expect(head).to_be_visible()
+    # Join the same nextTick focus callback before dispatching trusted touch.
+    expect(page.locator(
+        ".preview-selection-ask:visible textarea")).to_be_focused()
     before = popover.bounding_box()
     head_box = head.bounding_box()
     assert before is not None and head_box is not None
@@ -875,38 +1139,17 @@ def test_selection_side_question_window_supports_touch_drag(
 
 def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
         page: Page, backend_url, auth_token):
+    turn_bodies: list[dict] = []
+    _install_fake_mux_chat_transport(page, turn_bodies)
     _login(page, backend_url, auth_token)
-    ticket_bodies: list[dict] = []
-
-    def handle_ticket(route) -> None:
-        ticket_bodies.append(route.request.post_data_json)
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"ticket": "preview-detached-ticket"}),
-        )
-
-    page.route("**/api/chat/stream/start", handle_ticket)
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          class FakeEventSource extends EventTarget {
-            constructor(url) {
-              super();
-              this.url = url;
-              this.readyState = 0;
-              setTimeout(() => {
-                this.readyState = 1;
-                if (this.onopen) this.onopen(new Event('open'));
-              }, 0);
-            }
-            close() { this.readyState = 2; }
-          }
-          const originalEventSource = window.EventSource;
+          app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
+          app.model = 'e2e-model';
           const originalBusy = app._confirmSessionBusy;
           const originalRuntimeWait = app._awaitRuntimeSettingPatches;
           const originalCommit = app._commitChatRecoveryDraft;
-          window.EventSource = FakeEventSource;
           app._confirmSessionBusy = async () => false;
           app._awaitRuntimeSettingPatches = async () => true;
           let recoveryCommits = 0;
@@ -919,7 +1162,7 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
             app.pendingImages = [image];
             app.pendingDocs = [doc];
             app._captureComposerState(sid);
-            const messageCount = app.messages.length;
+            const messageCount = app._ensureTabState(app.currentId).messages.length;
             const sendResult = await app.send({
               sessionId: sid,
               detachedText: 'DETACHED PREVIEW QUESTION',
@@ -938,8 +1181,7 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
               recovery: app._chatDraftRecord(sid),
             };
           } finally {
-            if (app.es) app.es.close();
-            window.EventSource = originalEventSource;
+            app.tabState[app.currentId]?.es?.close();
             app._confirmSessionBusy = originalBusy;
             app._awaitRuntimeSettingPatches = originalRuntimeWait;
             app._commitChatRecoveryDraft = originalCommit;
@@ -947,9 +1189,9 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
         }"""
     )
 
-    assert len(ticket_bodies) == 1
-    assert ticket_bodies[0]["prompt"] == "DETACHED PREVIEW QUESTION"
-    assert ticket_bodies[0]["image_ids"] == ""
+    assert len(turn_bodies) == 1
+    assert turn_bodies[0]["prompt"] == "DETACHED PREVIEW QUESTION"
+    assert turn_bodies[0]["image_ids"] == ""
     assert result["sendResult"] == "undefined"
     assert result["input"] == result["draft"] == "PRESERVE THIS DRAFT"
     assert result["images"] == ["draft-image"]
@@ -963,37 +1205,16 @@ def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
 
 def test_composer_quote_sends_context_without_rewriting_visible_text(
         page: Page, backend_url, auth_token):
+    turn_bodies: list[dict] = []
+    _install_fake_mux_chat_transport(page, turn_bodies)
     _login(page, backend_url, auth_token)
-    ticket_bodies: list[dict] = []
-
-    def handle_ticket(route) -> None:
-        ticket_bodies.append(route.request.post_data_json)
-        route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"ticket": "selection-quote-ticket"}),
-        )
-
-    page.route("**/api/chat/stream/start", handle_ticket)
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          class FakeEventSource extends EventTarget {
-            constructor(url) {
-              super();
-              this.url = url;
-              this.readyState = 0;
-              setTimeout(() => {
-                this.readyState = 1;
-                if (this.onopen) this.onopen(new Event('open'));
-              }, 0);
-            }
-            close() { this.readyState = 2; }
-          }
-          const originalEventSource = window.EventSource;
+          app.availableModels = [{model: 'e2e-model', label: 'E2E', group: 'e2e'}];
+          app.model = 'e2e-model';
           const originalBusy = app._confirmSessionBusy;
           const originalRuntimeWait = app._awaitRuntimeSettingPatches;
-          window.EventSource = FakeEventSource;
           app._confirmSessionBusy = async () => false;
           app._awaitRuntimeSettingPatches = async () => true;
           try {
@@ -1006,7 +1227,7 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
               text: 'SELECTED CONTEXT', truncated: false,
             }];
             app._captureComposerState(sid);
-            const before = app.messages.length;
+            const before = app._ensureTabState(app.currentId).messages.length;
             const sendResult = await app.send();
             await new Promise(resolve => setTimeout(resolve, 20));
             const state = app.tabState[sid];
@@ -1021,16 +1242,15 @@ def test_composer_quote_sends_context_without_rewriting_visible_text(
               quoteText: user && user.selectionQuotes[0].text,
             };
           } finally {
-            if (app.es) app.es.close();
-            window.EventSource = originalEventSource;
+            app.tabState[app.currentId]?.es?.close();
             app._confirmSessionBusy = originalBusy;
             app._awaitRuntimeSettingPatches = originalRuntimeWait;
           }
         }"""
     )
 
-    assert len(ticket_bodies) == 1
-    prompt = ticket_bodies[0]["prompt"]
+    assert len(turn_bodies) == 1
+    prompt = turn_bodies[0]["prompt"]
     assert "引用自 `README.md`" in prompt
     assert "SELECTED CONTEXT" in prompt
     assert prompt.endswith("VISIBLE QUESTION")
@@ -1471,6 +1691,269 @@ def test_terminal_surface_clicking_last_selected_file_tab_returns_to_file(
             && app.selected === 'README.md'
             && app.previewMode === 'md';
         }"""
+    )
+
+
+def test_virtual_file_tree_supports_keyboard_navigation_and_mobile_handoff(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopFileEvents(false);
+          app._treeLoadSeq += 1;
+          app.treeFocusPath = '';
+          app.selected = '';
+          app.visible = Array.from({length: 240}, (_, index) => {
+            const suffix = String(index).padStart(3, '0');
+            return {
+              path: `virtual-${suffix}.txt`, name: `virtual-${suffix}.txt`,
+              depth: 0, is_dir: false, size: index + 1,
+            };
+          });
+          app.fileTreeViewport = {start: 0, end: 80};
+          await new Promise(resolve => app.$nextTick(resolve));
+          const list = app.$refs.fileList;
+          list.scrollTop = 80 * app._fileTreeRowHeight();
+          app._syncFileTreeViewport(list);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    middle = page.locator(
+        '.filelist [role="treeitem"][data-path="virtual-090.txt"]'
+    )
+    expect(middle).to_be_visible()
+    middle.focus()
+    expect(middle).to_have_attribute("tabindex", "0")
+
+    page.keyboard.press("ArrowDown")
+    page.wait_for_function(
+        "() => document.activeElement?.dataset?.path === 'virtual-091.txt'"
+    )
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const list = app.$refs.fileList;
+          list.scrollTop = 180 * app._fileTreeRowHeight();
+          app._syncFileTreeViewport(list);
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    tab_stops = page.locator(
+        '.filelist [role="treeitem"][tabindex="0"]'
+    )
+    expect(tab_stops).to_have_count(1)
+    assert tab_stops.get_attribute("data-path") != "virtual-091.txt"
+    tab_stops.focus()
+    page.keyboard.press("Home")
+    page.wait_for_function(
+        "() => document.activeElement?.dataset?.path === 'virtual-000.txt'"
+    )
+    page.keyboard.press("End")
+    page.wait_for_function(
+        "() => document.activeElement?.dataset?.path === 'virtual-239.txt'"
+    )
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const request = async (url, init) => {
+            const response = await fetch(url, init);
+            if (!response.ok && response.status !== 409) {
+              throw new Error(await response.text());
+            }
+          };
+          await request('/api/files/mkdir', {
+            method: 'POST',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({path: 'keyboard-folder'}),
+          });
+          await request('/api/files/write', {
+            method: 'PUT',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              path: 'keyboard-folder/child.md', content: '# keyboard child',
+            }),
+          });
+          app.treeFocusPath = '';
+          app.selected = '';
+          app.fileTreeViewport = {start: 0, end: 80};
+          app.$refs.fileList.scrollTop = 0;
+          await app.reloadTree();
+          app._startFileEvents();
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    refresh = page.locator(".filelist-sticky-root .root-action").last
+    refresh.focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        "() => document.activeElement?.getAttribute('role') === 'treeitem'"
+    )
+
+    directory = page.locator(
+        '.filelist [role="treeitem"][data-path="keyboard-folder"]'
+    )
+    directory.focus()
+    expect(directory).to_have_attribute("aria-level", "1")
+    page.keyboard.press("ArrowRight")
+    expect(directory).to_have_attribute("aria-expanded", "true")
+    expect(directory).to_be_focused()
+    child = page.locator(
+        '.filelist [role="treeitem"]'
+        '[data-path="keyboard-folder/child.md"]'
+    )
+    expect(child).to_have_attribute("aria-level", "2")
+    page.keyboard.press("ArrowRight")
+    expect(child).to_be_focused()
+    page.keyboard.press("ArrowLeft")
+    expect(directory).to_be_focused()
+    page.keyboard.press("ArrowLeft")
+    expect(directory).to_have_attribute("aria-expanded", "false")
+
+    readme = page.locator(
+        '.filelist [role="treeitem"][data-path="README.md"]'
+    )
+    readme.focus()
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].selected === 'README.md'"
+    )
+    expect(readme).to_be_focused()
+    notes = page.locator(
+        '.filelist [role="treeitem"][data-path="notes.md"]'
+    )
+    notes.focus()
+    page.keyboard.press("Space")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].selected === 'notes.md'"
+    )
+    expect(notes).to_be_focused()
+
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.setMobileTab('files');
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    readme.focus()
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const active = document.activeElement;
+          return app.mobileTab === 'preview'
+            && active?.matches('.pane.preview .tab.active .tab-main')
+            && active.getClientRects().length > 0;
+        }"""
+    )
+
+
+def test_file_and_terminal_tabs_expose_separate_keyboard_actions(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabs = [];
+          app.openFilesCollapsed = false;
+          app._clearPreviewState();
+          await app.openFile({path: 'README.md', name: 'README.md'});
+          await app.openFile({path: 'notes.md', name: 'notes.md'});
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    page.locator(".open-files-close-all").focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        "() => document.activeElement?.classList.contains('open-files-main')"
+    )
+    open_path = page.evaluate(
+        "() => document.activeElement.closest('li').dataset.path"
+    )
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "path => document.querySelector('#app')._x_dataStack[0].selected === path",
+        arg=open_path,
+    )
+    page.keyboard.press("Tab")
+    assert page.evaluate(
+        "() => document.activeElement?.classList.contains('open-files-x')"
+    ) is True
+
+    page.locator(".tab-picker-btn").focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        """() => document.activeElement?.matches(
+          '.pane.preview .tab[data-path] .tab-main')"""
+    )
+    file_path = page.evaluate(
+        "() => document.activeElement.closest('.tab').dataset.path"
+    )
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "path => document.querySelector('#app')._x_dataStack[0].selected === path",
+        arg=file_path,
+    )
+    page.keyboard.press("Tab")
+    assert page.evaluate(
+        """() => document.activeElement?.matches(
+          '.pane.preview .tab[data-path] .tab-close')"""
+    ) is True
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        """path => !document.querySelector(
+          `.pane.preview .tab[data-path="${CSS.escape(path)}"]`)""",
+        arg=file_path,
+    )
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.terminals = [{
+            id: 'keyboard-terminal', name: 'Keyboard terminal',
+            cwd: '/workspace', status: 'running',
+          }];
+          app.openTerminal = id => {
+            app.previewSurface = 'terminal';
+            app.activeTerminalId = id;
+          };
+          app.closeTerminal = id => {
+            app.terminals = app.terminals.filter(term => term.id !== id);
+            if (app.activeTerminalId === id) app.activeTerminalId = null;
+          };
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    page.locator(".tab-picker-btn").focus()
+    page.keyboard.press("Tab")
+    page.wait_for_function(
+        """() => document.activeElement?.matches(
+          '.pane.preview .terminal-tab .tab-main')"""
+    )
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.previewSurface === 'terminal'
+            && app.activeTerminalId === 'keyboard-terminal';
+        }"""
+    )
+    page.keyboard.press("Tab")
+    assert page.evaluate(
+        """() => document.activeElement?.matches(
+          '.pane.preview .terminal-tab .tab-close')"""
+    ) is True
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => !document.querySelector('.pane.preview .terminal-tab')"
     )
 
 
@@ -2095,6 +2578,56 @@ def test_workspace_remove_readd_rejects_old_path_generation(
     }
 
 
+def test_file_event_reconnect_backoff_resets_on_ready(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originals = {
+            EventSource: window.EventSource,
+            capabilities: app._fileCapabilities,
+            visible: app._fileTreeIsVisible,
+          };
+          class FakeEventSource extends EventTarget {
+            close() {}
+          }
+          try {
+            app._stopFileEvents(false);
+            app._fileEventsReconnectFailures = 0;
+            const delays = Array.from(
+              {length: 6}, () => app._nextFileEventsReconnectDelay(),
+            );
+            window.EventSource = FakeEventSource;
+            app._fileCapabilities = async () => ({
+              mintTicket: async () => 'fake-ticket',
+            });
+            app._fileTreeIsVisible = () => true;
+            await app._startFileEvents();
+            const stream = app._fileEvents;
+            stream.dispatchEvent(new MessageEvent('ready', {
+              data: JSON.stringify({ready: true, cursor: 0}),
+            }));
+            return {
+              delays,
+              failuresAfterReady: app._fileEventsReconnectFailures,
+              nextDelay: app._nextFileEventsReconnectDelay(),
+            };
+          } finally {
+            app._stopFileEvents(false);
+            window.EventSource = originals.EventSource;
+            app._fileCapabilities = originals.capabilities;
+            app._fileTreeIsVisible = originals.visible;
+          }
+        }"""
+    )
+    assert result == {
+        "delays": [500, 1000, 2000, 4000, 8000, 8000],
+        "failuresAfterReady": 0,
+        "nextDelay": 500,
+    }
+
+
 def test_sse_ready_workspace_id_mismatch_forces_cold_tree_recovery(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
@@ -2177,13 +2710,22 @@ def test_sse_ready_workspace_id_mismatch_forces_cold_tree_recovery(
             });
             const oldGeneration = app._workspaceGeneration(owner);
             await app._startFileEvents();
-            const first = streams[0];
+            // Layout watchers from the shared page can race an additional
+            // connection into the fake stream list. Exercise the stream that
+            // actually owns app state instead of assuming streams[0] won.
+            const first = app._fileEvents;
+            if (!first) throw new Error('owner file-event stream did not start');
             first.dispatchEvent(new MessageEvent('ready', {
               data: JSON.stringify({
                 ready: true, cursor: 0, workspace_id: newId,
               }),
             }));
-            for (let i = 0; i < 100 && streams.length < 2; i += 1) {
+            for (let i = 0; i < 100 && (
+              !first.closed || loadCalls < 1
+              || app._workspaceRegistryId(owner) !== newId
+              || !app._fileEvents || app._fileEvents === first
+              || app._fileEventsGeneration !== app._workspaceGeneration(owner)
+            ); i += 1) {
               await new Promise(resolve => setTimeout(resolve, 10));
             }
             const stored = await cache.getWorkspaceSnapshot(owner);
@@ -2444,7 +2986,7 @@ def test_workspace_switch_only_waits_for_cold_tree_not_auxiliary_refreshes(
     assert result["runtime"]["terminalId"] == "terminal-slow"
 
 
-def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
+def test_workspace_compact_bootstrap_never_falls_back_to_unbounded_get(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
     result = page.evaluate(
@@ -2508,7 +3050,7 @@ def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
           }
         }"""
     )
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert {call["workspace"] for call in result["calls"]} == {result["owner"]}
     calls = [
         {key: value for key, value in call.items() if key != "workspace"}
@@ -2523,10 +3065,9 @@ def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
                 "parents": ["src", "src/deep"],
             },
         },
-        {"method": "GET", "query": "?show_hidden=true", "body": None},
     ]
-    assert result["visible"] == ["src", "src/deep", "src/deep/file.txt", ".hidden"]
-    assert result["cursor"] == 9
+    assert result["visible"] == []
+    assert result["cursor"] is None
 
 
 def test_terminal_foreground_still_persists_cursor_matched_tree_snapshot(
@@ -3195,6 +3736,81 @@ def test_reopening_current_file_does_not_discard_editor_buffer(page: Page,
         "editText": "unsaved draft",
         "dirty": True,
         "pinned": True,
+    }
+
+
+def test_cancelled_dirty_switch_preserves_hidden_layout_and_terminal(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.selected = 'draft.txt';
+          app.editing = true;
+          app.previewOpen = false;
+          app.desktopFullPane = 'chat';
+          app.previewSurface = 'terminal';
+          let teardowns = 0;
+          const realConfirm = app._confirmLoseEdits;
+          const realTeardown = app._teardownTerminalView;
+          app._confirmLoseEdits = () => false;
+          app._teardownTerminalView = () => { teardowns += 1; };
+          try {
+            const ok = await app.openFile(
+              {path: 'other.txt', name: 'other.txt'}, {reveal: true});
+            return {
+              ok, teardowns, selected: app.selected,
+              previewOpen: app.previewOpen,
+              desktopFullPane: app.desktopFullPane,
+              previewSurface: app.previewSurface,
+            };
+          } finally {
+            app._confirmLoseEdits = realConfirm;
+            app._teardownTerminalView = realTeardown;
+            app.editing = false;
+          }
+        }"""
+    )
+    assert result == {
+        "ok": False,
+        "teardowns": 0,
+        "selected": "draft.txt",
+        "previewOpen": False,
+        "desktopFullPane": "chat",
+        "previewSurface": "terminal",
+    }
+
+
+def test_mobile_reopening_current_editor_reveals_preview_without_discarding(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabs = [{path: 'draft.txt', name: 'draft.txt', preview: false}];
+          app.selected = 'draft.txt';
+          app.previewMode = 'text';
+          app.editText = 'unsaved mobile draft';
+          app.editing = true;
+          app.cmStatus = {...app.cmStatus, dirty: true};
+          app.mobileTab = 'files';
+          const ok = await app.openFile(
+            {path: 'draft.txt', name: 'draft.txt'}, {reveal: true});
+          const state = {
+            ok, mobileTab: app.mobileTab, editing: app.editing,
+            editText: app.editText, dirty: app.cmStatus.dirty,
+          };
+          app.editing = false;
+          return state;
+        }"""
+    )
+    assert result == {
+        "ok": True,
+        "mobileTab": "preview",
+        "editing": True,
+        "editText": "unsaved mobile draft",
+        "dirty": True,
     }
 
 

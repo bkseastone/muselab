@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,6 +111,754 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 404
 
 
+def test_session_evidence_returns_validated_canonical_paths(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session(
+        "evidence session", model="claude-sonnet-4-6", cwd=temp_root,
+    )
+    sid = meta["id"]
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / chat._cli_encode_cwd(str(temp_root)) / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_name": "evidence session",
+        "session_id": sid,
+        "transcript_path": str(transcript.resolve()),
+        "workspace": str(temp_root),
+        "model": "claude-sonnet-4-6",
+        "sidecar_path": str(sess._sidecar_path(sid).resolve()),
+    }
+
+
+def test_session_evidence_requires_auth_and_existing_transcript(
+        client, auth, app_module):
+    from backend import sessions as sess
+
+    meta = sess.create_session("no transcript")
+    path = f"/api/chat/sessions/{meta['id']}/evidence"
+
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=auth).status_code == 404
+    invalid = client.get(
+        "/api/chat/sessions/not-a-uuid/evidence", headers=auth,
+    )
+    assert invalid.status_code == 400
+
+
+def test_session_evidence_rejects_transcript_from_wrong_workspace(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session("wrong workspace", cwd=temp_root)
+    sid = meta["id"]
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / "-somewhere-else" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 404
+    assert "transcript_path" not in response.text
+
+
+def test_session_evidence_omits_missing_sidecar(
+        client, auth, app_module, temp_root, tmp_path, monkeypatch):
+    from backend import chat, sessions as sess
+
+    meta = sess.create_session("without sidecar", cwd=temp_root)
+    sid = meta["id"]
+    sess._sidecar_path(sid).unlink()
+    projects = tmp_path / "claude" / "projects"
+    transcript = projects / chat._cli_encode_cwd(str(temp_root)) / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_cli_project_roots", lambda: [projects])
+    chat._JSONL_PATH_CACHE.clear()
+
+    response = client.get(f"/api/chat/sessions/{sid}/evidence", headers=auth)
+
+    assert response.status_code == 200
+    assert "sidecar_path" not in response.json()
+
+
+def test_fork_annotation_copy_rekeys_message_uuid(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("source")
+    child = sess.create_session("child")
+    old_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    new_uuid = "11111111-2222-4333-8444-555555555555"
+    sess.set_message_annotation(
+        source["id"], old_uuid,
+        model="GPT-5.6 Sol", turn_status="completed",
+        memory_recall={"count": 2}, docs=[{"name": "note.md"}],
+    )
+
+    copied = sess.copy_message_annotations(
+        source["id"], child["id"], {old_uuid: new_uuid})
+
+    assert copied == 1
+    annotation = sess.get_message_annotations(child["id"])[new_uuid]
+    assert annotation["model"] == "GPT-5.6 Sol"
+    assert annotation["turn_status"] == "completed"
+    assert annotation["memory_recall"] == {"count": 2}
+    assert annotation["docs"] == [{"name": "note.md"}]
+
+
+def test_runtime_task_overlay_bounds_summary_on_write(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-summary-budget")["id"]
+    full = "summary " * 1000
+
+    assert sess.set_runtime_task_overlay(
+        sid, "task-long", state="completed", summary=full,
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-long"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert overlay["summary_length"] == len(full)
+    assert overlay["summary_truncated"] is True
+    raw = json.loads(
+        sess._runtime_task_overlay_path(sid).read_text(encoding="utf-8")
+    )
+    assert raw["runtime_task_overlays"]["task-long"] == overlay
+
+
+def test_running_runtime_task_ids_cache_one_overlay_parse_per_generation(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-summary-cache")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid, "task-running", state="running",
+    )
+    sess._drop_running_runtime_task_ids_cache(sid)
+    real_load = sess._load_runtime_task_overlay_file
+    loads = 0
+
+    def counted_load(load_sid):
+        nonlocal loads
+        loads += 1
+        return real_load(load_sid)
+
+    monkeypatch.setattr(
+        sess, "_load_runtime_task_overlay_file", counted_load,
+    )
+    expected = {sid: frozenset({"task-running"})}
+    assert sess.running_runtime_task_ids((sid, sid)) == expected
+    assert sess.running_runtime_task_ids((sid,)) == expected
+    assert loads == 1
+
+
+def test_overlay_save_refreshes_running_task_summary_without_reread(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-summary-refresh")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="completed")
+
+    monkeypatch.setattr(
+        sess,
+        "_load_runtime_task_overlay_file",
+        lambda _sid: pytest.fail("a successful overlay save must prime summary"),
+    )
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
+def test_sidecar_caches_detect_same_size_mtime_atomic_replace(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-external-replace")["id"]
+    original = {
+        "messages": {"message-1": {"model": "old"}},
+        "runtime_task_overlays": {
+            "task-1": {"task_id": "task-1", "state": "running"},
+        },
+    }
+    replacement = {
+        "messages": {"message-1": {"model": "new"}},
+        "runtime_task_overlays": {
+            "task-1": {"task_id": "task-1", "state": "stopped"},
+        },
+    }
+    sess._save_sidecar(sid, original)
+    assert sess._load_sidecar(sid)["messages"]["message-1"]["model"] == "old"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    path = sess._sidecar_path(sid)
+    original_stat = path.stat()
+    serialized = json.dumps(replacement, ensure_ascii=False)
+    assert len(serialized.encode("utf-8")) == original_stat.st_size
+    replacement_path = path.with_suffix(".replacement")
+    replacement_path.write_text(serialized, encoding="utf-8")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement_path, path)
+    replaced_stat = path.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+
+    assert sess._load_sidecar(sid)["messages"]["message-1"]["model"] == "new"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
+def test_runtime_task_overlay_legacy_summary_is_bounded_then_compacted(app_module):
+    from backend import sessions as sess
+    from backend.task_summaries import TASK_SUMMARY_PREVIEW_CAP
+
+    sid = sess.create_session("runtime-overlay-legacy-summary")["id"]
+    full = "legacy " * 1000
+    sess._save_sidecar(sid, {
+        "runtime_task_overlays": {
+            "task-old": {"task_id": "task-old", "state": "completed", "summary": full},
+        },
+    })
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-old"]
+    assert len(overlay["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert len(json.loads(sess._sidecar_path(sid).read_text(encoding="utf-8"))
+               ["runtime_task_overlays"]["task-old"]["summary"]) == len(full)
+
+    assert sess.set_runtime_task_overlay(sid, "task-new", state="running")
+    legacy_raw = json.loads(
+        sess._sidecar_path(sid).read_text(encoding="utf-8")
+    )
+    assert len(
+        legacy_raw["runtime_task_overlays"]["task-old"]["summary"]
+    ) == len(full)
+    dedicated_raw = json.loads(
+        sess._runtime_task_overlay_path(sid).read_text(encoding="utf-8")
+    )
+    compacted = dedicated_raw["runtime_task_overlays"]["task-old"]
+    assert len(compacted["summary"]) == TASK_SUMMARY_PREVIEW_CAP
+    assert compacted["summary_length"] == len(full)
+    assert compacted["summary_truncated"] is True
+
+
+def test_runtime_overlay_updates_do_not_touch_large_annotation_sidecar(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-large-sidecar")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid, "task-large", state="running",
+    )
+    sidecar = sess._sidecar_path(sid)
+    sess._save_sidecar(sid, {
+        "messages": {
+            "message-large": {
+                "images": [{"data": "x" * 2_400_000}],
+            },
+        },
+    })
+    before_bytes = sidecar.read_bytes()
+    before = sidecar.stat()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("runtime overlay hot writes must not touch the main sidecar")
+
+    monkeypatch.setattr(sess, "_load_sidecar", forbidden)
+    monkeypatch.setattr(sess, "_save_sidecar", forbidden)
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-large",
+        state="completed",
+        summary="finished",
+    )
+
+    after = sidecar.stat()
+    assert sidecar.read_bytes() == before_bytes
+    assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
+        before.st_ino, before.st_mtime_ns, before.st_size,
+    )
+    assert sess.get_runtime_task_overlays(sid)["task-large"]["state"] == "completed"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+    overlay_path = sess._runtime_task_overlay_path(sid)
+    assert overlay_path.stat().st_size < 16 * 1024
+    assert overlay_path.stat().st_mode & 0o777 == 0o600
+    assert overlay_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_runtime_overlay_store_detects_same_size_mtime_atomic_replace(
+    app_module,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-store-replace")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset({"task-1"})
+
+    path = sess._runtime_task_overlay_path(sid)
+    original_stat = path.stat()
+    replacement = json.loads(path.read_text(encoding="utf-8"))
+    replacement["runtime_task_overlays"]["task-1"]["state"] = "stopped"
+    serialized = (
+        json.dumps(replacement, ensure_ascii=False, separators=(",", ":"))
+        + "\n"
+    )
+    assert len(serialized.encode("utf-8")) == original_stat.st_size
+    replacement_path = path.with_suffix(".replacement")
+    replacement_path.write_text(serialized, encoding="utf-8")
+    os.utime(
+        replacement_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement_path, path)
+
+    replaced_stat = path.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+    assert sess.get_runtime_task_overlays(sid)["task-1"]["state"] == "stopped"
+    assert sess.running_runtime_task_ids((sid,))[sid] == frozenset()
+
+
+def test_corrupt_runtime_overlay_store_is_never_overwritten(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-corrupt")["id"]
+    assert sess.set_runtime_task_overlay(sid, "task-1", state="running")
+    path = sess._runtime_task_overlay_path(sid)
+    broken = b'{"schema_version":1,"runtime_task_overlays":'
+    path.write_bytes(broken)
+
+    with pytest.raises(
+        RuntimeError,
+        match="cannot parse runtime task overlay store",
+    ):
+        sess.set_runtime_task_overlay(sid, "task-1", state="completed")
+
+    assert path.read_bytes() == broken
+
+@pytest.mark.parametrize(
+    "terminal_state", ["completed", "failed", "stopped", "done"],
+)
+def test_runtime_task_overlay_terminal_state_cannot_regress_to_running(
+    app_module, terminal_state,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-monotonic")["id"]
+    sess.set_runtime_task_overlay(
+        sid, "task-1", state="running", owner_session_id=sid,
+    )
+    sess.set_runtime_task_overlay(
+        sid, "task-1", state=terminal_state, summary="terminal result",
+    )
+
+    # A delayed launch/backfill is still allowed to enrich missing card
+    # metadata, but it cannot turn a terminal task back into a running task.
+    sess.set_runtime_task_overlay(
+        sid, "task-1", state="running", tool_use_id="tool-late",
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-1"]
+    assert overlay["state"] == (
+        "completed" if terminal_state == "done" else terminal_state
+    )
+    assert overlay["summary"] == "terminal result"
+    assert overlay["tool_use_id"] == "tool-late"
+
+
+def test_startup_stops_only_stale_running_runtime_task_overlays(app_module):
+    from backend import sessions as sess
+
+    running = sess.create_session("stale-running")["id"]
+    completed = sess.create_session("already-completed")["id"]
+    sess.set_runtime_task_overlay(
+        running, "task-running", state="running", owner_session_id=running,
+    )
+    sess.set_runtime_task_overlay(
+        completed, "task-completed", state="completed",
+        owner_session_id=completed, summary="done",
+    )
+
+    assert sess.stop_stale_runtime_task_overlays() == 1
+    stale = sess.get_runtime_task_overlays(running)["task-running"]
+    terminal = sess.get_runtime_task_overlays(completed)["task-completed"]
+    assert stale["state"] == "stopped"
+    assert stale["restart_recovered"] is True
+    assert terminal["state"] == "completed"
+    assert terminal["summary"] == "done"
+    assert sess.stop_stale_runtime_task_overlays() == 0
+
+
+def test_runtime_fork_boundary_at_is_strict_utc_and_successor_only(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime-source")
+    assert source["runtime_fork_boundary_at"] == ""
+    assert sess.set_runtime_background_boundary(source["id"], "message-1")
+    assert sess.get_session_meta(source["id"])["runtime_fork_boundary_at"] == ""
+
+    successor_id = "11111111-2222-4333-8444-555555555555"
+    successor = sess.register_session(
+        successor_id,
+        name="runtime-successor",
+        runtime_predecessor=source["id"],
+        runtime_fork_boundary_at="2026-08-14T10:20:30.123456+08:00",
+    )
+    assert successor["runtime_fork_boundary_at"] == (
+        "2026-08-14T02:20:30.123456Z"
+    )
+    assert sess.link_runtime_successor(source["id"], successor_id)
+
+    raw_rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    raw_successor = next(row for row in raw_rows if row["id"] == successor_id)
+    assert raw_successor["runtime_fork_boundary_at"] == (
+        "2026-08-14T02:20:30.123456Z"
+    )
+    assert sess.normalize_runtime_fork_boundary_at(
+        "2026-08-14T02:20:30Z"
+    ) == "2026-08-14T02:20:30.000000Z"
+    assert sess.normalize_runtime_fork_boundary_at(
+        "2026-08-14T02:20:30"
+    ) == ""
+    with pytest.raises(ValueError, match="timezone-aware ISO 8601"):
+        sess.register_session(
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            runtime_fork_boundary_at="2026-08-14T02:20:30",
+        )
+
+
+def test_runtime_lineages_loads_one_index_snapshot_for_many_sessions(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("batch-runtime-source")["id"]
+    child = sess.create_session("batch-runtime-child")["id"]
+    unrelated = sess.create_session("batch-runtime-unrelated")["id"]
+    assert sess.link_runtime_successor(source, child)
+
+    real_load = sess._load_index
+    loads = 0
+
+    def counted_load():
+        nonlocal loads
+        loads += 1
+        return real_load()
+
+    monkeypatch.setattr(sess, "_load_index", counted_load)
+    result = sess.runtime_lineages((source, child, unrelated, source))
+
+    assert loads == 1
+    assert result == {
+        source: [source, child],
+        child: [source, child],
+        unrelated: [unrelated],
+    }
+
+
+def test_runtime_lineages_cache_one_parse_per_index_generation(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("cached-runtime-lineage")["id"]
+    real_load = sess._load_index
+    loads = 0
+
+    def counted_load():
+        nonlocal loads
+        loads += 1
+        return real_load()
+
+    monkeypatch.setattr(sess, "_load_index", counted_load)
+
+    assert sess.runtime_lineage(sid) == [sid]
+    assert sess.runtime_lineage(sid) == [sid]
+    assert loads == 1
+
+
+def test_runtime_successor_redirects_resolve_only_final_public_target(
+    app_module,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("redirect-source")["id"]
+    child = sess.create_session("redirect-child")["id"]
+    grandchild = sess.create_session("redirect-grandchild")["id"]
+    unrelated = sess.create_session("redirect-unrelated")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+
+    assert sess.runtime_successor_redirects(
+        (source, child, grandchild, unrelated, "missing", source)
+    ) == {
+        source: grandchild,
+        child: grandchild,
+    }
+
+
+def test_session_list_repairs_hidden_open_tab_to_runtime_successor(
+    client, auth, app_module,
+):
+    from backend import sessions as sess
+
+    source = sess.create_session("hidden-open-source")["id"]
+    child = sess.create_session("hidden-open-child")["id"]
+    target = sess.create_session("visible-open-target")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, target)
+    newest = sess.create_session("newer-first-page-row")["id"]
+
+    response = client.get(
+        f"/api/chat/sessions?limit=1&ids={source}", headers=auth,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_redirects"] == {source: target}
+    returned_ids = [row["id"] for row in body["sessions"]]
+    assert returned_ids == [newest, target]
+    assert source not in returned_ids
+    assert child not in returned_ids
+
+
+def test_runtime_index_cache_never_shares_rows_with_mutators(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("cache-isolation")["id"]
+    assert sess.runtime_lineage(sid) == [sid]
+
+    mutable_rows = sess._load_index()
+    mutable_row = next(row for row in mutable_rows if row["id"] == sid)
+    mutable_row["id"] = "not-persisted"
+
+    durable_rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    assert any(row["id"] == sid for row in durable_rows)
+    assert sess.runtime_lineage(sid) == [sid]
+
+
+def test_runtime_index_cache_invalidates_after_save(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("cache-save-source")["id"]
+    child = sess.create_session("cache-save-child")["id"]
+    assert sess.runtime_lineage(source) == [source]
+
+    assert sess.link_runtime_successor(source, child)
+    assert sess.runtime_lineage(source) == [source, child]
+
+
+def test_runtime_index_cache_detects_same_size_mtime_atomic_replace(
+    app_module,
+):
+    from backend import sessions as sess
+
+    original_sid = sess.create_session("cache-external-replace")["id"]
+    replacement_sid = "11111111-2222-4333-8444-555555555555"
+    assert sess.runtime_lineage(original_sid) == [original_sid]
+
+    original_stat = sess.INDEX.stat()
+    rows = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    row = next(row for row in rows if row["id"] == original_sid)
+    row["id"] = replacement_sid
+    replacement = sess.INDEX.with_suffix(".replacement")
+    replacement.write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    os.utime(
+        replacement,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    os.replace(replacement, sess.INDEX)
+    replaced_stat = sess.INDEX.stat()
+    assert replaced_stat.st_size == original_stat.st_size
+    assert replaced_stat.st_mtime_ns == original_stat.st_mtime_ns
+    assert replaced_stat.st_ino != original_stat.st_ino
+
+    assert sess.runtime_lineage(original_sid) == []
+    assert sess.runtime_lineage(replacement_sid) == [replacement_sid]
+
+
+def test_runtime_lineage_authority_uses_earliest_owner_snapshot(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime-source")["id"]
+    child = sess.create_session("runtime-child")["id"]
+    grandchild = sess.create_session("runtime-grandchild")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+    assert sess.runtime_lineage(child) == [source, child, grandchild]
+
+    assert sess.set_runtime_task_overlay(
+        source,
+        "source-task",
+        owner_session_id=source,
+        state="running",
+        description="source launch",
+    )
+    assert sess.copy_runtime_task_overlays(source, child) == 1
+
+    # Simulate a pre-fix successor that rewrote both owner and lifecycle state.
+    child_overlays = sess.get_runtime_task_overlays(child)
+    child_overlay = child_overlays["source-task"]
+    child_overlay.update({
+        "owner_session_id": child,
+        "state": "stopped",
+        "summary": "false successor stop",
+        "tool_use_id": "tool-recovered-from-copy",
+    })
+    sess._save_runtime_task_overlays(child, child_overlays)
+    assert sess.set_runtime_task_overlay(
+        child,
+        "child-task",
+        owner_session_id=child,
+        state="running",
+    )
+
+    authoritative = sess.get_authoritative_runtime_task_overlays(child)
+    source_task = authoritative["source-task"]
+    assert source_task["owner_session_id"] == source
+    assert source_task["state"] == "running"
+    assert "summary" not in source_task
+    assert source_task["tool_use_id"] == "tool-recovered-from-copy"
+    assert authoritative["child-task"]["owner_session_id"] == child
+    assert "child-task" not in sess.get_authoritative_runtime_task_overlays(
+        source
+    )
+
+
+def test_runtime_task_overlay_owner_and_terminal_state_are_monotonic(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-invariants")["id"]
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        owner_session_id=sid,
+        state="running",
+        description="original",
+    )
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="completed",
+        summary="authoritative result",
+        usage={"seconds": 3},
+        updated_at=100,
+    )
+    assert not sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        owner_session_id="foreign-runtime",
+        state="stopped",
+    )
+    assert not sess.set_runtime_task_overlay(
+        sid, "task-1", state="stopped", summary="false stop",
+    )
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="running",
+        summary="late launch",
+        usage={"seconds": 999},
+        updated_at=999,
+        tool_use_id="tool-late",
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-1"]
+    assert overlay["owner_session_id"] == sid
+    assert overlay["state"] == "completed"
+    assert overlay["summary"] == "authoritative result"
+    assert overlay["usage"] == {"seconds": 3}
+    assert overlay["updated_at"] == 100
+    assert overlay["tool_use_id"] == "tool-late"
+    assert sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="completed",
+        output_file="/tmp/task-1.out",
+    )
+    assert not sess.set_runtime_task_overlay(
+        sid,
+        "task-1",
+        state="completed",
+        output_file="/tmp/task-1.out",
+    )
+
+
+def test_reconcile_runtime_task_overlay_chains_repairs_forward_copies(
+        app_module, monkeypatch):
+    from backend import sessions as sess
+
+    source = sess.create_session("runtime-source")["id"]
+    child = sess.create_session("runtime-child")["id"]
+    grandchild = sess.create_session("runtime-grandchild")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, grandchild)
+
+    assert sess.set_runtime_task_overlay(
+        source,
+        "source-task",
+        owner_session_id=source,
+        state="completed",
+        summary="real result",
+    )
+    assert sess.copy_runtime_task_overlays(source, child) == 1
+    child_overlays = sess.get_runtime_task_overlays(child)
+    child_overlays["source-task"].update({
+        "owner_session_id": child,
+        "state": "stopped",
+        "summary": "false successor stop",
+        "restart_recovered": True,
+    })
+    sess._save_runtime_task_overlays(child, child_overlays)
+    assert sess.set_runtime_task_overlay(
+        child,
+        "child-task",
+        owner_session_id=child,
+        state="running",
+        description="child launch",
+    )
+
+    original_save = sess._save_runtime_task_overlays
+    mutation_saves = []
+
+    def tracked_save(sid, overlays):
+        mutation_saves.append(sid)
+        return original_save(sid, overlays)
+
+    monkeypatch.setattr(sess, "_save_runtime_task_overlays", tracked_save)
+    assert sess.reconcile_runtime_task_overlay_chains() == 3
+    assert sorted(mutation_saves) == sorted([child, grandchild])
+    assert sess.reconcile_runtime_task_overlay_chains() == 0
+
+    source_visible = sess.get_authoritative_runtime_task_overlays(source)
+    assert set(source_visible) == {"source-task"}
+    visible = sess.get_authoritative_runtime_task_overlays(grandchild)
+    assert visible["source-task"]["owner_session_id"] == source
+    assert visible["source-task"]["state"] == "completed"
+    assert visible["source-task"]["summary"] == "real result"
+    assert "restart_recovered" not in visible["source-task"]
+    assert visible["child-task"]["owner_session_id"] == child
+    assert visible["child-task"]["state"] == "running"
+
+
 def test_corrupt_index_is_never_overwritten_by_a_mutator(app_module):
     from backend import sessions as sess
 
@@ -131,6 +881,16 @@ def test_corrupt_sidecar_is_never_overwritten_by_a_mutator(app_module):
 
     with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
         sess.set_message_annotation(meta["id"], "msg-1", cost="$1")
+    with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
+        sess.set_session_usage_summary(
+            meta["id"],
+            {
+                "schema": 1,
+                "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+                "update": {"turn_id": "turn-corrupt", "at": 1.0},
+                "normalized": {"input_tokens": 1},
+            },
+        )
 
     assert path.read_text(encoding="utf-8") == broken
 
@@ -257,6 +1017,34 @@ def test_register_retry_preserves_existing_plan_return_permission(app_module):
     assert len(json.loads(sess.INDEX.read_text(encoding="utf-8"))) == 1
 
 
+def test_deletion_fence_survives_register_retry_and_blocks_late_footer(
+        app_module):
+    from backend import sessions as sess
+
+    sid = "11111111-2222-4333-8444-555555555556"
+    original = sess.register_session(sid, name="being deleted")
+    sess.begin_session_delete(sid)
+
+    # An optimistic-create retry may still see the pre-delete index row, but it
+    # must not clear the tombstone that rejects new turns.
+    assert sess.register_session(sid, name="retry")["name"] == original["name"]
+    assert sess.session_is_deleting(sid) is True
+
+    sess.set_message_annotation(sid, "late-result", turn_status="completed")
+    assert "late-result" not in sess.get_message_annotations(sid)
+
+    assert sess.delete_session(sid) is True
+    sidecar = sess._sidecar_path(sid)
+    assert not sidecar.exists()
+    sess.set_session_ctx_window(sid, 200_000)
+    sess.append_pending_attachments(
+        sid, images=[{"name": "private-image.png"}])
+    assert sess.consume_one_pending_attachments(sid, "late-user") is None
+    assert not sidecar.exists()
+    with pytest.raises(ValueError, match="session is being deleted"):
+        sess.register_session(sid, name="stale retry after delete")
+
+
 def test_queue_plan_return_permission_roundtrip_and_legacy_migration(app_module):
     from backend import sessions as sess
 
@@ -309,6 +1097,402 @@ def test_queue_plan_return_permission_roundtrip_and_legacy_migration(app_module)
     restored["plan_return_permission"] = "plan"
     requeued = sess.requeue_head(sid, restored)
     assert requeued["items"][0]["plan_return_permission"] == "default"
+
+
+def test_native_adjustment_lifecycle_is_durable_and_not_double_claimed(
+        app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-adjustment"
+    adjusted = sess.enqueue_message(
+        sid,
+        "use this after the next tool",
+        image_ids="img-a,img-b",
+        delivery="adjust",
+        target_turn_id="turn-running",
+        command_uuid="command-1",
+        steering_state="pending",
+    )
+    ordinary = sess.enqueue_message(sid, "ordinary follow-up")
+    initial_revision = adjusted["queue"]["revision"]
+
+    assert adjusted["item"]["delivery"] == "adjust"
+    assert adjusted["item"]["target_turn_id"] == "turn-running"
+    assert adjusted["item"]["command_uuid"] == "command-1"
+    assert adjusted["item"]["steering_state"] == "pending"
+    # The native command owns the FIFO head. The ordinary drain must neither
+    # duplicate it nor jump over it to execute the later message.
+    assert sess.claim_queue_message(sid) is None
+    assert [item["id"] for item in sess.get_queue(sid)["items"]] == [
+        adjusted["item"]["id"], ordinary["item"]["id"],
+    ]
+
+    started = sess.update_queue_steering_state(
+        sid, "started", command_uuid="command-1",
+    )
+    assert started is not None
+    assert started["steering_state"] == "started"
+    started_snapshot = sess.get_queue(sid)
+    assert started_snapshot["revision"] == initial_revision + 2
+    assert started_snapshot["items"][0]["steering_state"] == "started"
+
+    # Replayed lifecycle frames are idempotent and do not manufacture a new
+    # revision. A selector mismatch must not remove anything.
+    assert sess.update_queue_steering_state(
+        sid, "started", command_uuid="command-1",
+    ) == started
+    assert sess.get_queue(sid)["revision"] == started_snapshot["revision"]
+    assert sess.update_queue_steering_state(
+        sid,
+        "completed",
+        item_id=adjusted["item"]["id"],
+        command_uuid="different-command",
+    ) is None
+
+    completed = sess.update_queue_steering_state(
+        sid, "completed", item_id=adjusted["item"]["id"],
+    )
+    assert completed is not None
+    assert completed["steering_state"] == "completed"
+    assert completed["image_ids"] == "img-a,img-b"
+    remaining = sess.get_queue(sid)
+    assert [item["id"] for item in remaining["items"]] == [
+        ordinary["item"]["id"],
+    ]
+    assert sess.update_queue_steering_state(
+        sid, "completed", item_id=adjusted["item"]["id"],
+    ) is None
+    assert sess.claim_queue_message(sid)["id"] == ordinary["item"]["id"]
+
+
+def test_native_adjustment_lifecycle_cannot_regress_after_fast_ack(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-fast-ack"
+    item = sess.enqueue_message(
+        sid,
+        "apply this after the current tool",
+        delivery="adjust",
+        command_uuid="command-fast-ack",
+        steering_state="pending",
+    )["item"]
+
+    queued = sess.update_queue_steering_state(
+        sid, "queued", item_id=item["id"],
+    )
+    queued_revision = sess.get_queue(sid)["revision"]
+    assert queued is not None
+    assert queued["steering_state"] == "queued"
+
+    # The lifecycle reader can receive queued/started before the HTTP task
+    # persists its post-write waiting_tool state. Those late writes must be
+    # idempotent instead of moving the durable UI status backwards.
+    assert sess.update_queue_steering_state(
+        sid, "waiting_tool", item_id=item["id"],
+    )["steering_state"] == "queued"
+    assert sess.get_queue(sid)["revision"] == queued_revision
+
+    started = sess.update_queue_steering_state(
+        sid, "started", item_id=item["id"],
+    )
+    started_revision = sess.get_queue(sid)["revision"]
+    assert started is not None
+    assert started["steering_state"] == "started"
+    assert sess.update_queue_steering_state(
+        sid, "queued", item_id=item["id"],
+    )["steering_state"] == "started"
+    assert sess.update_queue_steering_state(
+        sid, "waiting_tool", item_id=item["id"],
+    )["steering_state"] == "started"
+    assert sess.get_queue(sid)["revision"] == started_revision
+
+
+def test_cancelled_native_adjustment_cannot_be_resurrected_by_late_write(
+        app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-cancel-race"
+    item = sess.enqueue_message(
+        sid,
+        "do not resurrect this",
+        delivery="adjust",
+        command_uuid="command-cancel-race",
+        steering_state="pending",
+    )["item"]
+
+    cancelled = sess.update_queue_steering_state(
+        sid, "cancelled", item_id=item["id"], pause=True,
+    )
+    cancelled_revision = sess.get_queue(sid)["revision"]
+    assert cancelled is not None
+    assert cancelled["steering_state"] == "cancelled"
+
+    late = sess.update_queue_steering_state(
+        sid,
+        "waiting_tool",
+        item_id=item["id"],
+        command_uuid="command-cancel-race",
+    )
+    assert late is not None
+    assert late["steering_state"] == "cancelled"
+    snapshot = sess.get_queue(sid)
+    assert snapshot["paused"] is True
+    assert snapshot["revision"] == cancelled_revision
+
+
+def test_native_adjustment_fallback_becomes_an_ordinary_fifo_item(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-fallback"
+    adjusted = sess.enqueue_message(
+        sid,
+        "preserve all payload data",
+        image_ids="img-durable",
+        delivery="adjust",
+        target_turn_id="turn-old",
+        command_uuid="command-fallback",
+        steering_state="waiting_tool",
+    )["item"]
+    later = sess.enqueue_message(sid, "later ordinary message")["item"]
+
+    fallback = sess.fallback_queue_steering(
+        sid, command_uuid="command-fallback",
+    )
+    assert fallback is not None
+    assert fallback["id"] == adjusted["id"]
+    assert fallback["image_ids"] == "img-durable"
+    assert fallback["delivery"] == "queue"
+    assert fallback["steering_state"] == "fallback"
+    assert "target_turn_id" not in fallback
+    assert "command_uuid" not in fallback
+    snapshot = sess.get_queue(sid)
+    assert [item["id"] for item in snapshot["items"]] == [
+        adjusted["id"], later["id"],
+    ]
+    assert sess.claim_queue_message(sid)["id"] == adjusted["id"]
+    # A late lifecycle callback for the detached CLI command cannot consume the
+    # now-ordinary inflight item.
+    assert sess.update_queue_steering_state(
+        sid, "completed", command_uuid="command-fallback",
+    ) is None
+
+
+def test_cancelled_native_adjustment_is_retained_and_pauses_queue(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-cancelled"
+    item = sess.enqueue_message(
+        sid,
+        "review before retry",
+        delivery="adjust",
+        command_uuid="command-cancelled",
+        steering_state="queued",
+    )["item"]
+
+    cancelled = sess.update_queue_steering_state(
+        sid, "cancelled", item_id=item["id"],
+    )
+
+    assert cancelled is not None
+    assert cancelled["steering_state"] == "cancelled"
+    snapshot = sess.get_queue(sid)
+    assert snapshot["paused"] is True
+    assert snapshot["items"][0]["id"] == item["id"]
+    assert sess.claim_queue_message(sid) is None
+
+
+def test_restart_detaches_and_pauses_uncertain_native_adjustment(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-restart"
+    item = sess.enqueue_message(
+        sid,
+        "the CLI may already have accepted this",
+        delivery="adjust",
+        target_turn_id="turn-before-crash",
+        command_uuid="command-before-crash",
+        steering_state="started",
+    )["item"]
+    assert sess.get_queue(sid)["paused"] is False
+
+    recovered = sess.recover_queue_inflight(sid)
+
+    assert recovered["paused"] is True
+    assert recovered["items"][0]["id"] == item["id"]
+    assert recovered["items"][0]["delivery"] == "queue"
+    assert recovered["items"][0]["steering_state"] == "cancelled"
+    assert "target_turn_id" not in recovered["items"][0]
+    assert "command_uuid" not in recovered["items"][0]
+    assert sess.claim_queue_message(sid) is None
+
+    # Recovery is conservative but not a dead end: explicit Resume makes the
+    # retained payload claimable as an ordinary turn. It can also be deleted
+    # or cleared because no nonexistent CLI owner remains attached.
+    sess.set_queue_paused(sid, False)
+    assert sess.claim_queue_message(sid)["id"] == item["id"]
+
+
+def test_native_command_uuid_is_unique_across_waiting_and_inflight(app_module):
+    from backend import sessions as sess
+
+    sid = "s-native-command-dedup"
+    first = sess.enqueue_message(
+        sid,
+        "first",
+        delivery="queue",
+        command_uuid="same-command",
+        steering_state="fallback",
+    )
+    assert first["ok"] is True
+    assert sess.claim_queue_message(sid)["id"] == first["item"]["id"]
+
+    duplicate = sess.enqueue_message(
+        sid,
+        "must not become ambiguous",
+        delivery="adjust",
+        command_uuid="same-command",
+        steering_state="pending",
+    )
+    assert duplicate["ok"] is False
+    assert duplicate["error"] == "duplicate_command_uuid"
+    assert duplicate["queue"]["items"] == []
+    assert duplicate["queue"]["inflight"]["item"]["id"] == first["item"]["id"]
+
+
+def test_snapshot_batch_remove_preserves_later_enqueue(app_module):
+    from backend import sessions as sess
+
+    sid = "s-snapshot-batch-remove"
+    first = sess.enqueue_message(sid, "present in clear snapshot")["item"]
+    snapshot_ids = [first["id"]]
+    later = sess.enqueue_message(sid, "committed after snapshot")["item"]
+
+    queue, removed = sess.remove_queue_items_with_removed(sid, snapshot_ids)
+
+    assert removed == (first["id"],)
+    assert [item["id"] for item in queue["items"]] == [later["id"]]
+
+
+def _sdk_session_info(sid: str, *, title: str | None = None):
+    return SimpleNamespace(
+        session_id=sid,
+        custom_title=title,
+        first_prompt="transcript prompt",
+        created_at=1_000,
+        last_modified=2_000,
+        tag=None,
+    )
+
+
+def test_explicit_local_rename_beats_stale_sdk_title_cache(app_module):
+    from backend import sessions as sess
+
+    sid = "11111111-2222-4333-8444-555555555555"
+    merged = sess._merge_sdk_with_index(
+        _sdk_session_info(sid, title="stale sdk title"),
+        {"name": "manual title", "auto_named": False},
+    )
+    automatic = sess._merge_sdk_with_index(
+        _sdk_session_info(sid, title="fresh sdk title"),
+        {"name": "local fallback", "auto_named": True},
+    )
+
+    assert merged["name"] == "manual title"
+    assert merged["auto_named"] is False
+    assert automatic["name"] == "fresh sdk title"
+
+
+def _wait_for_list_refresh(sess, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with sess._LIST_CACHE_LOCK:
+            if not sess._LIST_REFRESHING["v"]:
+                return
+        time.sleep(0.01)
+    raise AssertionError("session list refresh did not finish")
+
+
+def test_sessions_first_page_does_not_wait_for_workspace_jsonl_scan(
+    client, auth, app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    local = sess.create_session("cached metadata")
+    sess.invalidate_sessions_cache()
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+
+    def blocked_scan(**_kwargs):
+        scan_started.set()
+        release_scan.wait(60)
+        return [_sdk_session_info(local["id"], title="transcript title")]
+
+    monkeypatch.setattr(sess, "sdk_list_sessions", blocked_scan)
+    try:
+        # Start the background flight outside TestClient. Starlette waits for
+        # request-owned worker activity on some runners, which makes a wall-clock
+        # assertion measure TestClient shutdown rather than this cache contract.
+        initial, _generation = sess.list_sessions_snapshot()
+        listed = {row["id"]: row for row in initial}
+        assert listed[local["id"]]["name"] == "cached metadata"
+        assert scan_started.wait(1)
+
+        response = client.get("/api/chat/sessions", headers=auth)
+        assert response.status_code == 200
+        initial_etag = response.headers["etag"]
+    finally:
+        release_scan.set()
+        _wait_for_list_refresh(sess)
+
+    refreshed_response = client.get(
+        "/api/chat/sessions",
+        headers={**auth, "If-None-Match": initial_etag},
+    )
+    assert refreshed_response.status_code == 200
+    assert refreshed_response.headers["etag"] != initial_etag
+    refreshed = {
+        row["id"]: row for row in refreshed_response.json()["sessions"]
+    }
+    assert refreshed[local["id"]]["name"] == "transcript title"
+    assert refreshed[local["id"]]["first_prompt"] == "transcript prompt"
+
+
+def test_single_session_stat_update_preserves_transcript_list_cache(
+    app_module, monkeypatch,
+):
+    from backend import sessions as sess
+
+    first = sess.create_session("first")
+    second = sess.create_session("second")
+    calls = 0
+
+    def scan(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return [
+            _sdk_session_info(first["id"]),
+            _sdk_session_info(second["id"]),
+        ]
+
+    monkeypatch.setattr(sess, "sdk_list_sessions", scan)
+    sess.invalidate_sessions_cache()
+    sess.list_sessions()
+    _wait_for_list_refresh(sess)
+    assert calls == 1
+    with sess._LIST_CACHE_LOCK:
+        transcript_layer = sess._LIST_CACHE["transcripts"]
+        generation = sess._LIST_CACHE["gen"]
+
+    sess.set_message_count(first["id"], 17, turn_count=4)
+    listed = {row["id"]: row for row in sess.list_sessions()}
+
+    assert calls == 1
+    assert listed[first["id"]]["message_count"] == 17
+    assert listed[first["id"]]["turn_count"] == 4
+    assert listed[second["id"]]["first_prompt"] == "transcript prompt"
+    with sess._LIST_CACHE_LOCK:
+        assert sess._LIST_CACHE["transcripts"] is transcript_layer
+        assert sess._LIST_CACHE["gen"] == generation + 1
 
 
 def test_sessions_list_conditional_get(client, auth):
@@ -425,6 +1609,83 @@ def test_annotation_partial_update_preserves_other_fields(app_module):
     assert anns["uuid-x"]["cost"] == "$0.01"
     assert anns["uuid-x"]["model"] == "m1"
     assert anns["uuid-x"]["images"] == [{"mime": "image/png"}]
+
+
+def test_terminal_annotation_and_usage_summary_share_one_sidecar_write(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    usage = {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "context_used": 12,
+        "context_limit": 200_000,
+    }
+    summary = {
+        "schema": 1,
+        "source": {"dev": 7, "inode": 11, "size": 4321, "mtime_ns": 99},
+        "update": {"turn_id": "turn-1", "at": 1_700_000_000.0},
+        "normalized": usage,
+    }
+    sess.set_terminal_annotation_and_usage(
+        sid,
+        "uuid-terminal",
+        summary,
+        turn_status="completed",
+        cost="$0.0100",
+    )
+
+    assert sess.get_message_annotations(sid)["uuid-terminal"] == {
+        "turn_status": "completed",
+        "cost": "$0.0100",
+    }
+    assert sess.get_session_usage_summary(sid) == summary
+
+
+def test_usage_summary_refinement_requires_matching_terminal_turn(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    original = {
+        "schema": 1,
+        "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+        "update": {"turn_id": "turn-new", "at": 2.0},
+        "normalized": {"input_tokens": 20},
+    }
+    stale = {
+        **original,
+        "update": {"turn_id": "turn-old", "at": 3.0},
+        "normalized": {"input_tokens": 10},
+    }
+    sess.set_session_usage_summary(sid, original)
+
+    assert sess.set_session_usage_summary_if_turn_matches(
+        sid, "turn-old", stale) is False
+    assert sess.get_session_usage_summary(sid) == original
+    assert sess.set_session_usage_summary_if_turn_matches(
+        sid, "turn-new", {**original, "normalized": {"input_tokens": 21}})
+    assert sess.get_session_usage_summary(sid)["normalized"] == {
+        "input_tokens": 21,
+    }
+
+
+def test_usage_summary_write_respects_session_deletion_fence(app_module):
+    from backend import sessions as sess
+
+    sid = "00000000-0000-4000-8000-00000000f001"
+    path = sess._sidecar_path(sid)
+    path.unlink(missing_ok=True)
+    sess.begin_session_delete(sid)
+    assert sess.set_session_usage_summary(
+        sid,
+        {
+            "schema": 1,
+            "source": {"dev": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+            "update": {"turn_id": "turn-deleted", "at": 1.0},
+            "normalized": {"input_tokens": 1},
+        },
+    ) is False
+    assert not path.exists()
 
 
 def test_cancelled_annotation_is_not_downgraded_by_late_completion(app_module):
@@ -748,8 +2009,15 @@ def test_delete_session_clears_sidecar(client, auth, app_module):
     meta = sess.create_session("ephemeral")
     sid = meta["id"]
     assert sess.get_session_meta(sid) is not None
+    assert sess.set_runtime_task_overlay(sid, "task-delete", state="running")
+    sidecar = sess._sidecar_path(sid)
+    overlay = sess._runtime_task_overlay_path(sid)
+    assert sidecar.exists()
+    assert overlay.exists()
     assert sess.delete_session(sid) is True
     assert sess.get_session_meta(sid) is None
+    assert not sidecar.exists()
+    assert not overlay.exists()
     assert sess.delete_session(sid) is False
 
 
@@ -761,10 +2029,12 @@ def test_export_session_markdown_empty(client, auth, app_module):
     r = client.post("/api/chat/sessions", headers=auth,
                      json={"name": "export-empty"})
     sid = r.json()["id"]
-    r = client.get(
-        f"/api/chat/sessions/{sid}/export",
-        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    ticket = client.post(
+        "/api/chat/resource-ticket", headers=auth,
+        json={"resource": "export", "session_id": sid},
     )
+    assert ticket.status_code == 200
+    r = client.get(ticket.json()["url"])
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/markdown")
     cd = r.headers["content-disposition"]
@@ -781,9 +2051,10 @@ def test_export_session_markdown_empty(client, auth, app_module):
 
 
 def test_export_session_markdown_404_for_unknown(client, auth):
-    r = client.get(
-        "/api/chat/sessions/no-such-session/export",
-        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    r = client.post(
+        "/api/chat/resource-ticket",
+        headers=auth,
+        json={"resource": "export", "session_id": "no-such-session"},
     )
     assert r.status_code == 404
 
