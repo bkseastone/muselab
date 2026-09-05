@@ -98,7 +98,7 @@ def _load(sid: str) -> dict:
             "checkpoints": [],
             "ops": [],
         }
-    data = json.loads(p.read_text())
+    data = json.loads(p.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema") != 1:
         raise ValueError("invalid checkpoint data")
     return data

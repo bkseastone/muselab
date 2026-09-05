@@ -38,7 +38,7 @@ def load(sid: str) -> dict:
     target = path(sid)
     if not ensure_private_regular_file(target):
         return {"schema": 1, "turns": []}
-    data = json.loads(target.read_text())
+    data = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema") != 1:
         raise ValueError("invalid delivery data")
     return data

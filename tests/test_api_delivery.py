@@ -195,3 +195,38 @@ def test_deleting_session_removes_delivery_and_invalidates_preview(client, auth,
     assert data["token"] not in file_checkpoints._PREVIEWS
     task_delivery.begin(f.sid, f.turn, f.root)
     assert not task_delivery.path(f.sid).exists()
+
+
+@pytest.mark.parametrize("writer", ["background", "watcher", "scheduled", "cron"])
+@pytest.mark.parametrize("scope", ["same", "nested", "unrelated"])
+def test_restore_detects_detached_workspace_writers(
+    client, auth, delivery_session, monkeypatch, writer, scope
+):
+    from backend import sessions
+
+    f = delivery_session
+    other = sessions.create_session(name="Detached task", model="deepseek-v4-pro", cwd=f.root)["id"]
+    owner = f.api.owned_workspace
+    other_cwd = {
+        "same": f.root,
+        "nested": f.root / "nested-project",
+        "unrelated": f.root.parent / "separate-project",
+    }[scope]
+    monkeypatch.setattr(f.api, "owned_workspace", lambda sid: ({}, other_cwd) if sid == other else owner(sid))
+    stores = {
+        "background": (f.chat._sessions_with_inflight_tasks, other, {"task"}),
+        "watcher": (f.chat._task_watchers, other, SimpleNamespace(done=lambda: False)),
+        "scheduled": (f.chat._sdk_scheduled_deliveries, (other, "scheduled"), SimpleNamespace(broadcast=SimpleNamespace(done=False))),
+        "cron": (f.chat._sdk_cron_jobs, other, [{"id": "cron"}]),
+    }
+    store, key, value = stores[writer]
+    store[key] = value
+    assert other not in f.chat._active_turns
+    try:
+        response = client.get(
+            f"/api/chat/sessions/{f.sid}/checkpoints/{f.cid}/preview", headers=auth
+        )
+        assert response.status_code == (200 if scope == "unrelated" else 409)
+        assert not f.calls and f.target.read_text(encoding="utf-8") == "after"
+    finally:
+        store.pop(key, None)

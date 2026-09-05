@@ -93,14 +93,26 @@ async def _idle(sid: str, cwd: Path) -> None:
         raise HTTPException(409, "runtime_rebuild_pending")
     if chat._sdk_cron_jobs.get(sid):
         raise HTTPException(409, "native_scheduled_tasks_must_be_removed_before_restore")
-    for other, active in tuple(chat._active_turns.items()):
-        if other != sid and not active.done:
-            try:
-                _, other_cwd = await asyncio.to_thread(owned_workspace, other)
-            except HTTPException:
-                continue
-            if workspaces_overlap(other_cwd, cwd):
-                raise HTTPException(409, "another_session_is_using_workspace")
+    # A foreground result can finish before detached writers or scheduled
+    # deliveries do. Use the runtime's authoritative busy predicate for every
+    # known session owner instead of equating a completed turn with idleness.
+    candidates = (
+        set(chat._active_turns)
+        | set(chat._sessions_with_inflight_tasks)
+        | set(chat._task_watchers)
+        | {key[0] for key in chat._sdk_scheduled_deliveries}
+        | set(chat._sdk_cron_jobs)
+        | set(RESTORING)
+    )
+    for other in candidates - {sid}:
+        if not (chat._session_runtime_busy(other) or chat._sdk_cron_jobs.get(other)):
+            continue
+        try:
+            _, other_cwd = await asyncio.to_thread(owned_workspace, other)
+        except HTTPException:
+            raise HTTPException(409, "active_workspace_unavailable") from None
+        if workspaces_overlap(other_cwd, cwd):
+            raise HTTPException(409, "another_session_is_using_workspace")
 
 
 @router.get("/{sid}/runtime")

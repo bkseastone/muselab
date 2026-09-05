@@ -36,7 +36,8 @@ output, and disable filesystem-monitor commands from Git configuration.
 ## Reviewing a file restore
 
 1. Finish or stop the task, clear its pending queue and remove native scheduled
-   tasks. Other MuseLab sessions using the same workspace must be idle.
+   tasks. Other MuseLab sessions using the same or an overlapping workspace must
+   have no active turns, background writers or native scheduled tasks.
 2. Select **Preview restore scope**. Review every observed path and action.
    Modified files restore their contents; files created since that checkpoint
    are removed. Any unknown or unsafe scope disables restoration.
