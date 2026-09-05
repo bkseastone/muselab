@@ -10,18 +10,18 @@ window.museTaskDelivery = function () {
     async fetchTaskRuntime(sid) {
       const seq = ++this._taskRuntimeSeq;
       this.runtimeIdentity = null;
-      if (!sid || !this.authed) return;
+      if (!sid || !this.authed || this.workspaceSwitching) return;
       const result = await this.api(`/api/chat/sessions/${encodeURIComponent(sid)}/runtime`);
       if (seq === this._taskRuntimeSeq && sid === this.currentId && result.ok) this.runtimeIdentity = result.data;
     },
     async fetchDeliverySurfaceIdentity(surface, cwd) {
       const sid = this.currentId;
-      const key = [sid, surface, cwd, this.authed].join("|");
+      const key = [sid, surface, cwd, this.authed, this.workspaceSwitching].join("|");
       if (key === this._deliverySurfaceKey) return;
       this._deliverySurfaceKey = key;
       const seq = ++this._deliverySurfaceSeq;
       this.deliverySurfaceIdentity = null;
-      if (!sid || !cwd || !this.authed) return;
+      if (!sid || !cwd || !this.authed || this.workspaceSwitching) return;
       const result = await this.api(`/api/chat/sessions/${encodeURIComponent(sid)}/runtime`, { query: { workspace: cwd } });
       if (seq === this._deliverySurfaceSeq && result.ok) this.deliverySurfaceIdentity = { ...result.data, surface };
     },

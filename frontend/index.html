@@ -1545,7 +1545,7 @@
           <svg x-show="!previewOpen || desktopFullPane"><use href="#i-chevron-left"/></svg>
         </button>
       </header>
-      <div class="task-runtime-strip" x-init="$watch('currentId', sid => fetchTaskRuntime(sid)); $watch('authed', () => fetchTaskRuntime(currentId)); if(currentId) fetchTaskRuntime(currentId)" x-show="currentId">
+      <div class="task-runtime-strip" x-init="$watch('currentId', sid => fetchTaskRuntime(sid)); $watch('authed', () => fetchTaskRuntime(currentId)); $watch('workspaceSwitching', () => fetchTaskRuntime(currentId)); if(currentId) fetchTaskRuntime(currentId)" x-show="currentId">
         <button type="button" @click="openTaskDelivery()" :title="runtimeIdentity?.session_id===currentId ? runtimeIdentity.workspace : ''" x-text="deliveryRuntimeLabel() || (lang==='zh' ? '运行环境待核验' : 'Runtime identity pending')"></button>
       </div>
 
