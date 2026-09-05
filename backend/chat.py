@@ -12091,6 +12091,8 @@ def _classify_stream_error(err: Any) -> dict:
     """
     msg = str(err) if err is not None else ""
     low = msg.lower()
+    if "runtime_buffer_exceeded" in low:
+        return {"kind": "runtime_buffer", "retryable": False, "cta": None}
     kind = "unknown"
     cta: str | None = "retry"
     retryable = True

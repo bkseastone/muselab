@@ -96,6 +96,8 @@ muselab only acts as an Images API client; it does not launch a local image mode
 | `MUSELAB_MAX_UPLOAD_MB` | Files API upload limit per file in MiB | `100` |
 | `MUSELAB_MAX_TURNS` | Additional session turn cap; `0` means unlimited | `0` |
 | `MUSELAB_THINKING_BUDGET` | Extended-thinking token budget | `10000` |
+| `MUSELAB_RUNTIME_BUFFER_EVENTS` | Queued SDK messages per turn/background handoff, minimum 1 | `8192` |
+| `MUSELAB_RUNTIME_BUFFER_BYTES` | Estimated parsed-object bytes per SDK handoff, minimum 1024 | `67108864` |
 | `MUSELAB_CLIENT_POOL_CAP` | Number of live SDK clients | `3` |
 | `MUSELAB_RECENT_TURN_TTL` | Seconds a finished turn remains reconnectable | `60` |
 | `MUSELAB_INTERRUPT_ACK_TIMEOUT_S` | Graceful SDK interrupt acknowledgement timeout | `0.35` |
@@ -107,6 +109,23 @@ muselab only acts as an Images API client; it does not launch a local image mode
 | `MUSELAB_PRUNE_EMPTY_SESSIONS` | Prune sessions meeting strict empty-session rules | `false` |
 | `MUSELAB_TRASH_TTL_DAYS` | Dustbin retention; `0` means forever | `30` |
 | `MUSELAB_VAPID_SUBJECT` | Web Push VAPID subject | `mailto:noreply@muselab.dev` |
+
+The SDK handoff budgets apply before browser SSE replay. The orphan handoff
+also has a 512-message cap. A single oversized message or accumulated backlog
+produces `runtime_buffer_exceeded`, interrupts/disconnects the exact owning SDK
+client, and enters the existing failed-turn/history recovery path; messages are
+never silently evicted and the sole SDK reader never waits for queue space.
+These limits are estimated Python-object memory, not token or upload limits.
+Changes take effect after a service restart.
+
+The Service panel reads numeric `diagnostics.runtime_buffers` from
+`GET /api/settings/service`: current depth/estimated bytes, oldest wait,
+maximum observed single-queue depth/bytes and dequeue wait, and process-lifetime
+overflow count. No prompt, tool result, path, or protocol payload is logged.
+MCP status/reconnect observe a shared three-second deadline with at most four
+in-flight controls; partial responses mark unfinished operations `pending`.
+The SDK owns their completion timeout, and repeated calls reuse an in-flight
+operation instead of cancelling or duplicating it.
 
 The VAPID keypair is not an environment variable. It is generated at `$MUSELAB_ROOT/.muselab/vapid.json`.
 
