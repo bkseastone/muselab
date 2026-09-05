@@ -4278,7 +4278,7 @@
   <input type="file" x-ref="ctxUpload" style="display:none" @change="ctxUploadHandler($event)" />
 
   <!-- ============ Settings Modal ============ -->
-  <div class="modal-backdrop" x-show="settings.show" @click.self="settings.show=false">
+  <div class="modal-backdrop" x-show="settings.show" @click.self="closeSettings()">
     <div class="modal settings-modal" :class="{'is-memory-center': settings.surface==='memory'}" tabindex="-1"
          @keydown.tab="trapDialogFocus($event, 'settings')"
          role="dialog" aria-modal="true" :aria-label="settings.surface==='memory' ? (lang==='zh'?'记忆中心':'Memory Center') : t('set.title')">
@@ -4287,7 +4287,7 @@
           <svg class="modal-title-icon"><use href="#i-settings"/></svg>
           <span x-text="settings.surface==='memory' ? (lang==='zh'?'记忆中心':'Memory Center') : t('set.title')"></span>
         </span>
-        <button class="modal-close" @click="settings.show=false"
+        <button class="modal-close" @click="closeSettings()"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body settings-modal-body">
@@ -4323,6 +4323,10 @@
         <div class="settings-inline-error" role="alert" x-show="settings.error && settings.surface!=='memory'">
           <span x-text="settings.error"></span>
           <button class="btn-ghost sm" @click="openSettings(settings.activePage)" x-text="lang==='zh'?'重试':'Retry'"></button>
+        </div>
+        <div class="settings-draft-notice" role="status" x-show="settingsDirty()">
+          <span x-text="lang==='zh' ? '有未保存的设置。关闭后可在此页面继续编辑。' : 'Unsaved settings. Close and reopen on this page to continue.'"></span>
+          <button class="btn-ghost sm" @click="discardSettingsDrafts()" x-text="lang==='zh'?'放弃草稿':'Discard drafts'"></button>
         </div>
         <!-- Mobile-only back button — shown on detail pages. -->
         <button class="settings-back"
@@ -5781,7 +5785,7 @@
       </div>
       <div class="modal-foot">
         <button x-show="settings.surface!=='memory'" @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
-        <button @click="settings.show=false" class="btn-ghost" x-text="lang==='zh'?'关闭':'Close'"></button>
+        <button @click="closeSettings()" class="btn-ghost" x-text="lang==='zh'?'关闭':'Close'"></button>
         <button x-show="settings.activePage === 'provider' || settings.activePage === 'defaults'"
                 :disabled="settings.loading || !!settings.error"
                 @click="saveSettings()" class="btn-primary" x-text="t('btn.save')"></button>

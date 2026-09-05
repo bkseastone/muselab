@@ -12522,3 +12522,21 @@ html[data-theme="eyecare"] .tool-error-hint {
   .queue-outbox-toggle, .queue-outbox .queued-act { min-height: 40px; }
   .queue-outbox-items { max-height: 23vh; }
 }
+
+/* Settings must override the later desktop grid on narrow viewports. */
+.settings-draft-notice { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px; margin:0 0 16px; border:1px solid var(--c-accent); border-radius:var(--r-md); font-size:var(--fs-sm); }
+.settings-draft-notice span { flex:1 1 170px; overflow-wrap:anywhere; }
+.settings-modal .settings-row > * { min-width:0; }
+@media (max-width:720px) {
+  .settings-modal .settings-row { grid-template-columns:minmax(0,1fr); row-gap:6px; margin-bottom:14px; }
+  .settings-modal .settings-row > label { overflow:visible; text-overflow:clip; white-space:normal; overflow-wrap:anywhere; }
+  .settings-modal .settings-input-wrap { min-width:0; flex-wrap:wrap; }
+  .settings-modal .settings-input-wrap .settings-input { flex:1 1 150px; }
+  .settings-modal input:not([type="checkbox"]):not([type="radio"]),
+  .settings-modal select, .settings-modal textarea { min-width:0; max-width:100%; box-sizing:border-box; font-size:16px; }
+  .settings-modal .settings-section { min-width:0; }
+  .settings-modal .provider-row { grid-template-columns:minmax(0,1fr); }
+  .settings-modal .settings-row select,
+  .settings-modal .settings-row input:not([type="checkbox"]):not([type="radio"]) { height:40px; }
+  .settings-modal .settings-row .switch { width:40px; }
+}

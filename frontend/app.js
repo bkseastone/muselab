@@ -1487,7 +1487,7 @@ function portal() {
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
-        else if (top === "settings") this.settings.show = false;
+        else if (top === "settings") this.closeSettings();
         else if (top === "image-gen") this.closeImageGen();
         else if (top === "cheatsheet") this.cheatSheet.show = false;
         else if (top === "workspace-browser") this.closeWorkspaceBrowser();
@@ -1619,7 +1619,7 @@ function portal() {
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
-        if (this.settings.show) { this.settings.show = false; return; }
+        if (this.settings.show) { this.closeSettings(); return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
         if (this.previewQuote.show) { this.dismissPreviewQuote(true); return; }
         // 退出编辑 — guard against silently discarding unsaved edits when ESC
@@ -20305,6 +20305,33 @@ function portal() {
     },
 
     // ===== settings modal =====
+    settingsDirty() { return !!this._settingsDraftGuard?.dirty(); },
+    async closeSettings() {
+      if (this._settingsLeavePending) return false;
+      if (this.settingsDirty()) {
+        this._settingsLeavePending = true;
+        const leave = await this.confirm({
+          title: this.lang === "zh" ? "设置尚未保存" : "Unsaved settings",
+          body: this.lang === "zh"
+            ? "关闭后草稿会保留在此页面。重新打开可继续编辑；刷新或离开页面前请先保存。"
+            : "Your drafts stay on this page when closed. Reopen to continue; save before refreshing or leaving the page.",
+          okText: this.lang === "zh" ? "保留草稿并关闭" : "Keep drafts & close",
+          cancelText: this.lang === "zh" ? "继续编辑" : "Keep editing",
+        });
+        this._settingsLeavePending = false;
+        if (!leave) return false;
+      }
+      this.settings.show = false;
+      return true;
+    },
+    async discardSettingsDrafts() {
+      const discard = await this.confirm({
+        title: this.lang === "zh" ? "放弃未保存的设置？" : "Discard unsaved settings?",
+        body: this.lang === "zh" ? "已保存的设置不受影响。" : "Saved settings remain unchanged.",
+        okText: this.lang === "zh" ? "放弃草稿" : "Discard drafts", danger: true,
+      });
+      if (discard) this._settingsDraftGuard?.discard();
+    },
     settingsNavigation() {
       const zh = this.lang === "zh";
       return [
@@ -20348,6 +20375,17 @@ function portal() {
       finally { this.settings.serviceLoading = false; }
     },
     async openSettings(activePage = "") {
+      if (!this._settingsDraftGuard) {
+        const { createSettingsDraftGuard } = await import("/static/modules/settings-drafts.mjs");
+        this._settingsDraftGuard = createSettingsDraftGuard(this);
+        this._settingsDraftGuard.capture();
+      }
+      if (this.settingsDirty()) {
+        this.settings.surface = activePage === "memory" ? "memory" : "settings";
+        this.settings.show = true;
+        this.selectSettingsPage(activePage || this.settings.activePage || (this.isWideScreen ? "provider" : null));
+        return;
+      }
       const generation = (this._settingsOpenGeneration || 0) + 1;
       this._settingsOpenGeneration = generation;
       if (this._settingsOpenController) this._settingsOpenController.abort();
@@ -20389,6 +20427,10 @@ function portal() {
         this.busySendMode = this._normalizeBusySendMode(d.defaults.busy_send_mode);
         this.savePrefs();
       }
+      this._settingsDraftGuard.capture([
+        "defaults", "keys", "newProvider",
+        ...d.providers.map(p => `provider:${p.id}`),
+      ]);
       // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
       // Desktop: sidebar is always visible, so land on a default tab
       // (provider — the most-used section) and render only that pane.
@@ -20576,13 +20618,17 @@ function portal() {
       this._memorySettingsGeneration = generation;
       mem.loading = true;
       const load = async (key) => {
+        if (key === "config" && this._settingsDraftGuard?.dirty("memory")) return;
         mem[`${key}Loading`] = true;
         mem[`${key}Error`] = "";
         try {
           const data = await this._settingsRead(`/api/memory/${key}`);
           if (generation !== this._memorySettingsGeneration) return;
           mem[key] = data;
-          if (key === "config") mem.configLoaded = true;
+          if (key === "config") {
+            mem.configLoaded = true;
+            this._settingsDraftGuard?.capture(["memory"]);
+          }
         } catch (e) {
           if (generation === this._memorySettingsGeneration) {
             mem[`${key}Error`] = this._settingsReadError(e);
@@ -20640,6 +20686,7 @@ function portal() {
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
         mem.config = d.config; mem.status = d.status;
+        this._settingsDraftGuard?.capture(["memory"]);
         this._memoryMonitorEnabled = d.config.mode !== "off";
         this._startMemoryMonitor();
         this.toast(this.lang === "zh" ? "记忆设置已保存" : "Memory settings saved",
@@ -21158,6 +21205,7 @@ function portal() {
     },
     startAddHook() {
       this.settings.hooks.draft = this._newHookDraft();
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     editHook(row) {
       this.settings.hooks.draft = {
@@ -21173,9 +21221,11 @@ function portal() {
         groupIndex: row.groupIndex,
         handlerIndex: row.handlerIndex,
       };
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     cancelHookDraft() {
       this.settings.hooks.draft = { ...this._newHookDraft(), show: false };
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     hookHandlerTemplate(type) {
       const templates = {
@@ -21635,7 +21685,11 @@ function portal() {
         drafts[p.id].open = false;
         return;
       }
+      if (drafts[p.id] && this._settingsDraftGuard?.dirty(`provider:${p.id}`)) {
+        drafts[p.id].open = true; return;
+      }
       drafts[p.id] = { ...this._draftFromProvider(p), open: true };
+      this._settingsDraftGuard?.capture([`provider:${p.id}`]);
     },
 
     _parseModels(text) {
@@ -21648,7 +21702,11 @@ function portal() {
     toggleAnthropicModels(p) {
       const drafts = this.settings.providerDrafts;
       if (drafts[p.id] && drafts[p.id].open) { drafts[p.id].open = false; return; }
+      if (drafts[p.id] && this._settingsDraftGuard?.dirty(`provider:${p.id}`)) {
+        drafts[p.id].open = true; return;
+      }
       drafts[p.id] = { open: true, models: (p.models || []).join("\n") };
+      this._settingsDraftGuard?.capture([`provider:${p.id}`]);
     },
 
     async saveAnthropicModels(p) {
@@ -21668,6 +21726,7 @@ function portal() {
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
+        this._settingsDraftGuard?.capture([`provider:${p.id}`]);
         await this._reloadProviders();
         await this._fetchModels();
       } catch (e) {
@@ -21705,6 +21764,7 @@ function portal() {
         throw new Error(msg);
       }
       dr.open = false;
+      this._settingsDraftGuard?.capture([`provider:${prov.id}`]);
       return 1;
     },
 
@@ -21723,6 +21783,8 @@ function portal() {
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         if (pid && this.settings.providerDrafts[pid]) {
           this.settings.providerDrafts[pid].open = false;
+          this.settings.providerDrafts[pid].api_key = "";
+          this._settingsDraftGuard?.capture([`provider:${pid}`]);
         }
         await this._reloadProviders();
         await this._fetchModels();
@@ -22124,7 +22186,11 @@ function portal() {
       });
       if (r.ok) {
         const d = await r.json();
-        this.settings.show = false;
+        this.settings.draftKeys = Object.fromEntries(
+          Object.keys(this.settings.draftKeys).map(key => [key, ""]));
+        this._settingsDraftGuard?.capture(["defaults", "keys"]);
+        // Other sections have their own explicit Save; never hide their drafts.
+        if (!this.settingsDirty()) this.settings.show = false;
         // Prefer `updated_count` (user-facing tally) over `updated.length`
         // (raw env-key count). Backend dedupes the MUSELAB_MODEL +
         // MUSELAB_DEFAULT_MODEL pair so changing the model dropdown reads
@@ -30379,11 +30445,11 @@ function portal() {
     // Idempotent: only touches the listener when the desired state changes,
     // so it never leaves a stale handler attached (which would break bfcache).
     _syncBeforeUnloadGuard() {
-      const wantGuard = this._editorDirty();
+      const wantGuard = this._editorDirty() || this.settingsDirty();
       if (wantGuard && !this._beforeUnloadFn) {
         this._beforeUnloadFn = (e) => {
           // Re-check at fire time — state may have changed since attach.
-          if (!this._editorDirty()) return;
+          if (!this._editorDirty() && !this.settingsDirty()) return;
           e.preventDefault();
           // Legacy browsers need returnValue set to trigger the native prompt;
           // the string itself is ignored by modern browsers.
