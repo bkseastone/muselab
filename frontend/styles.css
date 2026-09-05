@@ -12569,3 +12569,6 @@ html[data-theme="eyecare"] .tool-error-hint {
 
 .browser-turn-metrics { display:flex; flex-direction:column; gap:8px; }
 .browser-turn-metric { display:flex; flex-wrap:wrap; gap:8px 16px; padding:8px 0; border-top:1px solid var(--c-border); font-size:var(--fs-sm); font-variant-numeric:tabular-nums; }
+
+/* Expanded diagnostics must not inherit legacy negative hint margins. */
+.settings-modal .settings-advanced > .settings-hint { margin:10px 0 12px; }
