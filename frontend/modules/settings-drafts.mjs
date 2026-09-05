@@ -7,7 +7,9 @@ const clean = value => {
       .map(key => [key, clean(value[key])]));
   return value;
 };
-const signature = value => JSON.stringify(clean(value));
+const signature = (value, name) => JSON.stringify(clean(name === "keys"
+  ? Object.fromEntries(Object.entries(value || {}).filter(([, item]) => String(item || "").trim()))
+  : value));
 
 export function createSettingsDraftGuard(app) {
   const baseline = new Map();
@@ -32,7 +34,7 @@ export function createSettingsDraftGuard(app) {
       const current = values();
       const names = name ? [name] : Object.keys(current);
       return names.some(key => baseline.has(key)
-        && signature(current[key]) !== signature(baseline.get(key)));
+        && signature(current[key], key) !== signature(baseline.get(key), key));
     },
     discard() {
       const simple = {defaults: "draftDefaults", keys: "draftKeys", newProvider: "providerNew", mcp: "mcpDraft"};

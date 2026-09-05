@@ -1218,6 +1218,25 @@ function portal() {
     // duplicating on accidental repeated Ctrl+V.
     fileClipboard: { path: "", name: "" },
 
+    browserMetrics: {fcpMs:null, readyMs:null, monitorStartedMs:null, longTasksSupported:false, longTasks:0, longTaskMs:0, turns:[]},
+    browserMetricTime(value) { return Number.isFinite(value) ? Math.round(value) + " ms" : "—"; },
+    async loadBrowserMetrics() {
+      if (!this._browserMetricsPromise) this._browserMetricsPromise = import("/static/modules/browser-metrics.mjs")
+        .then(({createBrowserMetrics}) => { this._browserMetrics = createBrowserMetrics(this); return this._browserMetrics; })
+        .catch(() => { this._browserMetricsPromise = null; return null; });
+      const metrics = await this._browserMetricsPromise;
+      metrics?.publish();
+      return metrics;
+    },
+    htmlAnnotation: { active:false, loading:false, selection:null, comment:"", error:"" },
+    async toggleHtmlAnnotation() {
+      if (!this._htmlAnnotationController) {
+        const { createHtmlAnnotation } = await import("/static/modules/html-annotation.mjs");
+        this._htmlAnnotationController = createHtmlAnnotation(this);
+      }
+      if (this.htmlAnnotation.active || this.htmlAnnotation.loading) this._htmlAnnotationController.stop();
+      else this._htmlAnnotationController.start();
+    },
     // ===== settings =====
     // Keyboard cheat-sheet modal — toggled by `?` keypress outside any
     // input. Discoverability tool: muselab has 10+ shortcuts and no one
@@ -1730,6 +1749,9 @@ function portal() {
       this._initArtifacts();
       this._initStreamSelectionGuard();
       this._initPreviewSelection();
+      const startBrowserMetrics = () => { void this.loadBrowserMetrics(); };
+      if (window.requestIdleCallback) window.requestIdleCallback(startBrowserMetrics, {timeout:3000});
+      else setTimeout(startBrowserMetrics, 1500);
       this._initAriaLabelMirror();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
@@ -1998,6 +2020,7 @@ function portal() {
       } else {
         // No token saved → skip splash, jump straight to login.
         this.appReady = true;
+        performance.mark("muselab-app-ready");
       }
     },
 
@@ -2354,19 +2377,8 @@ function portal() {
       // (the already-open-tab case is handled via the SW postMessage above).
       this._openStartupActivityDeeplink();
       this.initSessions().then(() => this._openStartupSessionDeeplink());
-      // First-run hint — surface key shortcuts so the user doesn't have to
-      // hunt for them. Flagged in localStorage so it only fires once. Short
-      // delay lets the splash clear first.
-      if (!localStorage.getItem("muselab_seen_help")) {
-        setTimeout(() => {
-          this.toast(
-            this.lang === "zh"
-              ? "Tip：⌘K 命令面板 · @ 引用文件或目录 · ↑ 回滚上一条"
-              : "Tip: ⌘K command palette · @ to reference files or folders · ↑ to recall last message",
-            "info", 7000);
-          this._setLS("muselab_seen_help", "1");
-        }, 1500);
-      }
+      // Shortcuts remain discoverable in the command button and empty preview.
+      // Boot success needs no extra toast over the first useful interaction.
       // Same preview-file restore that login() does — covers the
       // already-authed boot path (page refresh with saved token).
       if (this._pendingPreviewSelected && this.previewSurface !== "terminal") {
@@ -2498,6 +2510,7 @@ function portal() {
     _markReady() {
       if (this.appReady) return;
       this.appReady = true;
+      performance.mark("muselab-app-ready");
       clearTimeout(this._splashHintTimer);
       clearTimeout(this._splashHardTimeout);
       this.splashHint = "";
@@ -3076,7 +3089,7 @@ function portal() {
         if (Number.isInteger(i) && i >= 0 && i < this.MASCOTS.length) {
           this.mascotIdx = i;
           this.applyFavicon();
-          setTimeout(() => this.greetMascot(this.mascotLabel()), 400);
+          setTimeout(() => this.greetMascot(), 400);
           return;
         }
       }
@@ -3090,7 +3103,7 @@ function portal() {
       this.mascotIdx = Math.abs(h) % this.MASCOTS.length;
       try { localStorage.setItem("muselab_mascot_idx", String(this.mascotIdx)); } catch {}
       this.applyFavicon();
-      setTimeout(() => this.greetMascot(this.mascotLabel()), 400);
+      setTimeout(() => this.greetMascot(), 400);
     },
     mascot() { return this.MASCOTS[this.mascotIdx]; },
     mascotHref() { return "#m-" + this.mascot().id; },
@@ -20676,6 +20689,7 @@ function portal() {
 
     async saveMemorySettings() {
       const mem = this.settings.memory;
+      const submittedConfig = JSON.parse(JSON.stringify(mem.config));
       mem.saving = true;
       try {
         const r = await fetch("/api/memory/config?probe=true", {
@@ -20685,8 +20699,11 @@ function portal() {
         });
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
-        mem.config = d.config; mem.status = d.status;
-        this._settingsDraftGuard?.capture(["memory"]);
+        if (JSON.stringify(mem.config) === JSON.stringify(submittedConfig)) {
+          mem.config = d.config;
+          this._settingsDraftGuard?.capture(["memory"]);
+        } else this._settingsDraftGuard?.accept("memory", submittedConfig);
+        mem.status = d.status;
         this._memoryMonitorEnabled = d.config.mode !== "off";
         this._startMemoryMonitor();
         this.toast(this.lang === "zh" ? "记忆设置已保存" : "Memory settings saved",
@@ -21633,7 +21650,7 @@ function portal() {
         // the draft so the row collapses back to "已配置" view next render.
         const p = this.settings.providers.find(x => x.env_key === envKey);
         if (p) p.configured = true;
-        this.settings.draftKeys[envKey] = "";
+        if ((this.settings.draftKeys[envKey] || "").trim() === v) this.settings.draftKeys[envKey] = "";
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         // Refresh providers + model list so any newly-enabled model
         // appears in the chat dropdown immediately.
@@ -21712,6 +21729,7 @@ function portal() {
     async saveAnthropicModels(p) {
       const dr = this.settings.providerDrafts[p.id];
       if (!dr) return;
+      const submittedDraft = JSON.parse(JSON.stringify(dr));
       const models = this._parseModels(dr.models);
       try {
         const r = await fetch("/api/settings/providers/anthropic-models", {
@@ -21725,8 +21743,8 @@ function portal() {
           throw new Error(msg);
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
-        if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
-        this._settingsDraftGuard?.capture([`provider:${p.id}`]);
+        if (JSON.stringify(dr) === JSON.stringify(submittedDraft)) dr.open = false;
+        this._settingsDraftGuard?.accept(`provider:${p.id}`, submittedDraft);
         await this._reloadProviders();
         await this._fetchModels();
       } catch (e) {
@@ -21750,6 +21768,7 @@ function portal() {
       if (!prov) return 0;
       const dr = this.settings.providerDrafts[prov.id];
       if (!dr || !dr.open) return 0;
+      const submittedDraft = JSON.parse(JSON.stringify(dr));
       const next = this._parseModels(dr.models);
       const cur = prov.models || [];
       if (next.join("\n") === cur.join("\n")) return 0;  // no real change
@@ -21763,12 +21782,14 @@ function portal() {
         try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
         throw new Error(msg);
       }
-      dr.open = false;
-      this._settingsDraftGuard?.capture([`provider:${prov.id}`]);
+      if (JSON.stringify(dr) === JSON.stringify(submittedDraft)) dr.open = false;
+      this._settingsDraftGuard?.accept(`provider:${prov.id}`, submittedDraft);
       return 1;
     },
 
     async _submitProvider(body, pid) {
+      const submittedDraft = pid && this.settings.providerDrafts[pid]
+        ? JSON.parse(JSON.stringify(this.settings.providerDrafts[pid])) : null;
       try {
         const r = await fetch("/api/settings/providers", {
           method: "POST",
@@ -21782,9 +21803,11 @@ function portal() {
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         if (pid && this.settings.providerDrafts[pid]) {
-          this.settings.providerDrafts[pid].open = false;
-          this.settings.providerDrafts[pid].api_key = "";
-          this._settingsDraftGuard?.capture([`provider:${pid}`]);
+          const draft = this.settings.providerDrafts[pid];
+          const unchanged = JSON.stringify(draft) === JSON.stringify(submittedDraft);
+          if (draft.api_key === submittedDraft.api_key) draft.api_key = "";
+          if (unchanged) draft.open = false;
+          this._settingsDraftGuard?.accept(`provider:${pid}`, {...submittedDraft, api_key:""});
         }
         await this._reloadProviders();
         await this._fetchModels();
@@ -22148,6 +22171,7 @@ function portal() {
     },
 
     async saveSettings() {
+      const submittedDefaults = JSON.parse(JSON.stringify(this.settings.draftDefaults));
       // Flush an open Claude model-list edit first so the global Save captures
       // it too (see _flushAnthropicModelDraft). modelChanges folds into the
       // "Saved N settings" tally below so the toast reflects the model edit
@@ -22160,10 +22184,10 @@ function portal() {
         return;
       }
       const body = {
-        default_model: this.settings.draftDefaults.model,
-        default_permission: this.settings.draftDefaults.permission,
+        default_model: submittedDefaults.model,
+        default_permission: submittedDefaults.permission,
         busy_send_mode: this._normalizeBusySendMode(
-          this.settings.draftDefaults.busy_send_mode,
+          submittedDefaults.busy_send_mode,
         ),
       };
       // Send every typed provider key through the generic provider_keys
@@ -22186,9 +22210,12 @@ function portal() {
       });
       if (r.ok) {
         const d = await r.json();
-        this.settings.draftKeys = Object.fromEntries(
-          Object.keys(this.settings.draftKeys).map(key => [key, ""]));
-        this._settingsDraftGuard?.capture(["defaults", "keys"]);
+        for (const [key, value] of Object.entries(providerKeys)) {
+          if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+        }
+        this._settingsDraftGuard?.accept("defaults", submittedDefaults);
+        this._settingsDraftGuard?.accept("keys", Object.fromEntries(
+          Object.keys(this.settings.draftKeys).map(key => [key, ""])));
         // Other sections have their own explicit Save; never hide their drafts.
         if (!this.settingsDirty()) this.settings.show = false;
         // Prefer `updated_count` (user-facing tally) over `updated.length`
@@ -22215,20 +22242,20 @@ function portal() {
         // 之前只写了服务端 env，但前端的 this.model 还是 localStorage 里的
         // 老值 → 用户看不到任何变化。同步前端 + localStorage 让"我改了它生效"
         // 的预期成立。已建会话有自己 locked model，不受影响。
-        const newDefaultModel = this.settings.draftDefaults.model;
+        const newDefaultModel = submittedDefaults.model;
         if (newDefaultModel) {
           // newSession() seeds from defaultModel — update it so the change
           // takes effect on the very next new chat without a providers refetch.
           this.defaultModel = newDefaultModel;
           this.savePrefs();
         }
-        const newDefaultPerm = this.settings.draftDefaults.permission;
+        const newDefaultPerm = submittedDefaults.permission;
         if (newDefaultPerm && newDefaultPerm !== this.defaultPermission) {
           this.defaultPermission = newDefaultPerm;
           this.savePrefs();
         }
         const newBusySendMode = this._normalizeBusySendMode(
-          this.settings.draftDefaults.busy_send_mode,
+          submittedDefaults.busy_send_mode,
         );
         if (newBusySendMode !== this.busySendMode) {
           this.busySendMode = newBusySendMode;
@@ -32814,6 +32841,8 @@ function portal() {
       // from `this.currentId` here. That was the bug.
       const streamSid = sendSid;
       const streamState = sendState;
+      const uiMetricTurn = isReconnect ? this._browserMetrics?.currentTurn(streamSid)
+        : this._browserMetrics?.startTurn(streamSid);
       // Transport/render capability is fixed for the lifetime of this stream.
       // Viewport changes mid-reply must not silently switch replay policy.
       const streamMobile = this._isMobileLayout();
@@ -33402,6 +33431,7 @@ function portal() {
         lastPlainPaint = Date.now();
         streamState._streamPlainRenderCount++;
         _scrollIfActive();
+        if (acc) this._browserMetrics?.paint(uiMetricTurn, "first", curBubble._k);
       };
       const schedulePlainPaint = () => {
         if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
@@ -34244,6 +34274,8 @@ function portal() {
             ta.focus();
           });
         }
+        if (stampedAssistant) this._browserMetrics?.paint(uiMetricTurn, "first", stampedAssistant._k);
+        if (tailCandidate) this._browserMetrics?.paint(uiMetricTurn, "final", tailCandidate._k);
         return {
           followTail: followedTail,
           userScrollAt: Math.max(
@@ -35418,6 +35450,9 @@ function portal() {
       // better to show something technical than swallow useful info.
       const zh = this.lang === "zh";
       const s = String(raw || "");
+      if (/runtime_buffer_exceeded/i.test(s)) return zh
+        ? "输出积压过大，运行已停止。请先刷新会话历史确认结果，再决定是否重试。"
+        : "Output backlog stopped the run. Reload conversation history to confirm the result before retrying.";
       if (/401|unauthorized|invalid.api.key/i.test(s))
         return zh ? "API key 无效，去 Settings 检查" : "Invalid API key — check Settings";
       if (/429|rate.?limit|too many/i.test(s))

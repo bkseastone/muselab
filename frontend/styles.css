@@ -12540,3 +12540,32 @@ html[data-theme="eyecare"] .tool-error-hint {
   .settings-modal .settings-row input:not([type="checkbox"]):not([type="radio"]) { height:40px; }
   .settings-modal .settings-row .switch { width:40px; }
 }
+
+.workbench-more { position:relative; flex-shrink:0; }
+.workbench-more summary { list-style:none; font-weight:600; letter-spacing:2px; }
+.workbench-more summary::-webkit-details-marker { display:none; }
+.workbench-more-actions { position:absolute; top:calc(100% + 6px); right:0; width:230px; padding:6px; display:flex; flex-direction:column; gap:2px; background:var(--c-bg-1); border:1px solid var(--c-border); border-radius:var(--r-md); box-shadow:0 8px 24px #0002; z-index:200; }
+.workbench-more-actions .icon-btn { width:100%; min-height:40px; padding:8px 10px; justify-content:flex-start; gap:10px; position:relative; }
+.workbench-action-label { font-size:var(--fs-sm); text-align:left; }
+.workbench-more-actions .icon-btn svg { flex-shrink:0; }
+.pane.chat:has(.workbench-more[open]) { z-index:90; }
+.preview-empty-title { font-size:24px; }
+.brand-empty .preview-open-existing { margin:18px 0 0; font-size:var(--fs-sm); }
+.brand-empty .preview-focus-chat { margin-top:14px; font-size:var(--fs-sm); }
+.memory-center-intro, .memory-empty-guide p, .memory-how-it-works p { font-size:var(--fs-sm); line-height:1.65; color:var(--c-fg-2); }
+.memory-empty-guide { padding:20px; border:1px dashed var(--c-border); border-radius:var(--r-md); margin:16px 0; }
+.memory-source summary { cursor:pointer; }
+.memory-source > span { display:block; overflow-wrap:anywhere; margin-top:6px; }
+@media (max-width:720px) { .workbench-more-actions { position:fixed; top:110px; right:12px; max-width:calc(100vw - 24px); } }
+
+.html-annotation-panel { flex-shrink:0; padding:10px 14px; background:var(--c-bg-2); border-bottom:1px solid var(--c-border); font-size:var(--fs-sm); }
+.html-annotation-head { display:flex; align-items:center; gap:12px; justify-content:space-between; }
+.html-annotation-head > span { min-width:0; }
+.html-annotation-panel code { display:block; white-space:normal; overflow-wrap:anywhere; font-size:12px; margin:8px 0; }
+.html-annotation-form { display:flex; gap:8px; align-items:flex-end; }
+.html-annotation-form textarea { flex:1; min-width:0; height:auto; resize:vertical; padding:8px; line-height:1.5; }
+.html-annotation-form button { flex-shrink:0; }
+@media(max-width:720px) { .html-annotation-form { flex-wrap:wrap; } .html-annotation-form textarea { flex-basis:100%; font-size:16px; } }
+
+.browser-turn-metrics { display:flex; flex-direction:column; gap:8px; }
+.browser-turn-metric { display:flex; flex-wrap:wrap; gap:8px 16px; padding:8px 0; border-top:1px solid var(--c-border); font-size:var(--fs-sm); font-variant-numeric:tabular-nums; }

@@ -3064,7 +3064,9 @@ SANDBOXED_INLINE_SUFFIX = {".html", ".htm", ".svg"}
 
 # HTML-preview bridge. The iframe has an opaque sandbox origin, so the parent
 # cannot inspect its document scroll position or intercept image clicks. This
-# script is injected only for preview=1 and uses postMessage for both jobs;
+# bridge is injected only for preview=1; the element-annotation helper uses
+# the same opaque frame boundary and sends bounded descriptions, never commands.
+# It uses postMessage for scroll/image coordination;
 # neither feature requires relaxing the sandbox. The parent validates
 # event.source against its own preview iframe, while this child accepts restore
 # messages only from its parent. CSP permits this inline bridge.
@@ -3102,6 +3104,7 @@ _PREVIEW_HTML_BRIDGE = (
     "if(!src)return;e.preventDefault();"
     "try{parent.postMessage({__muselab:'preview-img',src:src,alt:img.alt||''},'*');}"
     "catch(_e){}},true);})();</script>"
+    '<script src="/static/modules/html-annotation-frame.js" defer></script>'
 )
 # Cap the in-memory read used for injection. Bigger HTML (e.g. reports with
 # megabytes of base64 images) falls back to streaming untouched — it won't

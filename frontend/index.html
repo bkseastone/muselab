@@ -718,6 +718,14 @@
             </div>
           </template>
         </div>
+        <button class="icon-btn preview-keep-mobile html-annotation-trigger"
+                x-show="previewSurface==='file' && previewMode==='html' && !editing"
+                :class="{active:htmlAnnotation.active}" @click="toggleHtmlAnnotation()"
+                :aria-pressed="htmlAnnotation.active"
+                :title="lang==='zh'?'标注页面元素':'Annotate an element'"
+                :aria-label="lang==='zh'?'标注页面元素':'Annotate an element'">
+          <svg><use href="#i-edit"/></svg>
+        </button>
         <!-- Preview zoom (browser-like −/percentage/+). Shown only for the
              zoomable modes (md/text/img/xlsx/csv/html); pdf has native zoom.
              Click the percentage to reset to 100%. -->
@@ -1003,6 +1011,20 @@
         </svg>
       </button>
 
+      <div class="html-annotation-panel" x-show="htmlAnnotation.active || htmlAnnotation.loading || htmlAnnotation.selection || htmlAnnotation.error" x-cloak>
+        <div class="html-annotation-head">
+          <span x-text="htmlAnnotation.loading ? (lang==='zh'?'准备标注…':'Preparing annotation…') : (lang==='zh'?'点击页面中的元素，再写下修改意见。':'Click an element, then describe the change.')"></span>
+          <button class="icon-btn sm" @click="_htmlAnnotationController?.stop(); htmlAnnotation.error=''" :aria-label="lang==='zh'?'关闭标注':'Close annotation'">×</button>
+        </div>
+        <code x-show="htmlAnnotation.selection" x-text="htmlAnnotation.selection?.selector"></code>
+        <div x-show="htmlAnnotation.selection" class="html-annotation-form">
+          <textarea class="html-annotation-comment settings-input" rows="2" maxlength="1000"
+                    x-model="htmlAnnotation.comment" :placeholder="lang==='zh'?'例如：按钮文字改得更清楚':'For example: make this button label clearer'"></textarea>
+          <button class="btn-primary sm" @click="_htmlAnnotationController?.add()"
+                  x-text="lang==='zh'?'加入会话引用':'Add to conversation'"></button>
+        </div>
+        <span class="settings-inline-error" x-show="htmlAnnotation.error" x-text="htmlAnnotation.error"></span>
+      </div>
       <div class="preview-body" x-ref="previewBody"
            :class="{ 'drag-hover': previewSurface==='file' && (previewDragHover || osFileDragging),
                      'terminal-active': previewSurface==='terminal' }"
@@ -1328,8 +1350,10 @@
           <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
             <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
           </span>
-          <div class="brand-logo">muse<span class="accent">·lab</span></div>
-          <div class="brand-tagline" x-text="t('empty.preview_tagline')"></div>
+          <div class="brand-logo preview-empty-title" x-text="lang==='zh'?'文件与成果':'Files & results'"></div>
+          <div class="brand-tagline" x-text="lang==='zh'?'在这里阅读、预览和检查工作成果。':'Read, preview, and inspect your work here.'"></div>
+          <button class="preview-action preview-open-existing" @click="openPalette()"
+                  x-text="lang==='zh'?'查找文件或会话　⌘K':'Find files or conversations　⌘K'"></button>
           <!-- Quick actions — surface the most useful things when no file is selected -->
           <div class="preview-quick-actions">
             <button class="preview-action" @click="quickNewNote()">
@@ -1341,6 +1365,8 @@
               <span x-text="t('preview.action_upload')"></span>
             </button>
           </div>
+          <button class="btn-ghost preview-focus-chat" x-show="isWideScreen" @click="togglePreviewPane()"
+                  x-text="lang==='zh'?'收起预览，专注会话':'Hide preview to focus on chat'"></button>
           <!-- 2026-05-23: 移除 preview 空态下方的三行操作提示
                （「从左侧选文件」/「@ 递给 Muse」/「右键查看更多操作」）。
                用户反馈：「新建笔记/上传文档」两个按钮已经把核心操作摆明，
@@ -1413,21 +1439,9 @@
              并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
              与「这一轮怎么发」直接相关的控件。两者都回答「这个会话有哪些能力
              可用」，放顶 bar 更符合其全局属性，也给移动端底 bar 腾出空间。-->
-        <button @click="toggleSkillsDrawer()" class="icon-btn"
-                :title="t('set.skills.drawer_open')"
-                aria-label="Open skills list">
-          <svg><use href="#i-puzzle"/></svg>
-        </button>
-        <button @click="openImageGen()" class="icon-btn"
-                :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'"
-                aria-label="Codex Image 2">
-          <svg><use href="#i-image"/></svg>
-        </button>
-        <button @click="toggleMcpDrawer()" class="icon-btn"
-                :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
-                aria-label="Open MCP servers">
-          <svg><use href="#i-plug"/></svg>
-        </button>
+
+
+
 
         <!-- Manual hard-refresh escape hatch. When the chat pane gets
              stuck (SSE wedged, Alpine state out of sync after a flaky
@@ -1438,11 +1452,7 @@
              picks up any still-running backend turn. The toast gives a
              visible confirmation so the user knows the click registered
              before the page actually unloads. -->
-        <button @click="reloadApp()" class="icon-btn"
-                :title="lang==='zh' ? '重新加载（卡住时的兜底：完整刷新页面，等同关掉再打开）' : 'Reload (escape hatch when stuck: full page reload, like closing and reopening)'"
-                aria-label="Reload app">
-          <svg><use href="#i-refresh"/></svg>
-        </button>
+
         <!-- Desktop fullscreen toggle — pair of preview-pane's button. Click
              → chat pane takes whole viewport for immersive conversation;
              click again or ESC → restore 3-column. Hidden on mobile (the
@@ -1456,6 +1466,37 @@
         <!-- Scheduled-tasks bell — unread badge when any scheduled
              prompt has produced output since the user last opened
              the drawer. Heartbeat keeps the count fresh. -->
+
+        <!-- Command palette entry — slim icon-btn alongside settings.
+             Discoverability comes from the first-run toast (init()) +
+             a tooltip showing the keyboard shortcut. Visual weight is
+             intentionally low so the palette doesn't read as "chat
+             search" — it's app-global. -->
+        <details class="workbench-more" @click.outside="$el.removeAttribute('open')"
+                 @keydown.escape.stop="$el.removeAttribute('open'); $el.querySelector('summary').focus()">
+          <summary class="icon-btn" :title="lang==='zh'?'更多工具':'More tools'"
+                   :aria-label="lang==='zh'?'更多工具':'More tools'">•••</summary>
+          <div class="workbench-more-actions" @click="if ($event.target.closest('button')) $el.closest('details').removeAttribute('open')">
+        <button @click="toggleSkillsDrawer()" class="icon-btn"
+                :title="t('set.skills.drawer_open')"
+                aria-label="Open skills list">
+          <svg><use href="#i-puzzle"/></svg>
+        <span class="workbench-action-label" x-text="t('set.skills.drawer_open')"></span></button>
+        <button @click="openImageGen()" class="icon-btn"
+                :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'"
+                aria-label="Codex Image 2">
+          <svg><use href="#i-image"/></svg>
+        <span class="workbench-action-label" x-text="lang==='zh'?'生成图片':'Generate an image'"></span></button>
+        <button @click="toggleMcpDrawer()" class="icon-btn"
+                :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
+                aria-label="Open MCP servers">
+          <svg><use href="#i-plug"/></svg>
+        <span class="workbench-action-label" x-text="lang==='zh'?'MCP 服务':'MCP servers'"></span></button>
+        <button @click="reloadApp()" class="icon-btn"
+                :title="lang==='zh' ? '重新加载（卡住时的兜底：完整刷新页面，等同关掉再打开）' : 'Reload (escape hatch when stuck: full page reload, like closing and reopening)'"
+                aria-label="Reload app">
+          <svg><use href="#i-refresh"/></svg>
+        <span class="workbench-action-label" x-text="lang==='zh'?'重新加载页面':'Reload page'"></span></button>
         <button @click="openScheduler()" class="icon-btn bell-btn"
                 :title="currentSessionScheduledCount()
                   ? (lang==='zh'
@@ -1475,12 +1516,9 @@
                 x-show="currentSessionScheduledCount() > 0"
                 x-text="currentSessionScheduledCount()"
                 aria-hidden="true"></span>
-        </button>
-        <!-- Command palette entry — slim icon-btn alongside settings.
-             Discoverability comes from the first-run toast (init()) +
-             a tooltip showing the keyboard shortcut. Visual weight is
-             intentionally low so the palette doesn't read as "chat
-             search" — it's app-global. -->
+        <span class="workbench-action-label" x-text="lang==='zh'?'定时任务':'Scheduled tasks'"></span></button>
+          </div>
+        </details>
         <button @click="openPalette()" class="icon-btn chat-head-palette"
                 :title="lang==='zh' ? '命令面板  ⌘K' : 'Command palette  ⌘K'"
                 aria-label="Command palette">
@@ -4535,6 +4573,14 @@
                       x-text="lang==='zh'?'刷新':'Refresh'"></button>
             </div>
           </div>
+          <p class="memory-center-intro" x-text="lang==='zh'
+            ? '记忆帮助后续任务理解你的偏好与经验。每条记忆保留来源，可由你确认、更正或删除。检索命中表示曾提供给任务参考，不代表模型实际采用。'
+            : 'Memories help future tasks understand your preferences and experience. Each keeps its sources and can be confirmed, corrected or forgotten. Retrieval counts show references offered to tasks, not confirmed model use.'"></p>
+          <details class="settings-advanced memory-how-it-works">
+            <summary x-text="lang==='zh'?'记忆如何工作':'How memory works'"></summary>
+            <p x-text="lang==='zh'?'只处理会话与明确保存的记忆，不自动扫描整个工作目录。启用需要生成模型、Embedding 与向量库；相关内容会发送到你配置的服务。':'Memory processes conversations and explicitly saved records; it does not automatically scan your whole workspace. Enabling it requires a generation model, embeddings and a vector store; relevant content is sent to the services you configure.'"></p>
+            <p x-text="lang==='zh'?'原始会话提供证据，SQLite 保存记忆及审核记录，向量索引可以重建。工作目录和主题是检索标签。':'Original conversations provide evidence. SQLite stores memories and review records; vector indexes can be rebuilt. Workspaces and topics are retrieval labels.'"></p>
+          </details>
           <div class="memory-center-toolbar">
             <label class="chk"><input type="checkbox" x-model="settings.memory.advanced" />
               <span x-text="lang==='zh'?'显示高级记录':'Show advanced records'"></span>
@@ -4621,8 +4667,10 @@
                        || item.last_error || item.action || JSON.stringify(item.payload || item.results || {})"></div>
                 <div class="memory-stats" :title="lang==='zh'?'召回结果记录次数，不代表模型实际采用次数':'Recorded retrievals, not confirmed model usage'" x-show="settings.memory.tab === 'items' && item.recall_stats"
                      x-text="memoryRecallStatsText(item)"></div>
-                <div class="memory-source" x-show="item.sources?.length"
-                     x-text="(lang==='zh' ? '来源：' : 'Sources: ') + (item.sources || []).map(s => s.source_type + ':' + s.source_id).join(' · ')"></div>
+                <details class="memory-source" x-show="item.sources?.length">
+                  <summary x-text="lang==='zh' ? ('来源证据（'+(item.sources || []).length+'）') : ('Source evidence ('+(item.sources || []).length+')')"></summary>
+                  <span x-text="(item.sources || []).map(s => s.source_type + ':' + s.source_id).join(' · ')"></span>
+                </details>
                 <div class="memory-source-actions"
                      x-show="settings.memory.tab === 'items' && item.sources?.length">
                   <button class="btn-ghost xs" @click="openMemorySource(item)"
@@ -4662,8 +4710,15 @@
                 </details>
               </article>
             </template>
-            <div class="settings-hint" x-show="settings.memory.listLoaded && !settings.memory.listLoading && !settings.memory.listError && !settings.memory.items.length"
-                 x-text="lang==='zh' ? '暂无数据' : 'No data yet'"></div>
+            <div class="memory-empty-guide" x-show="settings.memory.listLoaded && !settings.memory.listLoading && !settings.memory.listError && !settings.memory.items.length">
+              <strong x-text="settings.memory.query || settings.memory.kind || settings.memory.itemStatus
+                ? (lang==='zh'?'没有匹配的记录':'No matching records')
+                : (lang==='zh'?'从一条值得保留的偏好开始':'Start with a preference worth remembering')"></strong>
+              <p x-text="settings.memory.config.mode==='off'
+                ? (lang==='zh'?'自动记忆尚未启用。你仍可明确保存一条偏好；配置完成并启用后，它会在相关任务中提供参考。':'Automatic memory is off. You can still save a preference explicitly; once configured and enabled, it can inform relevant tasks.')
+                : (lang==='zh'?'可以明确保存偏好，或在任务完成后审核从会话中学到的经验。':'Save a preference explicitly, or review experience learned from completed conversations.')"></p>
+              <button class="btn-primary sm" x-show="settings.memory.tab==='items'" @click="memoryAdd()" x-text="lang==='zh'?'保存一条记忆':'Save a memory'"></button>
+            </div>
             <div class="memory-pagination" x-show="settings.memory.tab==='items' && settings.memory.listLoaded">
               <span x-text="lang==='zh' ? ('共 '+settings.memory.total+' 条') : (settings.memory.total+' memories')"></span>
               <button class="btn-ghost sm" @click="memoryPage(-1)" :disabled="settings.memory.listLoading || settings.memory.offset===0"
@@ -5144,6 +5199,37 @@
             <div><span x-text="lang==='zh'?'进行中轮次':'Active turns'"></span><strong x-text="settings.service?.active_turns || 0"></strong></div>
             <div><span x-text="lang==='zh'?'后台任务':'Background tasks'"></span><strong x-text="settings.service?.background_tasks || 0"></strong></div>
           </div>
+          <details class="settings-advanced service-buffer-metrics">
+            <summary x-text="lang==='zh'?'流式队列状态':'Stream queue status'"></summary>
+            <div class="service-status-grid" x-show="settings.service?.diagnostics?.runtime_buffers">
+              <div><span x-text="lang==='zh'?'待处理事件':'Pending events'"></span><strong x-text="settings.service?.diagnostics?.runtime_buffers?.depth ?? '—'"></strong></div>
+              <div><span x-text="lang==='zh'?'队列内存估计':'Estimated queue bytes'"></span><strong x-text="fmtSize(settings.service?.diagnostics?.runtime_buffers?.estimated_bytes || 0)"></strong></div>
+              <div><span x-text="lang==='zh'?'最老事件等待':'Oldest event wait'"></span><strong x-text="Math.round(settings.service?.diagnostics?.runtime_buffers?.oldest_ms || 0)+' ms'"></strong></div>
+              <div><span x-text="lang==='zh'?'本次服务溢出次数':'Overflows since service start'"></span><strong x-text="settings.service?.diagnostics?.runtime_buffers?.overflows ?? '—'"></strong></div>
+            </div>
+            <p x-show="!settings.service?.diagnostics?.runtime_buffers" x-text="lang==='zh'?'当前服务尚未提供队列指标。':'This service does not expose queue metrics yet.'"></p>
+          </details>
+          <details class="settings-advanced browser-performance" @toggle="if ($event.target.open) loadBrowserMetrics()">
+            <summary x-text="lang==='zh'?'浏览器响应':'Browser responsiveness'"></summary>
+            <p class="settings-hint" x-text="lang==='zh'?'仅在当前页面记录耗时数字，不上传会话或文件内容。长任务从页面空闲时开始监测，后台或未显示的回复不计为已可见。':'Timing numbers stay on this page; no conversation or file content is uploaded. Long-task monitoring begins during browser idle time; background or hidden replies are not counted as visible.'"></p>
+            <div class="service-status-grid">
+              <div><span x-text="lang==='zh'?'首次内容绘制':'First contentful paint'"></span><strong x-text="browserMetricTime(browserMetrics.fcpMs)"></strong></div>
+              <div><span x-text="lang==='zh'?'工作台就绪':'Workspace ready'"></span><strong x-text="browserMetricTime(browserMetrics.readyMs)"></strong></div>
+              <div><span x-text="lang==='zh'?'长任务次数':'Long tasks'"></span><strong x-text="browserMetrics.longTasksSupported ? browserMetrics.longTasks : '—'"></strong></div>
+              <div><span x-text="lang==='zh'?'长任务累计耗时':'Total long-task time'"></span><strong x-text="browserMetrics.longTasksSupported ? browserMetricTime(browserMetrics.longTaskMs) : '—'"></strong></div>
+            </div>
+            <p class="settings-hint" x-text="(lang==='zh'?'监测起点：页面打开后 ':'Monitoring began at ') + browserMetricTime(browserMetrics.monitorStartedMs)"></p>
+            <div class="browser-turn-metrics" x-show="browserMetrics.turns.length">
+              <template x-for="turn in browserMetrics.turns" :key="turn.number">
+                <div class="browser-turn-metric">
+                  <span x-text="(lang==='zh'?'回合 ':'Turn ')+turn.number"></span>
+                  <span x-text="(lang==='zh'?'首可见 ':'First visible ')+browserMetricTime(turn.firstMs)"></span>
+                  <span x-text="(lang==='zh'?'最终可见 ':'Final visible ')+browserMetricTime(turn.finalMs)"></span>
+                </div>
+              </template>
+            </div>
+            <p x-show="!browserMetrics.turns.length" class="settings-hint" x-text="lang==='zh'?'发送下一条消息后记录可见耗时；未测得时显示 —。':'Visible reply timings appear after your next message; — means not measured.'"></p>
+          </details>
           <div class="settings-row">
             <label x-text="lang==='zh'?'服务操作':'Service actions'"></label>
             <div class="settings-row-col">
