@@ -53,7 +53,9 @@
      same-attribute scripts. -->
 <script defer src="/static/i18n/index.js"></script>
 <script defer src="/static/data/constants.js"></script>
+<script defer src="/static/modules/task-delivery.js"></script>
 <script defer src="/static/app.js"></script>
+<link rel="stylesheet" href="/static/modules/task-delivery.css" />
 <script defer src="/static/vendor/marked.min.js"></script>
 <script defer src="/static/vendor/purify.min.js"></script>
 <!-- KaTeX (math rendering for $...$ / $$...$$) and CodeMirror (preview-pane
@@ -729,6 +731,9 @@
         <!-- Preview zoom (browser-like −/percentage/+). Shown only for the
              zoomable modes (md/text/img/xlsx/csv/html); pdf has native zoom.
              Click the percentage to reset to 100%. -->
+        <span class="preview-runtime-source" x-effect="fetchDeliverySurfaceIdentity(previewSurface, previewSurface==='terminal' ? activeTerminal()?.cwd : fileWorkspacePath())"
+          :title="deliverySurfaceIdentity ? [deliverySurfaceIdentity.workspace, deliverySurfaceIdentity.host, deliverySurfaceIdentity.backend].join(' · ') : (previewSurface==='terminal' ? activeTerminal()?.cwd : fileWorkspacePath())"
+          x-text="deliverySurfaceLabel()"></span>
         <div class="preview-zoom" x-show="previewSurface==='file' && previewZoomable()">
           <button class="preview-zoom-btn" @click="zoomPreviewOut()"
                   :disabled="previewZoom <= PREVIEW_ZOOM_MIN"
@@ -1414,6 +1419,11 @@
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
         </button>
+        <button class="task-delivery-trigger icon-btn" type="button" @click="openTaskDelivery()"
+                :disabled="!currentId" :aria-label="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'"
+                :title="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'">
+          <svg><use href="#i-check-circle"/></svg>
+        </button>
         <button class="session-todo-btn icon-btn" type="button"
                 @click="toggleSessionTodoBoard()"
                 :class="{ active: sessionTodoOpen, 'has-active': sessionTodoCount(false) }"
@@ -1535,6 +1545,9 @@
           <svg x-show="!previewOpen || desktopFullPane"><use href="#i-chevron-left"/></svg>
         </button>
       </header>
+      <div class="task-runtime-strip" x-init="$watch('currentId', sid => fetchTaskRuntime(sid)); $watch('authed', () => fetchTaskRuntime(currentId)); if(currentId) fetchTaskRuntime(currentId)" x-show="currentId">
+        <button type="button" @click="openTaskDelivery()" :title="runtimeIdentity?.session_id===currentId ? runtimeIdentity.workspace : ''" x-text="deliveryRuntimeLabel() || (lang==='zh' ? '运行环境待核验' : 'Runtime identity pending')"></button>
+      </div>
 
       <!-- Context breakdown popup — shows SDK get_context_usage() output
            with per-category token counts so the user can see which slice
@@ -7548,6 +7561,81 @@
         <span><kbd>esc</kbd> <span x-text="lang==='zh' ? '关闭' : 'close'"></span></span>
       </div>
     </div>
+  </div>
+  <div class="task-delivery-overlay" x-cloak x-show="taskDelivery.show" @keydown.escape.window="closeTaskDelivery()" @click.self="closeTaskDelivery()">
+    <section class="task-delivery-panel" role="dialog" aria-modal="true" aria-labelledby="task-delivery-title">
+      <header>
+        <h2 id="task-delivery-title" x-text="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'"></h2>
+        <button type="button" @click="refreshTaskDelivery()" :disabled="taskDelivery.loading || taskDelivery.restoring" x-text="lang==='zh' ? '刷新' : 'Refresh'"></button>
+        <button type="button" @click="closeTaskDelivery()" :disabled="taskDelivery.restoring" :aria-label="lang==='zh' ? '关闭' : 'Close'">×</button>
+      </header>
+      <p role="status" x-show="taskDelivery.loading" x-text="lang==='zh' ? '读取任务证据…' : 'Loading task evidence…'"></p>
+      <p class="delivery-error" role="alert" x-show="taskDelivery.error" x-text="taskDelivery.error"></p>
+      <template x-if="taskDelivery.data">
+        <div class="delivery-content">
+          <section class="delivery-environment">
+            <h3 x-text="lang==='zh' ? '实际运行环境' : 'Execution environment'"></h3>
+            <dl>
+              <dt x-text="lang==='zh' ? '工作目录' : 'Workspace'"></dt><dd x-text="taskDelivery.data.runtime.workspace"></dd>
+              <dt x-text="lang==='zh' ? '后端 / 主机' : 'Backend / host'"></dt><dd x-text="taskDelivery.data.runtime.backend + ' · ' + taskDelivery.data.runtime.host"></dd>
+              <dt x-text="lang==='zh' ? '服务来源' : 'Service source'"></dt><dd x-text="'MuseLab · ' + new URL(location.href).origin"></dd>
+              <dt x-text="lang==='zh' ? '分支' : 'Branch'"></dt><dd x-text="(taskDelivery.data.runtime.branch || (lang==='zh' ? '非 Git 项目' : 'Non-Git workspace')) + (taskDelivery.data.runtime.is_worktree ? ' · worktree' : '')"></dd>
+              <dt x-text="lang==='zh' ? '文件状态' : 'File state'"></dt><dd x-text="taskDelivery.data.runtime.dirty === null ? (lang==='zh' ? '未知' : 'Unknown') : taskDelivery.data.runtime.dirty ? (lang==='zh' ? '有未提交修改' : 'Uncommitted changes') : (lang==='zh' ? '干净' : 'Clean')"></dd>
+            </dl>
+          </section>
+          <label class="delivery-turn-picker"><span x-text="lang==='zh' ? '任务' : 'Task'"></span>
+            <select x-model="taskDelivery.selectedTurn" @change="taskDelivery.preview=null; refreshTaskDelivery()" :disabled="taskDelivery.restoring">
+              <option value="" x-text="lang==='zh' ? '最近任务' : 'Latest task'"></option>
+              <template x-for="turn in taskDelivery.data.turns" :key="turn.id"><option :value="turn.id" x-text="new Date(turn.started_at*1000).toLocaleString() + ' · ' + deliveryLabel(turn.status)"></option></template>
+            </select>
+          </label>
+          <section><h3 x-text="lang==='zh' ? '产物' : 'Artifacts'"></h3>
+            <p x-show="!taskDelivery.data.artifacts?.length" x-text="lang==='zh' ? '没有记录到可打开的文件产物。' : 'No recorded file artifacts.'"></p>
+            <template x-for="item in taskDelivery.data.artifacts || []" :key="item.id"><div class="delivery-item">
+              <button type="button" :disabled="!item.exists" @click="openDeliveryArtifact(item)" x-text="item.path"></button>
+              <button type="button" :disabled="!item.message_id" @click="openDeliveryEvidence(item)" x-text="lang==='zh' ? '消息证据' : 'Evidence'"></button>
+            </div></template>
+          </section>
+          <section><h3 x-text="lang==='zh' ? '实际执行的命令' : 'Executed commands'"></h3>
+            <template x-for="item in taskDelivery.data.commands || []" :key="item.id"><div class="delivery-command">
+              <code x-text="item.command"></code>
+              <div><span x-text="deliveryLabel(item.status)"></span><span x-text="item.exit_code == null ? (lang==='zh' ? ' · 退出码未知' : ' · exit code unavailable') : ' · exit ' + item.exit_code"></span>
+              <button type="button" :disabled="!item.message_id" @click="openDeliveryEvidence(item)" x-text="lang==='zh' ? '查看证据' : 'Inspect evidence'"></button></div>
+            </div></template>
+          </section>
+          <section><h3 x-text="lang==='zh' ? '仍需核验' : 'Verification limits'"></h3>
+            <ul><template x-for="code in taskDelivery.data.unverified || []" :key="code"><li x-text="deliveryLabel(code)"></li></template></ul>
+          </section>
+          <section><h3 x-text="lang==='zh' ? '相对任务起点的工作区变更' : 'Workspace changes from task baseline'"></h3>
+            <template x-if="taskDelivery.data.diff?.available"><div>
+              <p x-text="(lang==='zh' ? '起点提交：' : 'Starting commit: ') + taskDelivery.data.diff.base.slice(0,12)"></p>
+              <p class="delivery-warning" x-show="taskDelivery.data.diff.baseline_dirty !== false" x-text="lang==='zh' ? '任务开始时已有修改。下方差异包含既有修改，不能全部归因于此任务。' : 'The workspace was already modified. This diff includes pre-existing changes.'"></p>
+              <p x-text="lang==='zh' ? '这是工作区差异；其他操作的改动也可能在内，Git 差异不包含未跟踪文件。' : 'Other workspace changes may also appear; Git diff excludes untracked files.'"></p>
+              <pre class="delivery-diff"><code x-text="taskDelivery.data.diff.patch || (lang==='zh' ? '没有已跟踪文件差异。' : 'No tracked-file differences.')"></code></pre>
+            </div></template>
+            <p x-show="!taskDelivery.data.diff?.available" x-text="lang==='zh' ? '没有可核验的 Git 起点，文件与命令证据仍可使用。' : 'No verifiable Git baseline; file and command evidence remain available.'"></p>
+          </section>
+          <section><h3 x-text="lang==='zh' ? '文件检查点' : 'File checkpoints'"></h3>
+            <p x-text="lang==='zh' ? '只预览已观测的主 Agent Write、Edit、NotebookEdit 修改；不覆盖 Bash 和一般子 Agent，不撤销对话。' : 'Only observed main-agent Write, Edit and NotebookEdit changes are previewed. Bash, general subagents and conversation history are excluded.'"></p>
+            <p x-show="!taskDelivery.data.checkpoints.length" x-text="lang==='zh' ? '此会话还没有记录到文件检查点。' : 'No file checkpoints have been recorded for this session.'"></p>
+            <template x-for="checkpoint in taskDelivery.data.checkpoints" :key="checkpoint.id"><div class="delivery-item">
+              <span x-text="new Date(checkpoint.created_at*1000).toLocaleString()"></span>
+              <button type="button" @click="previewTaskCheckpoint(checkpoint.id)" :disabled="!checkpoint.valid || taskDelivery.restoring" x-text="checkpoint.valid ? (lang==='zh' ? '预览恢复范围' : 'Preview restore scope') : (lang==='zh' ? '已失效' : 'Invalidated')"></button>
+            </div></template>
+          </section>
+          <template x-if="taskDelivery.preview"><section class="delivery-restore-preview">
+            <h3 x-text="lang==='zh' ? '确认文件恢复范围' : 'Review file restore scope'"></h3>
+            <p x-text="lang==='zh' ? '范围来自工具前后文件观测。当前 Python SDK 没有 dry-run 或文件列表返回接口。' : 'This scope comes from file observations. The Python SDK exposes no dry-run or returned file list.'"></p>
+            <ul><template x-for="item in taskDelivery.preview.paths" :key="item.path"><li><code x-text="item.path"></code><span x-text="item.action==='remove_created_file' ? (lang==='zh' ? ' · 删除本次新建文件' : ' · remove created file') : (lang==='zh' ? ' · 恢复文件内容' : ' · restore file contents')"></span></li></template></ul>
+            <ul class="delivery-error"><template x-for="issue in taskDelivery.preview.issues" :key="issue"><li x-text="deliveryLabel(issue)"></li></template></ul>
+            <label x-show="taskDelivery.preview.can_restore"><input type="checkbox" x-model="taskDelivery.confirmation" /><span x-text="lang==='zh' ? '我已核对以上范围，并停止其他编辑器或进程对这些文件的写入。' : 'I reviewed this scope and stopped other editors or processes from writing these files.'"></span></label>
+            <p x-text="lang==='zh' ? '应用会再次检查文件指纹并保存恢复前备份。SDK 不提供原子文件比较与写入，必须停止外部写入。' : 'Files are checked again and backed up before restore. The SDK has no atomic compare-and-swap; external writes must be stopped.'"></p>
+            <button class="delivery-restore-button" type="button" @click="restoreTaskCheckpoint()" :disabled="!taskDelivery.confirmation || !taskDelivery.preview.can_restore || taskDelivery.restoring" x-text="taskDelivery.restoring ? (lang==='zh' ? '恢复并核验中…' : 'Restoring and verifying…') : (lang==='zh' ? '确认恢复文件' : 'Confirm file restore')"></button>
+          </section></template>
+          <template x-if="taskDelivery.lastRestore"><section><h3 x-text="lang==='zh' ? '上次恢复结果' : 'Last restore result'"></h3><p x-text="(lang==='zh' ? '已核验恢复：' : 'Verified restored: ') + taskDelivery.lastRestore.restored.length"></p><p x-show="taskDelivery.lastRestore.not_restored.length" x-text="taskDelivery.lastRestore.not_restored.join(', ')"></p><code x-text="'Recovery ID: ' + taskDelivery.lastRestore.recovery_id"></code></section></template>
+        </div>
+      </template>
+    </section>
   </div>
 </div>
 </body>

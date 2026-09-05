@@ -1183,6 +1183,8 @@ def delete_session(sid: str) -> bool:
             with _runtime_task_overlay_lock(sid):
                 if _delete_runtime_task_overlays(sid):
                     removed = True
+            from . import task_delivery
+            task_delivery.delete_data(sid)
             for path in (
                 SESS_DIR / f"{sid}.transcript-index.json",
                 SESS_DIR / f"{sid}.transcript-index.sqlite3",

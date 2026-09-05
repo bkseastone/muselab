@@ -365,6 +365,7 @@ class ChatMuxSessionChannel extends EventTarget {
 
 function portal() {
   return {
+    ...window.museTaskDelivery(),
     // ===== auth =====
     authed: false, tokenInput: "", token: "", loginErr: "",
     // App-readiness layers:

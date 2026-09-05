@@ -79,6 +79,7 @@ from . import chat_successor
 from . import hook_settings
 from . import hook_traces
 from . import sdk_lifecycle
+from . import task_delivery, file_checkpoints
 from . import transcript_index as transcript_idx
 from .task_summaries import normalize_task_summary_fields
 from .imagegen_job_store import ImagegenJobStore
@@ -2013,9 +2014,11 @@ def _session_has_scheduled_delivery(session_id: str) -> bool:
 
 def _session_runtime_busy(session_id: str) -> bool:
     """One authoritative busy boundary for turns and detached task readers."""
+    from .api_delivery import RESTORING
     active = _active_turns.get(session_id)
     return bool(
-        (active is not None and not active.done)
+        session_id in RESTORING
+        or (active is not None and not active.done)
         or _sessions_with_inflight_tasks.get(session_id)
         or _session_has_live_watcher(session_id)
         or _session_has_scheduled_delivery(session_id)
@@ -3530,6 +3533,11 @@ async def _build_and_connect_client(
         },
     )
     if not side_question_runtime:
+        for event, matcher in task_delivery.build_hooks(session_id, workspace_root).items():
+            opts_kwargs["hooks"].setdefault(event, []).append(matcher)
+        if not is_ducc:
+            opts_kwargs["enable_file_checkpointing"] = True
+            opts_kwargs.setdefault("extra_args", {})["replay-user-messages"] = None
         # PreToolUse observes AskUserQuestion regardless of allow rules or a
         # mid-turn permission-mode transition, unlike can_use_tool. It therefore
         # owns the browser round-trip in every mode. The timeout must cover the
@@ -3587,9 +3595,7 @@ async def _build_and_connect_client(
         # The CLI refuses a later setMode(bypassPermissions) unless this
         # capability was granted at process launch. This flag permits the
         # transition without starting the client itself in bypass mode.
-        opts_kwargs["extra_args"] = {
-            "allow-dangerously-skip-permissions": None,
-        }
+        opts_kwargs.setdefault("extra_args", {})["allow-dangerously-skip-permissions"] = None
     # Let the SDK expose every discovered Skill for every provider, including
     # Anthropic-compatible third-party gateways. Passing [] for disabled or
     # privacy-isolated runtimes is deliberate: omission can let SDK defaults
@@ -15973,6 +15979,8 @@ async def _admit_turn(
     async with _lock:
         if sess.session_is_deleting(session_id):
             raise _TurnStartError("session is being deleted", status=404)
+        from .api_delivery import assert_not_restoring
+        assert_not_restoring(session_id)
         if session_id in _interrupt_control_owners:
             raise _TurnBusy()
         cur = _active_turns.get(session_id)
@@ -16007,6 +16015,8 @@ async def _admit_turn(
         async with _lock:
             if sess.session_is_deleting(session_id):
                 raise _TurnStartError("session is being deleted", status=404)
+            from .api_delivery import assert_not_restoring
+            assert_not_restoring(session_id)
             if session_id in _interrupt_control_owners:
                 raise _TurnBusy()
             cur = _active_turns.get(session_id)
@@ -17214,6 +17224,15 @@ async def _start_turn(
                     _turn_transcript_boundary, session_id, model_to_use)
                 broadcast.transcript_boundary = transcript_boundary
                 boundary = _TurnResponseBoundary(existing_uuids)
+                try:
+                    from .api_delivery import owned_workspace
+                    _, task_workspace = await asyncio.to_thread(owned_workspace, session_id)
+                    await asyncio.to_thread(task_delivery.begin, session_id, broadcast.turn_id, task_workspace)
+                    await asyncio.to_thread(file_checkpoints.begin, session_id, broadcast.turn_id, task_workspace)
+                except (OSError, ValueError, HTTPException):
+                    # Missing evidence is shown as unknown and cannot authorize
+                    # restore; ancillary storage must not prevent the task.
+                    pass
                 # mem0 recall is supplied by the UserPromptSubmit hook configured
                 # on this client. The canonical query remains exactly `prompt` so
                 # recalled data is never persisted as a fake user message.
@@ -18628,6 +18647,11 @@ async def _start_turn(
                 # per-type helper async generators defined above. Each
                 # helper yields zero-or-more SSE events; we forward them.
                 msg = payload
+                if isinstance(msg, (AssistantMessage, UserMessage, ResultMessage)):
+                    try:
+                        await asyncio.to_thread(task_delivery.observe_message, session_id, broadcast.turn_id, msg)
+                    except (OSError, ValueError, TypeError):
+                        pass
                 if chat_subagents.is_subagent_message(msg):
                     # A forwarded sidechain is never parent answer content.
                     # Route on the SDK-owned parent id even when an incomplete

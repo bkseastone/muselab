@@ -94,10 +94,13 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert captured["skills"] == "all"
     assert callable(captured["can_use_tool"])
     assert "permission_prompt_tool_name" not in captured
-    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+    assert captured["enable_file_checkpointing"] is True
+    assert "replay-user-messages" in captured["extra_args"]
+    assert all(any(m.matcher is None for m in captured["hooks"][event]) for event in ("PreToolUse", "PostToolUse", "PostToolUseFailure"))
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"] if m.matcher is not None] == [
         "AskUserQuestion"
     ]
-    assert captured["hooks"]["PreToolUse"][0].timeout == (
+    assert next(m for m in captured["hooks"]["PreToolUse"] if m.matcher == "AskUserQuestion").timeout == (
         chat_mod.ANSWER_TIMEOUT_S + 5)
     assert "AskUserQuestion" not in captured["disallowed_tools"]
     for tool in ("CronCreate", "CronDelete", "CronList", "Monitor"):
@@ -473,7 +476,7 @@ def test_non_bypass_runtime_installs_permission_resolver(
         "sid-default-permission", "deepseek-v4-pro", "default", ""))
 
     assert callable(captured["can_use_tool"])
-    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"] if m.matcher is not None] == [
         "AskUserQuestion"
     ]
     assert "permission_prompt_tool_name" not in captured
@@ -533,16 +536,17 @@ def test_plan_runtime_can_return_to_bypass_and_installs_exit_hooks(
     assert captured["permission_mode"] == "plan"
     assert captured["extra_args"] == {
         "allow-dangerously-skip-permissions": None,
+        "replay-user-messages": None,
     }
     assert callable(captured["can_use_tool"])
-    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"] if m.matcher is not None] == [
         "AskUserQuestion"
     ]
     assert "AskUserQuestion" not in captured["disallowed_tools"]
     assert "muselab" not in captured["mcp_servers"]
     for hook_name in ("PostToolUse", "PostToolUseFailure"):
         matchers = captured["hooks"][hook_name]
-        assert [matcher.matcher for matcher in matchers] == [
+        assert [matcher.matcher for matcher in matchers if matcher.matcher is not None] == [
             "EnterPlanMode", "ExitPlanMode",
         ]
         assert all(len(matcher.hooks) == 1 for matcher in matchers)
@@ -568,7 +572,7 @@ def test_plan_runtime_with_default_return_does_not_gain_bypass_capability(
     ))
 
     assert captured["permission_mode"] == "plan"
-    assert "extra_args" not in captured
+    assert "allow-dangerously-skip-permissions" not in captured.get("extra_args", {})
 
 
 def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path):
@@ -617,7 +621,7 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     assert captured["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "258400"
     assert captured["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "258400"
     pre_tool_hooks = captured["hooks"]["PreToolUse"]
-    assert [m.matcher for m in pre_tool_hooks] == [
+    assert [m.matcher for m in pre_tool_hooks if m.matcher is not None] == [
         "Skill", "AskUserQuestion"
     ]
     assert callable(captured["can_use_tool"])
@@ -641,7 +645,7 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     asyncio.run(chat_mod._build_and_connect_client(
         "sid-codex-skill-optout", "codex:gpt-5.5",
         "bypassPermissions", "high"))
-    assert [m.matcher for m in opted_out["hooks"]["PreToolUse"]] == [
+    assert [m.matcher for m in opted_out["hooks"]["PreToolUse"] if m.matcher is not None] == [
         "AskUserQuestion"
     ]
     assert callable(opted_out["can_use_tool"])
@@ -781,7 +785,7 @@ def test_bare_gpt_provider_never_inherits_codex_gateway_headers(
     assert captured["effort"] == "high"
     assert captured["thinking"] == {"type": "disabled"}
     assert "ANTHROPIC_CUSTOM_HEADERS" not in captured["env"]
-    assert [m.matcher for m in captured["hooks"]["PreToolUse"]] == [
+    assert [m.matcher for m in captured["hooks"]["PreToolUse"] if m.matcher is not None] == [
         "AskUserQuestion"
     ]
     assert callable(captured["can_use_tool"])
