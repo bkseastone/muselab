@@ -41,7 +41,7 @@ RUN apt-get update && \
     # scripts/versions.env and the CLI bundled by claude-agent-sdk (the native
     # installers read the pin from versions.env).
     npm install -g \
-        @anthropic-ai/claude-code@2.1.252 && \
+        @anthropic-ai/claude-code@2.1.259 && \
     apt-get purge -y --auto-remove gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
@@ -66,9 +66,13 @@ COPY skills ./skills
 COPY scripts/templates ./scripts/templates
 COPY pyproject.toml ./
 
-# Non-root user (uid 1000 — matches default host user on Linux/Mac)
-RUN groupadd -g 1000 muse && \
-    useradd -u 1000 -g 1000 -m -s /bin/bash muse && \
+# Source builds can match a Linux bind-mount owner's UID/GID without
+# broadening permissions on credentials. Published images default to 1000.
+ARG MUSE_UID=1000
+ARG MUSE_GID=1000
+RUN test "$MUSE_UID" -gt 0 && test "$MUSE_GID" -gt 0 && \
+    groupadd -g "$MUSE_GID" muse && \
+    useradd -u "$MUSE_UID" -g "$MUSE_GID" -m -s /bin/bash muse && \
     mkdir -p /app/sessions /data && \
     chown -R muse:muse /app /data
 

@@ -57,6 +57,21 @@ main-chain appends update display coordinates incrementally; branch changes,
 compaction, and duplicate UUIDs use the full chain resolver. These caches may
 be omitted from backups; keep session sidecars, queues, and canonical JSONL.
 
+
+Task delivery adds three private locations under `$MUSELAB_SESSIONS_DIR/`:
+
+| Path | Content |
+|---|---|
+| `delivery/<sid>.json` | Observed task/tool evidence and task-start Git identity |
+| `checkpoints/<sid>.json` | Actual SDK checkpoint IDs and observed file fingerprints |
+| `checkpoint-recovery/<sid>/` | File contents backed up immediately before an explicit restore |
+
+Back these up to retain the corresponding task and recovery history. Recovery
+files can contain sensitive workspace contents. Deleting a session also removes
+these records and backups. A backup does not make an old checkpoint safe to
+replay after moving a workspace; current identity and file checks still apply.
+See [Task delivery and SDK compatibility](task-delivery-sdk.md).
+
 ## Claude CLI data
 
 | Path | Content |

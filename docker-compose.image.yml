@@ -1,12 +1,7 @@
+# Prebuilt image mode: docker compose -f docker-compose.image.yml up -d
 services:
   muselab:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        MUSE_UID: ${MUSELAB_UID:-1000}
-        MUSE_GID: ${MUSELAB_GID:-1000}
-    image: muselab:latest
+    image: ${MUSELAB_IMAGE:-ghcr.io/hesorchen/muselab:latest}
     container_name: muselab
     restart: unless-stopped
     ports:

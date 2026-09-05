@@ -116,9 +116,9 @@ The frontend is plain HTML + Alpine.js v3 (vendored). There is no separate front
 | Target | Command | Notes |
 |--------|---------|-------|
 | `make run` | `uv run uvicorn … --reload` | Dev server with hot-reload |
-| `make test` | `uv run pytest -v` | All tests, verbose |
-| `make test-fast` | `uv run pytest -x --tb=short` | Stop on first failure |
-| `make lint` | `uv run python -m compileall -q backend tests` | Syntax check only; CI uses `ruff check` |
+| `make test` | `uv run pytest -n auto --dist=worksteal -v` | All tests, verbose |
+| `make test-fast` | `uv run pytest -n auto --dist=worksteal -x --tb=short` | Stop on first failure |
+| `make lint` | `ruff` + project lint + owned JS syntax | Backend, frontend and encoding checks |
 
 ---
 
@@ -152,7 +152,7 @@ The `temp_root` fixture creates a throwaway workspace tree with a `notes/` subtr
 
 ### E2E (Playwright)
 
-`tests/e2e/` uses Playwright + Chromium and is not included in the default `pytest tests/` run. Set `RUN_E2E=1` and install Chromium separately. Current coverage includes multi-tab lifecycle, file previews, chat rendering performance, and mobile terminal interactions.
+`tests/e2e/` uses Playwright + Chromium and is collected but skipped by default in `pytest tests/`. Set `RUN_E2E=1` and install Chromium separately. Current coverage includes multi-tab lifecycle, file previews, chat rendering performance, and mobile terminal interactions.
 
 ---
 
@@ -160,34 +160,30 @@ The `temp_root` fixture creates a throwaway workspace tree with a `notes/` subtr
 
 ### ci.yml
 
-Triggers: push to `main`, version tags `v*.*.*`, PRs to `main`.
+Triggers: pushes to `main`, version tags `v*.*.*`, and PRs targeting `main`.
 
-| Job | Runner(s) | Blocking? | What it does |
-|-----|-----------|-----------|-------------|
-| `test` | ubuntu-latest (py 3.12 + 3.13), macos-latest (py 3.12) | yes | `uv sync --frozen` → `pytest tests/ -v`; coverage report on Linux py 3.12 (non-blocking, ephemeral `pytest-cov`) |
-| `lint` | ubuntu-latest | yes | `ruff check backend/ tests/` + `bash scripts/lint.sh` |
-| `frontend-lint` | ubuntu-latest (Node 20) | yes | `node --check` on `app.js`, `sw.js`, `constants.js`, `i18n/index.js`; JSON validation of `manifest.webmanifest` |
-| `security` | ubuntu-latest | no | `pip-audit` against the frozen lockfile |
-| `e2e` | ubuntu-latest | no | Playwright/Chromium, 2 retries via `pytest-rerunfailures` |
-| `docker` | ubuntu-latest | yes (push jobs) | PRs: single-arch build, no push. main/tags: multi-arch build + push to `ghcr.io` |
+| Job | Runner | Coverage |
+|-----|--------|----------|
+| `test` | Ubuntu Python 3.12/3.13, macOS Python 3.12 | Frozen dependencies and xdist unit/integration tests; extra coverage reporting is informational |
+| `lint` | Ubuntu | Ruff and project lint |
+| `frontend-lint` | Ubuntu, Node 20 | `scripts/check-frontend.sh`: owned JS/MJS and manifest syntax |
+| `security` | Ubuntu | Frozen dependency pip-audit; failures block |
+| `e2e-core` | Ubuntu | Fast critical browser contracts; failures block |
+| `e2e` | Ubuntu | Full Chromium suite, at most two retries; final failures block |
+| `docker-smoke` | Ubuntu | Build/load a single-arch image, boot isolated state, verify health, homepage, static JS and Docker HEALTHCHECK |
+| `docker` | Ubuntu, main/tags only | Publish multi-arch GHCR images after all jobs above succeed |
 
-CI test env vars: `MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`, `MUSELAB_ROOT=${{ github.workspace }}/.ci-workspace`.
-
-### install-test.yml
-
-Path-filtered to installer scripts, `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`. Runs real installer end-to-end on four OS images:
-
-| Job | Runner(s) | Notes |
-|-----|-----------|-------|
-| `linux` | ubuntu-22.04, ubuntu-24.04 | `MUSELAB_NONINTERACTIVE=1 MUSELAB_SKIP_SERVICE=1 MUSELAB_NO_BROWSER=1`; polls `/api/health` 30 s |
-| `macos` | macos-13 (Intel, `continue-on-error`), macos-14 (ARM, required) | 20-minute job timeout |
-| `docker-run` | ubuntu-latest | Builds locally, runs container, polls `/api/health`, confirms Docker `HEALTHCHECK` reaches `healthy` within 90 s |
-
-`.env` is explicitly excluded from failure artifact uploads to prevent leaking `MUSELAB_TOKEN`.
+The repository currently has only `ci.yml`. There is no additional
+`install-test.yml` or four-platform live installer matrix. Container startup and
+isolated installer tests have specific scope; they do not replace a full
+installation on every OS. Fixtures use synthetic auth and temporary data;
+real `.env` files are not uploaded.
 
 ### Release
 
-Push a git tag matching `v*.*.*`. The `docker` job in `ci.yml` automatically publishes multi-arch images with the full semver tag matrix to `ghcr.io/hesorchen/muselab`. Changelog and GitHub Release creation are handled manually.
+Pushing a `v*.*.*` tag triggers the release workflow. `docker` waits for quality
+checks and the running-container smoke test before updating image tags.
+Changelog and GitHub Release creation remain maintainer operations.
 
 ### Dependabot
 
@@ -203,7 +199,7 @@ Weekly uv bumps (grouped: `claude-agent-sdk`/`anthropic*` in one PR; `fastapi`/`
 
 | Package | Constraint | Rationale |
 |---------|-----------|-----------|
-| `claude-agent-sdk` | `>=0.2.120,<0.3` | The upper bound is deliberate: muselab relies on assumptions about the SDK tool denylist and JSONL transcript format, so minor-version upgrades require explicit validation. |
+| `claude-agent-sdk` | `==0.2.152` | Exact pin: SDK, bundled CLI, tool policy and transcript contracts are validated together. |
 | `starlette` | `>=1.3.1` | Explicitly constrained to a security-fixed release. |
 | `pyjwt[crypto]` | `>=2.13.0` | Pinned above the mcp-transitive 2.12.1 (PYSEC-2026-175/177/178/179). |
 
@@ -212,8 +208,10 @@ Weekly uv bumps (grouped: `claude-agent-sdk`/`anthropic*` in one PR; `fastapi`/`
 | Command | Where used |
 |---------|-----------|
 | `uv sync --frozen` | All install scripts, CI, Docker build — ensures exact reproducibility from `uv.lock` |
-| `uv lock --upgrade-package claude-agent-sdk` | `scripts/upgrade.sh` — selective bump without touching other deps |
+| `uv lock --upgrade-package claude-agent-sdk` | Maintainer operation after changing the exact SDK pin; normal upgrades use the frozen lock |
 | `uv run --with <pkg>` | CI ephemeral tools (`pytest-cov`, `pip-audit`) without modifying the frozen lockfile |
 | `uv run uvicorn …` | Dev server and systemd `ExecStart` |
 
 The `uv` binary is pinned in the Dockerfile so image rebuilds remain reproducible; see `Dockerfile` for the exact current version.
+
+For the new workbench controls and their validation boundaries, see [Workbench UI](workbench-ui.md) and [Task delivery and SDK compatibility](task-delivery-sdk.md).

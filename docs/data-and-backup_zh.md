@@ -53,6 +53,19 @@ CLI JSONL 始终是权威来源；索引缺失、损坏、旧 JSON 格式或版�
 不会重写对话。普通主链追加增量更新显示坐标，分叉、压缩和重复 UUID 则使用完整链解析兜底。
 这些缓存可以不备份；会话 sidecar、队列与 canonical JSONL 仍须保留。
 
+
+任务交付功能在 `$MUSELAB_SESSIONS_DIR/` 下增加三个私有位置：
+
+| 路径 | 内容 |
+|---|---|
+| `delivery/<sid>.json` | 观测到的任务／工具证据及任务开始时的 Git 身份 |
+| `checkpoints/<sid>.json` | 实际 SDK 检查点 ID 和观测到的文件指纹 |
+| `checkpoint-recovery/<sid>/` | 用户确认撤销前备份的文件内容 |
+
+需要保留任务及恢复记录时一并备份。恢复文件可能包含敏感工作区内容；
+删除会话会同时删除这些记录和备份。备份不代表迁移后的旧检查点可以
+直接重放，仍须通过当前目录身份及文件检查。详见[任务交付与 SDK 兼容性](task-delivery-sdk_zh.md)。
+
 ## Claude CLI 数据
 
 | 路径 | 内容 |

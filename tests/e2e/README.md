@@ -1,63 +1,39 @@
-# muselab e2e 测试
+# MuseLab 浏览器测试
 
-Playwright + pytest 的浏览器级测试，专门覆盖多 tab UI 交互这类**只有真浏览器能抓**的回归（DOM 事件、x-effect 反应、Alpine x-if/x-show 渲染竞态、SSE 后台流式）。
+Playwright＋pytest 覆盖实际前端 DOM、键盘／触摸、SSE、历史恢复和文件预览。
+模型输入使用受控事件／夹具，测试不需要真实 provider 凭据。
 
-## 为什么不放进默认 pytest 套件
+## 安装与运行
 
-- Playwright + Chromium 二进制约 200 MB，CI / 本地装一次门槛较高
-- 跑一次 e2e 要起后端 + 浏览器，比单元测试慢 30 倍
-- 多 tab 交互回归很重要但低频；按需手动跑即可
-
-所以 e2e 默认 **skip**，需要环境变量 `RUN_E2E=1` 才执行。
-
-## 首次启用
+在项目目录中同步已经声明的依赖，无需再次执行 `uv add`：
 
 ```bash
-# 装依赖（dev group 已声明 pytest-playwright，但 chromium 要单独下）
-uv add --group dev pytest-playwright
-uv run playwright install chromium
-
-# 系统库（Ubuntu / Debian 缺 libnss3 等会启动失败）
-sudo apt install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
+uv sync --frozen
+uv run --frozen playwright install --with-deps chromium
+RUN_E2E=1 uv run --frozen pytest tests/e2e/ -q
 ```
 
-## 跑测试
+定向运行例子：
 
 ```bash
-# 起后端（独立终端）
-MUSELAB_TOKEN=test-token-1234567890abcdef-secure-min-32 \
-MUSELAB_ROOT=$HOME/muselab-workspace \
-MUSELAB_PORT=9999 \
-.venv/bin/python -m backend.main
-
-# 跑 e2e（另一个终端）
-RUN_E2E=1 .venv/bin/python -m pytest tests/e2e/ -v
+RUN_E2E=1 uv run --frozen pytest tests/e2e/test_ux_reliability.py -q
 ```
 
-## 覆盖范围（草稿）
+`backend_url` fixture 自动创建临时工作区、会话目录、随机端口和独立后端，并在
+结束后停止它。无需另开终端启动服务器，也不要将测试指向生产服务。
+浏览器二进制与 Playwright 版本应配套；依赖更新后重新安装 Chromium。
 
-| 测试 | 抓什么 |
-|------|--------|
-| 新建 / 切换 / 关闭 tab | tab 操作核心三件套 |
-| 重命名 tab（双击） | inline-rename 模板与 blur 提交逻辑 |
-| 右键菜单 | tabCtxMenu 显示 / 点击各项 / Esc 关闭 |
-| 后台流式保留 | A 起 stream → 切到 B → 切回 A 看消息完整 |
-| 关闭 tab 撤销 toast | undo 复位到原 index |
-| 拖动 tab 重排序 | HTML5 drag & drop 完成顺序变更 |
-| 刷新后预览 tab 持久化 | localStorage previewPath 恢复 |
-| 浏览器 tab 标题 | document.title 反映当前 session + 流式 ● 前缀 |
-| PC 长会话热切换 | 4 个 resident pane、无 skeleton 闪烁、composer 不跳动 |
-| 移动端会话 footer | 390px / 320px、空闲 / 流式均不溢出，发送键和底栏可见 |
-| 长流式渲染 | PC 保持富文本体验，移动端限制 DOM 与重渲染频率 |
-| 移动端终端 | bottom sheet、新建按钮、可信触摸手势驱动 scrollback |
+## 本地与 CI
 
-具体实现见 `test_multi_tab.py`、`test_chat_render_perf.py` 和
-`test_terminal_mobile.py`，新增场景沿用同一模式。
+未设置 `RUN_E2E=1` 时，浏览器用例会收集后跳过。CI 同时运行快速 core 子集和
+完整浏览器套件，两者都阻塞发布；完整套件允许短暂失败重试，最终失败仍阻塞。
+完整覆盖还依赖实际启用的环境，不能把本地默认 pytest 的跳过项称为浏览器通过。
 
-## 备注
+fixture 使用较长的合成 token；应用实际最低校验门槛为 16 字符。推荐保持
+fixture 的较长值。生产认证信息、真实对话正文和用户附件不得用于测试快照。
 
-- 跑 e2e 前后请确认 `MUSELAB_ROOT` 指向**测试隔离目录**或自己愿意被读到的目录，e2e 会真实创建 sessions
-- 若想 headed 调试，spec 里把 `headless=True` 改 `False`
-- token 必须 ≥ 32 字符，否则后端在启动期就拒绝
+## 新增场景
+
+按触发行为选择已有测试文件，优先验证最终可见内容、元素身份、网络边界和
+实际控件几何。响应式检查要确认控件本身位于视口内；页面没有横向滚动条，
+并不能证明内部内容没有被裁掉。更长的任务应使用有界数据量和明确等待条件。

@@ -100,18 +100,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
-      - name: node --check all frontend JS
-        run: |
-          set -e
-          for f in frontend/app.js frontend/sw.js \
-                   frontend/data/constants.js frontend/i18n/index.js \
-                   frontend/modules/file-capabilities.mjs \
-                   frontend/modules/persistent-cache.mjs; do
-            echo "node --check $f"
-            node --check "$f"
-          done
-      - name: Validate web manifest JSON
-        run: node -e "JSON.parse(require('fs').readFileSync('frontend/assets/manifest.webmanifest','utf8')); console.log('manifest JSON OK')"
+      - name: Check all owned frontend JS and manifest
+        run: bash scripts/check-frontend.sh
 
   # Dependency vulnerability scan. dependabot keeps deps current, but doesn't
   # surface KNOWN CVEs in the currently-pinned set — pip-audit does. Runs
@@ -149,7 +139,7 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Install Chromium
-        run: uv run --with pytest-playwright playwright install --with-deps chromium
+        run: uv run --frozen playwright install --with-deps chromium
       - name: Run blocking browser contracts
         env:
           RUN_E2E: "1"
@@ -157,7 +147,7 @@ jobs:
           MUSELAB_ROOT: ${{ github.workspace }}/.e2e-core-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
-          uv run --with pytest-playwright pytest -q \
+          uv run --frozen pytest -q \
             tests/e2e/test_activity_center.py::test_memory_shortcut_opens_memory_settings_page \
             tests/e2e/test_chat_render_perf.py::test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends \
             tests/e2e/test_chat_render_perf.py::test_desktop_done_reconcile_preserves_live_message_dom_identity \
@@ -185,8 +175,8 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
       - name: Install deps + playwright
-        # pytest-playwright pulled ephemerally (not in the frozen dev lock).
-        run: uv run --with pytest-playwright playwright install --with-deps chromium
+        # Browser dependency is declared in the frozen dev group.
+        run: uv run --frozen playwright install --with-deps chromium
       - name: Run e2e tests
         env:
           RUN_E2E: "1"
@@ -194,8 +184,27 @@ jobs:
           MUSELAB_ROOT: ${{ github.workspace }}/.e2e-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
-          uv run --with pytest-playwright --with pytest-rerunfailures \
+          uv run --frozen --with pytest-rerunfailures \
             pytest tests/e2e/ -v --reruns 2 --reruns-delay 1
+
+  # Build and boot the image on every event, independently of other checks.
+  docker-smoke:
+    name: docker build + runtime smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: Build local image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: muselab:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Boot and validate image
+        run: bash scripts/docker-smoke.sh muselab:ci
 
   # Builds the Dockerfile on every PR (smoke), and on push to main / tags it
   # publishes a multi-arch image to GitHub Container Registry.
@@ -204,7 +213,9 @@ jobs:
   #   ghcr.io/<owner>/muselab:1.2          — major.minor of latest tag
   #   ghcr.io/<owner>/muselab:sha-<short>  — every commit on main
   docker:
-    name: docker build + publish
+    name: docker publish after validation
+    needs: [test, lint, frontend-lint, security, e2e-core, e2e, docker-smoke]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -240,17 +251,6 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,prefix=sha-,format=short
             type=raw,value=latest,enable={{is_default_branch}}
-
-      # PR: build only (single arch) for smoke test — no push, no QEMU cost.
-      - name: Build (PR smoke test, no push)
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          tags: muselab:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       # main / tags: multi-arch build + push.
       - name: Build + push (multi-arch)
