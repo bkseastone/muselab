@@ -5,6 +5,7 @@ import base64
 from collections import deque
 from contextlib import contextmanager, suppress
 import hashlib
+import heapq
 import inspect
 import json
 import asyncio
@@ -5649,7 +5650,7 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
     jsonl_paths = [p for d in proj_dirs for p in d.glob("*.jsonl")]
     for jsonl in jsonl_paths:
         sid = jsonl.stem
-        per_sess = 0
+        session_hits: list[tuple[str, int, dict]] = []
         try:
             # utf-8-sig strips a leading BOM so JSONL writers that emit
             # U+FEFF at the start (some CLI versions did, briefly) don't
@@ -5657,16 +5658,20 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
             # of every line — `"﻿{...}".lower()` would mismatch a
             # qlower hitting the literal first chars.
             with jsonl.open("r", encoding="utf-8-sig") as f:
-                for line in f:
-                    if qlower not in line.lower():
-                        continue   # fast reject before JSON parse
+                for ordinal, line in enumerate(f):
+                    # Escaped JSON text must be decoded before matching. A raw
+                    # substring rejection is only sound for unescaped lines.
+                    if "\\" not in line and qlower not in line.lower():
+                        continue
                     try:
                         entry = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
                         continue
-                    if entry.get("type") not in ("user", "assistant"):
+                    if not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant"):
                         continue
                     msg = entry.get("message") or {}
+                    if not isinstance(msg, dict):
+                        continue
                     text = _extract_searchable_text(msg.get("content"))
                     if not text:
                         continue
@@ -5677,17 +5682,20 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
                     pos = text.lower().find(qlower)
                     if pos < 0:
                         continue
-                    hits.append({
+                    hit = {
                         "sid": sid,
                         "name": name_map.get(sid, ""),
                         "uuid": entry.get("uuid", ""),
                         "role": entry.get("type"),
                         "snippet": _make_snippet(text, pos, len(query)),
-                        "ts": entry.get("timestamp", ""),
-                    })
-                    per_sess += 1
-                    if per_sess >= PER_SESSION_CAP:
-                        break
+                        "ts": str(entry.get("timestamp") or ""),
+                    }
+                    candidate = (hit["ts"], ordinal, hit)
+                    if len(session_hits) < PER_SESSION_CAP:
+                        heapq.heappush(session_hits, candidate)
+                    else:
+                        heapq.heappushpop(session_hits, candidate)
+            hits.extend(hit for _ts, _ordinal, hit in session_hits)
         except OSError:
             continue
 

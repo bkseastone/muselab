@@ -99,3 +99,33 @@ def test_search_respects_limit(client, auth, _staged_jsonls):
 def test_search_requires_auth(client):
     r = client.get("/api/chat/search?q=anything")
     assert r.status_code in (401, 403)
+
+
+def test_search_keeps_latest_matches_per_session(client, auth, _staged_jsonls):
+    staged = _staged_jsonls
+    _write_jsonl(staged['dir'] / f"{staged['sid_a']}.jsonl", [
+        {"type": "user", "uuid": f"newest-{i}",
+         "message": {"content": "unique-recency-probe"},
+         "timestamp": f"2026-09-06T00:00:{i:02d}Z"}
+        for i in (8, 2, 3, 4, 5, 6, 7, 1)
+    ])
+    response = client.get('/api/chat/search?q=unique-recency-probe', headers=auth)
+    assert response.status_code == 200
+    assert [hit['uuid'] for hit in response.json()['hits']] == [
+        'newest-8', 'newest-7', 'newest-6', 'newest-5', 'newest-4']
+
+
+@pytest.mark.parametrize('text,query', [
+    ('测试搜索', '测试'), ('quote "example"', '"example"'),
+    ('path C:\\notes', 'C:\\notes'), ('first\nsecond', 'first\nsecond'),
+])
+def test_search_decodes_json_escapes(client, auth, _staged_jsonls, text, query):
+    staged = _staged_jsonls
+    path = staged['dir'] / f"{staged['sid_a']}.jsonl"
+    path.write_text(json.dumps({
+        'type': 'user', 'uuid': 'escaped-match',
+        'message': {'content': text}, 'timestamp': '2026-09-06T00:00:00Z',
+    }, ensure_ascii=True) + '\n', encoding='utf-8')
+    response = client.get('/api/chat/search', params={'q': query}, headers=auth)
+    assert response.status_code == 200
+    assert [hit['uuid'] for hit in response.json()['hits']] == ['escaped-match']
