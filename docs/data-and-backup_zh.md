@@ -47,6 +47,12 @@ Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CL
 
 代码、`.venv/`、依赖缓存、构建产物和日志可从版本库或安装器恢复，不必作为数据备份。
 
+`$MUSELAB_SESSIONS_DIR/<sid>.transcript-index.sqlite3` 是私有的字节偏移与描述符缓存，
+不承担对话原始记录的职责。追加记录时，只在一次 SQLite 事务中写入新增描述符与小型源文件检查点。
+CLI JSONL 始终是权威来源；索引缺失、损坏、旧 JSON 格式或版本不兼容时，会从 JSONL 重建，
+不会重写对话。普通主链追加增量更新显示坐标，分叉、压缩和重复 UUID 则使用完整链解析兜底。
+这些缓存可以不备份；会话 sidecar、队列与 canonical JSONL 仍须保留。
+
 ## Claude CLI 数据
 
 | 路径 | 内容 |

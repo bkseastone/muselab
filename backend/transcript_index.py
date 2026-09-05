@@ -17,11 +17,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .settings import atomic_write_text
+from . import transcript_index_store as store
 
 # Increment whenever persisted descriptor semantics (bubble expansion, preview,
 # tool/task metadata) change, not only when the JSON container shape changes.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _TRANSCRIPT_TYPES = {"user", "assistant", "progress", "system", "attachment"}
 _PREFIX_GUARD_BYTES = 1024 * 1024
 
@@ -120,16 +120,13 @@ def _index_signature(path: Path) -> tuple[int, int] | None:
 
 
 def _load(path: Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(data, dict) or data.get("schema") != SCHEMA_VERSION:
-        return None
-    source = data.get("source")
-    if not isinstance(source, dict) or not isinstance(data.get("records"), list):
-        return None
-    return data
+    index = store.load(path.absolute(), SCHEMA_VERSION)
+    if index is not None:
+        try:
+            _rebuild_derived(index)
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+    return index
 
 
 def _task_status_from_descriptor(desc: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -310,6 +307,70 @@ def _rebuild_derived(index: dict[str, Any]) -> None:
             statuses[tool_id] = status
     index["tool_use_names"] = tool_names
     index["task_status"] = statuses
+    index["_append_state"] = {
+        "by_uuid": by_uuid,
+        "full_seen": full_seen,
+        "referenced": parent_uuids,
+        "tip": records[max(main_leaves or leaves)]["uuid"] if leaves else None,
+    }
+
+
+def _extend_derived(index: dict[str, Any], first_record: int) -> None:
+    """Extend ordinary main-chain appends without walking historical records.
+
+    Duplicate UUIDs, forks, compaction roots and sidechains retain the complete
+    SDK-chain resolver. The fast path never guesses a new branch selection.
+    Invisible progress records can extend the current tip without changing its
+    visible conversation coordinates.
+    """
+    state = index.get("_append_state")
+    if state is None:
+        _rebuild_derived(index)
+        return
+    records = index["records"]
+    by_uuid = state["by_uuid"]
+    for position in range(first_record, len(records)):
+        rec = records[position]
+        uid = rec["uuid"]
+        parent = rec.get("parent")
+        visible = rec["type"] in {"user", "assistant"} or rec.get("presentation_record")
+        display_uuid = str(rec.get("presentation_uuid") or uid)
+        if (uid in by_uuid or uid in state["referenced"] or rec["is_sidechain"] or rec["team_name"] or rec["is_meta"]
+                or (visible and display_uuid in state["full_seen"])):
+            _rebuild_derived(index)
+            return
+        # Resolve only the short newly appended invisible suffix. If a new
+        # visible record branches away from the prior selected leaf, rebuild.
+        cursor = parent
+        seen: set[str] = set()
+        while cursor and cursor != state["tip"] and cursor not in seen:
+            seen.add(cursor)
+            parent_position = by_uuid.get(cursor)
+            if parent_position is None:
+                break
+            ancestor = records[parent_position]
+            if ancestor["type"] in {"user", "assistant"} or ancestor.get("presentation_record"):
+                break
+            cursor = ancestor.get("parent")
+        if visible and (state["tip"] is None or cursor != state["tip"]):
+            _rebuild_derived(index)
+            return
+        if visible:
+            for name in ("normal", "full"):
+                index["orders"][name].append(position)
+                prefix = index["bubble_prefix"][name]
+                prefix.append(prefix[-1] + max(0, int(rec.get("bubble_count") or 0)))
+            state["full_seen"].add(display_uuid)
+            state["tip"] = uid
+        by_uuid[uid] = position
+        if parent:
+            state["referenced"].add(parent)
+        for tool in rec.get("tool_uses") or []:
+            tool_id = str(tool.get("id") or "")
+            if tool_id:
+                index["tool_use_names"][tool_id] = str(tool.get("name") or "")
+        for tool_id, status in _task_status_from_descriptor(rec):
+            index["task_status"][tool_id] = status
 
 
 def ensure_index(
@@ -371,6 +432,8 @@ def ensure_index(
 
         changed = rebuild or stat["size"] != index["source"].get("size")
         if changed:
+            # A failed transaction must reload its last durable checkpoint.
+            _index_cache.pop(sid, None)
             records_before = len(index["records"])
             scanned = _append_complete_lines(
                 transcript_path, index, start, stat["size"], describe_record)
@@ -383,12 +446,11 @@ def ensure_index(
                 "guard_start": guard_start,
                 "guard_digest": guard_digest,
             }
-            _rebuild_derived(index)
-            atomic_write_text(
-                index_path,
-                json.dumps(index, ensure_ascii=False, separators=(",", ":")),
-                mode=0o600,
-            )
+            if rebuild:
+                _rebuild_derived(index)
+            else:
+                _extend_derived(index, records_before)
+            store.persist(index_path, index, records_before, rebuild=rebuild)
         _index_cache.pop(sid, None)
         _index_cache[sid] = (index_path, _index_signature(index_path), index)
         while len(_index_cache) > _INDEX_CACHE_MAX:

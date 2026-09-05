@@ -5816,7 +5816,7 @@ def _apply_runtime_task_overlays(
 
 
 def _transcript_index_path(sid: str) -> Path:
-    return sess.SESS_DIR / f"{sid}.transcript-index.json"
+    return sess.SESS_DIR / f"{sid}.transcript-index.sqlite3"
 
 
 def _describe_transcript_record(entry: dict) -> dict:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -156,9 +157,10 @@ def test_incremental_append_partial_malformed_and_replace(tmp_path):
     assert [r["uuid"] for r in rebuilt["records"]] == ["u9"]
 
     # A stale schema is rejected and rebuilt rather than trusted.
-    bad = json.loads(index_path.read_text())
-    bad["schema"] = 999
-    index_path.write_text(json.dumps(bad))
+    with sqlite3.connect(index_path) as db:
+        bad = json.loads(db.execute("SELECT value FROM metadata WHERE id=1").fetchone()[0])
+        bad["schema"] = 999
+        db.execute("UPDATE metadata SET value=? WHERE id=1", (json.dumps(bad),))
     schema_rebuilt = ti.ensure_index("s", transcript, index_path, _describe)
     assert schema_rebuilt["schema"] == ti.SCHEMA_VERSION
     assert [r["uuid"] for r in schema_rebuilt["records"]] == ["u9"]
@@ -1281,3 +1283,77 @@ def test_outline_uses_index_and_excludes_compact_summary(
         {"preview": "(empty)", "uuid": "u2"},
     ]
     assert response.json()["history_generation"]
+
+
+def test_append_persists_only_new_descriptor_and_small_checkpoint(tmp_path, monkeypatch):
+    transcript, path = tmp_path / 'canonical.jsonl', tmp_path / 'index.sqlite3'
+    _append(transcript, *[_entry(str(i), 'user', 'synthetic', str(i-1) if i else None)
+                           for i in range(2000)])
+    index = ti.ensure_index('incremental-store', transcript, path, _describe)
+    initial_size = path.stat().st_size
+    original = ti.store._write
+    writes = []
+    def record_write(store_path, snapshot, first_record, create):
+        writes.append((first_record, len(snapshot['records']), create))
+        return original(store_path, snapshot, first_record, create)
+    monkeypatch.setattr(ti.store, '_write', record_write)
+    def no_full_rebuild(_index):
+        raise AssertionError('ordinary append rebuilt old derived records')
+    monkeypatch.setattr(ti, '_rebuild_derived', no_full_rebuild)
+    _append(transcript, _entry('2000', 'assistant', 'next', '1999'))
+    index = ti.ensure_index('incremental-store', transcript, path, _describe)
+    assert writes == [(2000, 2001, False)]
+    assert index['orders']['normal'][-1] == 2000
+    assert path.stat().st_size - initial_size <= 16384
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_descriptor_store_restart_and_legacy_json_rebuild(tmp_path):
+    transcript, path = tmp_path / 'canonical.jsonl', tmp_path / 'legacy.json'
+    _append(transcript, _entry('u1', 'user', 'one'))
+    path.write_text(json.dumps({'schema': ti.SCHEMA_VERSION, 'records': []}))
+    first = ti.ensure_index('restart-store', transcript, path, _describe)
+    generation = first['history_generation']
+    ti._index_cache.pop('restart-store', None)
+    def no_parse(_entry):
+        raise AssertionError('unchanged canonical transcript should not be reparsed')
+    loaded = ti.ensure_index('restart-store', transcript, path, no_parse)
+    assert loaded['history_generation'] == generation
+    assert loaded['orders'] == first['orders']
+    assert path.read_bytes().startswith(b'SQLite format 3')
+
+
+def test_failed_append_transaction_reloads_durable_checkpoint(tmp_path, monkeypatch):
+    transcript, path = tmp_path / 'canonical.jsonl', tmp_path / 'index.sqlite3'
+    _append(transcript, _entry('u1', 'user', 'one'))
+    ti.ensure_index('failed-append-store', transcript, path, _describe)
+    _append(transcript, _entry('a1', 'assistant', 'two', 'u1'))
+    original = ti.store.persist
+    monkeypatch.setattr(ti.store, 'persist', lambda *a, **k: (_ for _ in ()).throw(OSError('synthetic write failure')))
+    import pytest
+    with pytest.raises(OSError):
+        ti.ensure_index('failed-append-store', transcript, path, _describe)
+    monkeypatch.setattr(ti.store, 'persist', original)
+    retried = ti.ensure_index('failed-append-store', transcript, path, _describe)
+    assert [r['uuid'] for r in retried['records']] == ['u1', 'a1']
+
+
+def test_incremental_orders_match_rebuild_after_progress_fork_and_duplicate(tmp_path):
+    import copy
+    transcript, path = tmp_path / 'canonical.jsonl', tmp_path / 'index.sqlite3'
+    entries = [
+        _entry('u1', 'user', 'one'), _entry('a1', 'assistant', 'reply', 'u1'),
+        _entry('p1', 'progress', '', 'a1'), _entry('u2', 'user', 'next', 'p1'),
+        _entry('side', 'assistant', 'side', 'u2', isSidechain=True),
+        _entry('a2', 'assistant', 'reply', 'u2'),
+        _entry('u2', 'user', 'duplicate', 'u1'),
+        _entry('s', 'system', '', None), _entry('compact', 'user', 'summary', 's'),
+        _entry('a3', 'assistant', 'reply', 'compact'),
+    ]
+    for entry in entries:
+        _append(transcript, entry)
+        actual = ti.ensure_index('branch-incremental', transcript, path, _describe)
+        oracle = copy.deepcopy(actual)
+        ti._rebuild_derived(oracle)
+        for name in ('orders', 'bubble_prefix', 'tool_use_names', 'task_status'):
+            assert actual[name] == oracle[name]
