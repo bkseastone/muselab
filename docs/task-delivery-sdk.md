@@ -26,9 +26,9 @@ Git changes and file checkpoints. The panel is useful in non-Git workspaces too.
 
 The environment panel shows the registered workspace, branch/worktree, dirty
 state, backend and host. The service origin is the authenticated browser origin.
-The preview header has no persistent service-identity label. Inspect session
-environment details in this panel; a terminal may use a different workspace. Automatic Git probes cache
-for five seconds; opening or refreshing the delivery panel refreshes identity.
+Chat and preview headers have no persistent environment labels. Inspect session
+environment details in this panel; a terminal may use a different workspace.
+Opening or refreshing the delivery panel refreshes identity.
 Git probes are read-only, have a two-second timeout per command and bounded
 output, and disable filesystem-monitor commands from Git configuration.
 

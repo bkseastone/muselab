@@ -2,15 +2,6 @@
 window.museTaskDelivery = function () {
   return {
     taskDelivery: { show: false, loading: false, sid: "", selectedTurn: "", data: null, error: "", preview: null, restoring: false, confirmation: false, seq: 0 },
-    runtimeIdentity: null,
-    _taskRuntimeSeq: 0,
-    async fetchTaskRuntime(sid) {
-      const seq = ++this._taskRuntimeSeq;
-      this.runtimeIdentity = null;
-      if (!sid || !this.authed || this.workspaceSwitching) return;
-      const result = await this.api(`/api/chat/sessions/${encodeURIComponent(sid)}/runtime`);
-      if (seq === this._taskRuntimeSeq && sid === this.currentId && result.ok) this.runtimeIdentity = result.data;
-    },
     deliveryError(error, fallback) {
       if (typeof error === "string") return this.deliveryLabel(error);
       if (error && typeof error === "object") return [this.deliveryLabel(error.code || fallback), error.recovery_id ? `Recovery ID: ${error.recovery_id}` : ""].filter(Boolean).join(" · ");
@@ -38,9 +29,6 @@ window.museTaskDelivery = function () {
       state.loading = false;
       if (!result.ok) { state.error = String(result.error || "Delivery unavailable"); return; }
       state.data = result.data;
-      if (sid === this.currentId) {
-        this.runtimeIdentity = result.data.runtime;
-      }
     },
     closeTaskDelivery() {
       if (this.taskDelivery.restoring) return;
@@ -110,11 +98,6 @@ window.museTaskDelivery = function () {
         unsafe_or_missing_file: ["文件已移动或路径不安全", "A file moved or its path is unsafe"],
       };
       return labels[code]?.[this.lang === "zh" ? 0 : 1] || code;
-    },
-    deliveryRuntimeLabel() {
-      const r = this.runtimeIdentity;
-      if (!r || r.session_id !== this.currentId) return "";
-      return [r.host, r.branch || (this.lang === "zh" ? "非 Git" : "No Git"), r.is_worktree ? "worktree" : "", r.dirty === true ? (this.lang === "zh" ? "有修改" : "modified") : ""].filter(Boolean).join(" · ");
     },
   };
 };

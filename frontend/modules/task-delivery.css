@@ -24,8 +24,6 @@
 .delivery-restore-preview{border:1px solid #c89632!important;border-radius:8px;padding:16px!important}
 .delivery-restore-preview label{display:flex;gap:8px;font-size:13px;line-height:1.6}
 .delivery-restore-button{font-weight:600}
-.task-runtime-strip{font-size:11px;color:var(--c-fg-3);padding:4px 12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-height:22px;box-sizing:border-box}
-.task-runtime-strip button{font:inherit;color:inherit;border:0;padding:0;background:transparent;cursor:pointer}
 @media(max-width:600px){.task-delivery-panel{padding:14px}
 .task-delivery-panel>header{top:-14px}
 .delivery-environment dl{grid-template-columns:85px minmax(0,1fr)}
