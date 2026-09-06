@@ -48,6 +48,30 @@ Global state remains only under the primary `MUSELAB_ROOT/.muselab/`; it is not 
 
 Source code, `.venv/`, dependency caches, build output, and logs can be restored from the repository or installer and do not need to be treated as user data.
 
+`$MUSELAB_SESSIONS_DIR/<sid>.transcript-index.sqlite3` is a private, derived
+byte-offset/descriptor cache, not the conversation source. Appends write only
+new descriptors and a small source checkpoint in one SQLite transaction.
+Canonical CLI JSONL remains authoritative; missing, corrupt, legacy JSON, or
+incompatible indexes are rebuilt without rewriting the transcript. Ordinary
+main-chain appends update display coordinates incrementally; branch changes,
+compaction, and duplicate UUIDs use the full chain resolver. These caches may
+be omitted from backups; keep session sidecars, queues, and canonical JSONL.
+
+
+Task delivery adds three private locations under `$MUSELAB_SESSIONS_DIR/`:
+
+| Path | Content |
+|---|---|
+| `delivery/<sid>.json` | Observed task/tool evidence and task-start Git identity |
+| `checkpoints/<sid>.json` | Actual SDK checkpoint IDs and observed file fingerprints |
+| `checkpoint-recovery/<sid>/` | File contents backed up immediately before an explicit restore |
+
+Back these up to retain the corresponding task and recovery history. Recovery
+files can contain sensitive workspace contents. Deleting a session also removes
+these records and backups. A backup does not make an old checkpoint safe to
+replay after moving a workspace; current identity and file checks still apply.
+See [Task delivery and SDK compatibility](task-delivery-sdk.md).
+
 ## Claude CLI data
 
 | Path | Content |

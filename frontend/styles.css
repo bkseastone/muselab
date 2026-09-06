@@ -1787,32 +1787,9 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   display: flex; flex-direction: column;
   overflow: hidden;
   container-type: inline-size;
-  /* Position context for the absolutely-positioned PTR indicator —
-     it floats above the list without taking layout space. */
   position: relative;
 }
 
-/* Pull-to-refresh indicator — injected by _attachPTR(). Sits absolutely
-   at the top of the scroll container, slides DOWN as the user pulls.
-   opacity controlled by JS based on pull distance. */
-.ptr-indicator {
-  position: absolute; top: -50px; left: 0; right: 0;
-  height: 50px;
-  display: flex; align-items: center; justify-content: center; gap: var(--sp-2);
-  font-size: var(--fs-sm); color: var(--c-fg-2);
-  background: transparent;
-  pointer-events: none;
-  opacity: 0;
-  transition: transform var(--t-base) ease, opacity var(--t-base) ease;
-  z-index: 3;
-}
-.ptr-indicator .ptr-icon {
-  font-size: var(--fs-lg); display: inline-block;
-  transition: transform var(--t-base) ease;
-}
-.ptr-indicator.ptr-spinning .ptr-icon {
-  animation: ptr-spin 0.9s linear infinite;
-}
 @keyframes ptr-spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
@@ -6546,10 +6523,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ctx-meter.danger .ctx-meter-fill { background: var(--c-danger); }
 .ctx-meter.warn .ctx-meter-label { color: var(--c-warn); }
 .ctx-meter.danger .ctx-meter-label { color: var(--c-danger); font-weight: var(--fw-semibold); }
-/* Context breakdown popup — anchored top-right of viewport, fixed so it
-   floats over any pane. Shows SDK get_context_usage() per-category data. */
+/* Context breakdown follows the composer ring via the anchored-popup controller. */
 .ctx-breakdown-pop {
-  position: fixed; top: 56px; right: 12px;
+  position: fixed;
   width: 340px; max-width: calc(100vw - 24px);
   background: var(--c-bg-0);
   border: 1px solid var(--c-border);
@@ -9679,6 +9655,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
+.codex-quota-stale { color: var(--c-warn); }
 .codex-quota-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -9824,7 +9801,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   align-items: flex-end;
   gap: 3px;
   height: 130px;
-  padding: 0 4px;
+  /* Keep centered date labels within the chart on narrow screens. */
+  padding: 0 16px;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);
@@ -12522,3 +12500,52 @@ html[data-theme="eyecare"] .tool-error-hint {
   .queue-outbox-toggle, .queue-outbox .queued-act { min-height: 40px; }
   .queue-outbox-items { max-height: 23vh; }
 }
+
+/* Settings must override the later desktop grid on narrow viewports. */
+.settings-draft-notice { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px; margin:0 0 16px; border:1px solid var(--c-accent); border-radius:var(--r-md); font-size:var(--fs-sm); }
+.settings-draft-notice span { flex:1 1 170px; overflow-wrap:anywhere; }
+.settings-modal .settings-row > * { min-width:0; }
+@media (max-width:720px) {
+  .settings-modal .settings-row { grid-template-columns:minmax(0,1fr); row-gap:6px; margin-bottom:14px; }
+  .settings-modal .settings-row > label { overflow:visible; text-overflow:clip; white-space:normal; overflow-wrap:anywhere; }
+  .settings-modal .settings-input-wrap { min-width:0; flex-wrap:wrap; }
+  .settings-modal .settings-input-wrap .settings-input { flex:1 1 150px; }
+  .settings-modal input:not([type="checkbox"]):not([type="radio"]),
+  .settings-modal select, .settings-modal textarea { min-width:0; max-width:100%; box-sizing:border-box; font-size:16px; }
+  .settings-modal .settings-section { min-width:0; }
+  .settings-modal .provider-row { grid-template-columns:minmax(0,1fr); }
+  .settings-modal .settings-row select,
+  .settings-modal .settings-row input:not([type="checkbox"]):not([type="radio"]) { height:40px; }
+  .settings-modal .settings-row .switch { width:40px; }
+}
+
+.workbench-more { position:relative; flex-shrink:0; }
+.workbench-more summary { list-style:none; font-weight:600; letter-spacing:2px; }
+.workbench-more summary::-webkit-details-marker { display:none; }
+.workbench-more-actions { position:absolute; top:calc(100% + 6px); right:0; width:230px; padding:6px; display:flex; flex-direction:column; gap:2px; background:var(--c-bg-1); border:1px solid var(--c-border); border-radius:var(--r-md); box-shadow:0 8px 24px #0002; z-index:200; }
+.workbench-more-actions .icon-btn { width:100%; min-height:40px; padding:8px 10px; justify-content:flex-start; gap:10px; position:relative; }
+.workbench-action-label { font-size:var(--fs-sm); text-align:left; }
+.workbench-more-actions .icon-btn svg { flex-shrink:0; }
+.pane.chat:has(.workbench-more[open]) { z-index:90; }
+.preview-empty-title { font-size:24px; }
+.brand-empty .preview-open-existing { margin:18px 0 0; font-size:var(--fs-sm); }
+.brand-empty .preview-focus-chat { margin-top:14px; font-size:var(--fs-sm); }
+.memory-center-intro, .memory-empty-guide p, .memory-how-it-works p { font-size:var(--fs-sm); line-height:1.65; color:var(--c-fg-2); }
+.memory-empty-guide { padding:20px; border:1px dashed var(--c-border); border-radius:var(--r-md); margin:16px 0; }
+.memory-source summary { cursor:pointer; }
+.memory-source > span { display:block; overflow-wrap:anywhere; margin-top:6px; }
+
+.html-annotation-panel { flex-shrink:0; padding:10px 14px; background:var(--c-bg-2); border-bottom:1px solid var(--c-border); font-size:var(--fs-sm); }
+.html-annotation-head { display:flex; align-items:center; gap:12px; justify-content:space-between; }
+.html-annotation-head > span { min-width:0; }
+.html-annotation-panel code { display:block; white-space:normal; overflow-wrap:anywhere; font-size:12px; margin:8px 0; }
+.html-annotation-form { display:flex; gap:8px; align-items:flex-end; }
+.html-annotation-form textarea { flex:1; min-width:0; height:auto; resize:vertical; padding:8px; line-height:1.5; }
+.html-annotation-form button { flex-shrink:0; }
+@media(max-width:720px) { .html-annotation-form { flex-wrap:wrap; } .html-annotation-form textarea { flex-basis:100%; font-size:16px; } }
+
+.browser-turn-metrics { display:flex; flex-direction:column; gap:8px; }
+.browser-turn-metric { display:flex; flex-wrap:wrap; gap:8px 16px; padding:8px 0; border-top:1px solid var(--c-border); font-size:var(--fs-sm); font-variant-numeric:tabular-nums; }
+
+/* Expanded diagnostics must not inherit legacy negative hint margins. */
+.settings-modal .settings-advanced > .settings-hint { margin:10px 0 12px; }

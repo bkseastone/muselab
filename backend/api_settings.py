@@ -975,34 +975,37 @@ async def reconnect_mcp_server(name: str) -> dict:
         live = list(_chat._clients.items())
     if not live:
         return {"ok": True, "reconnected": [], "errors": [], "note": "no live client"}
-    for key, client in live:
-        try:
-            await client.reconnect_mcp_server(name)
-            reconnected.append(f"{key[0]}@{key[1]}")
-        except Exception as e:
-            errors.append(f"{key}: {type(e).__name__}: {e}")
-    return {"ok": True, "reconnected": reconnected, "errors": errors}
+    from .mcp_probes import probe_clients
+    pending = []
+    for item in await probe_clients(live, "reconnect_mcp_server", name):
+        key = item["key"]
+        label = f"{key[0]}@{key[1]}"
+        if "error" in item:
+            errors.append(f"{label}: {item['error']}")
+            if item.get("pending"):
+                pending.append(label)
+        else:
+            reconnected.append(label)
+    return {"ok": True, "reconnected": reconnected, "errors": errors,
+            "pending": pending}
 
 
 @router.get("/mcp/status", dependencies=[Depends(require_token)])
 async def mcp_status() -> dict:
-    """Aggregate MCP server status from every live SDK client (each may have
-    its own connection state). Returns per-client breakdown so the UI can
-    show which session's MCP is borked when reconnect is needed."""
+    """Return independent live-client results within a short shared deadline."""
     from . import chat as _chat
+    from .mcp_probes import probe_clients
     async with _chat._lock:
         live = list(_chat._clients.items())
-    out: list[dict] = []
-    for key, client in live:
-        # Cache key is (sid, model, effort) — 3-tuple since 2026-05-21.
-        # Unpacking into 2 vars would crash with ValueError; index instead.
-        sid, model = key[0], key[1]
-        try:
-            status = await client.get_mcp_status()
-            out.append({"session_id": sid, "model": model, "status": status})
-        except Exception as e:
-            out.append({"session_id": sid, "model": model,
-                         "error": f"{type(e).__name__}: {e}"})
+    out = []
+    for item in await probe_clients(live, "get_mcp_status"):
+        key = item["key"]
+        row = {"session_id": key[0], "model": key[1]}
+        if "error" in item:
+            row.update(error=item["error"], pending=item.get("pending", False))
+        else:
+            row["status"] = item["result"]
+        out.append(row)
     return {"clients": out}
 
 
@@ -1531,8 +1534,10 @@ async def restart_service() -> dict:
 @router.get("/service", dependencies=[Depends(require_token)])
 async def service_status() -> dict:
     """Cheap in-memory status; no filesystem, subprocess or private payload."""
-    from . import chat
+    from . import chat, chat_runtime, runtime_buffer
     return {
+        "diagnostics": {"runtime_buffers": runtime_buffer.diagnostics(
+            streams=len(chat_runtime.SESSION_STREAMS))},
         "instance_id": _SERVICE_INSTANCE_ID,
         "uptime_seconds": round(time.monotonic() - _SERVICE_STARTED, 1),
         "active_turns": sum(not bc.done for bc in tuple(chat._active_turns.values())),

@@ -165,13 +165,25 @@ The container runs as a non-root `muse` user (uid 1000) with home directory
 `/home/muse/.claude`. Bind-mount the host's `~/.claude` to that path to reuse
 the OAuth credentials from `claude login`.
 
-> **Host UID note.** The container's `muse` user is uid 1000. On most
-> single-user Linux/macOS hosts the primary account is also uid 1000, so
-> bind-mounts work without adjustment. If the host UID differs (multi-user
-> host, custom macOS admin account, etc.), either run
-> `chmod -R go+rX ~/.claude` and `chown -R 1000:1000 ~/muselab-workspace`
-> before starting the container, or pass `--user $(id -u):$(id -g)` and
-> accept that the in-container `~/.claude` may be read-only.
+**Bind-mount permissions.** Published images run as UID/GID 1000. Linux
+host ownership must permit that user to read and write the workspace, sessions
+and Claude state. Do not recursively grant other users access to `~/.claude`:
+it contains OAuth credentials and transcripts. Token refresh and transcript
+persistence both require write access; a read-only mount is not sufficient.
+
+If the owner differs, use the source Compose build with a matching non-root
+UID/GID. Create the host directories as your account before Docker mounts them:
+
+```bash
+mkdir -p data sessions
+MUSELAB_UID=$(id -u) MUSELAB_GID=$(id -g) docker compose up -d --build
+```
+
+Set `MUSELAB_UID` and `MUSELAB_GID` in the Compose `.env` to retain that choice.
+On Docker Desktop, verify the actual bind-mount permissions rather than assuming
+the host account is UID 1000. A separate Claude state directory can isolate this
+application's login and transcripts; it still needs private ownership and write
+access. These options do not require changing your original credential files.
 
 Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 
@@ -181,7 +193,8 @@ Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 git clone https://github.com/hesorchen/muselab && cd muselab
 cp .env.example .env && $EDITOR .env    # set MUSELAB_TOKEN; ARCHIVE_DIR is the host workspace (legacy name)
 claude login                              # host-side; container reuses OAuth
-docker compose up -d
+mkdir -p data sessions
+docker compose up -d --build
 ```
 
 ### Native dev (uv, no service)

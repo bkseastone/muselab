@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        MUSE_UID: ${MUSELAB_UID:-1000}
+        MUSE_GID: ${MUSELAB_GID:-1000}
     image: muselab:latest
     container_name: muselab
     restart: unless-stopped

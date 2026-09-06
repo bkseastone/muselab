@@ -1,4 +1,4 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
 .env
@@ -73,3 +73,7 @@ docs/background-tasks-spec.md
 
 # local Claude Code project docs — kept local, not published
 .claude/
+
+# Validated dependency environments and private upgrade logs.
+/.venv-builds/
+/.venv.next.*

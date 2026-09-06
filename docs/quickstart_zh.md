@@ -145,7 +145,23 @@ docker run -d --name muselab \
 
 容器以非 root 用户 `muse`（uid 1000）运行，主目录为 `/home/muse/.claude`。将宿主机的 `~/.claude` 挂载至该路径，即可复用 `claude login` 获取的 OAuth 凭据。
 
-> **宿主机 UID 说明：** 容器内 muse 用户为 uid 1000，大多数单用户 Linux / macOS 主机的账号也是 uid 1000，挂载可直接生效。若宿主机 UID 不同（多用户环境、自定义 macOS 管理员账号等），需在启动容器前执行 `chmod -R go+rX ~/.claude` 及 `chown -R 1000:1000 ~/muselab-workspace`；或传入 `--user $(id -u):$(id -g)`，但需接受容器内 `~/.claude` 可能为只读。
+**挂载权限。** 发布镜像默认使用 UID／GID 1000。Linux 宿主机上的工作区、
+会话目录和 Claude 状态目录必须允许该用户读写。不要递归向其他用户开放
+`~/.claude`，其中包含 OAuth 凭据和会话记录。刷新 token 和持久化会话都需要
+写权限，只读挂载不能满足这些操作。
+
+若目录所有者不同，使用匹配当前非 root UID／GID 的源码 Compose 构建。
+先以自己的账号创建宿主机目录，再让 Docker 挂载：
+
+```bash
+mkdir -p data sessions
+MUSELAB_UID=$(id -u) MUSELAB_GID=$(id -g) docker compose up -d --build
+```
+
+在 Compose 使用的 `.env` 中保存 `MUSELAB_UID` 和 `MUSELAB_GID` 可保留此选择。
+Docker Desktop 应验证实际挂载权限，不要假设宿主机账号是 UID 1000。
+也可以为本应用准备独立的 Claude 状态目录，隔离登录与会话；该目录仍须保持
+私有且可写。这些方式不要求修改原有凭据文件的权限。
 
 指定版本：`ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`。
 
@@ -155,7 +171,8 @@ docker run -d --name muselab \
 git clone https://github.com/hesorchen/muselab && cd muselab
 cp .env.example .env && $EDITOR .env    # 填 MUSELAB_TOKEN、ARCHIVE_DIR（宿主机工作区，兼容变量名）
 claude login                              # 宿主机执行，容器复用 OAuth
-docker compose up -d
+mkdir -p data sessions
+docker compose up -d --build
 ```
 
 ### 原生开发模式（uv，无 service）

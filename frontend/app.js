@@ -365,6 +365,7 @@ class ChatMuxSessionChannel extends EventTarget {
 
 function portal() {
   return {
+    ...window.museTaskDelivery(),
     // ===== auth =====
     authed: false, tokenInput: "", token: "", loginErr: "",
     // App-readiness layers:
@@ -1099,6 +1100,8 @@ function portal() {
     // RPCs and falls back to local JSONL; neither path reads OAuth credentials
     // or sends a model request. The Gateway may use a different account.
     codexLimit: { windows: {}, updated_at: 0, ok: false },
+    codexLimitLoading: false,
+    codexLimitError: "",
     codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
@@ -1218,6 +1221,25 @@ function portal() {
     // duplicating on accidental repeated Ctrl+V.
     fileClipboard: { path: "", name: "" },
 
+    browserMetrics: {fcpMs:null, readyMs:null, monitorStartedMs:null, longTasksSupported:false, longTasks:0, longTaskMs:0, turns:[]},
+    browserMetricTime(value) { return Number.isFinite(value) ? Math.round(value) + " ms" : "—"; },
+    async loadBrowserMetrics() {
+      if (!this._browserMetricsPromise) this._browserMetricsPromise = import("/static/modules/browser-metrics.mjs")
+        .then(({createBrowserMetrics}) => { this._browserMetrics = createBrowserMetrics(this); return this._browserMetrics; })
+        .catch(() => { this._browserMetricsPromise = null; return null; });
+      const metrics = await this._browserMetricsPromise;
+      metrics?.publish();
+      return metrics;
+    },
+    htmlAnnotation: { active:false, loading:false, selection:null, comment:"", error:"" },
+    async toggleHtmlAnnotation() {
+      if (!this._htmlAnnotationController) {
+        const { createHtmlAnnotation } = await import("/static/modules/html-annotation.mjs");
+        this._htmlAnnotationController = createHtmlAnnotation(this);
+      }
+      if (this.htmlAnnotation.active || this.htmlAnnotation.loading) this._htmlAnnotationController.stop();
+      else this._htmlAnnotationController.start();
+    },
     // ===== settings =====
     // Keyboard cheat-sheet modal — toggled by `?` keypress outside any
     // input. Discoverability tool: muselab has 10+ shortcuts and no one
@@ -1487,7 +1509,7 @@ function portal() {
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
-        else if (top === "settings") this.settings.show = false;
+        else if (top === "settings") this.closeSettings();
         else if (top === "image-gen") this.closeImageGen();
         else if (top === "cheatsheet") this.cheatSheet.show = false;
         else if (top === "workspace-browser") this.closeWorkspaceBrowser();
@@ -1619,7 +1641,7 @@ function portal() {
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
-        if (this.settings.show) { this.settings.show = false; return; }
+        if (this.settings.show) { this.closeSettings(); return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
         if (this.previewQuote.show) { this.dismissPreviewQuote(true); return; }
         // 退出编辑 — guard against silently discarding unsaved edits when ESC
@@ -1730,6 +1752,10 @@ function portal() {
       this._initArtifacts();
       this._initStreamSelectionGuard();
       this._initPreviewSelection();
+      this._initAnchoredPopups();
+      const startBrowserMetrics = () => { void this.loadBrowserMetrics(); };
+      if (window.requestIdleCallback) window.requestIdleCallback(startBrowserMetrics, {timeout:3000});
+      else setTimeout(startBrowserMetrics, 1500);
       this._initAriaLabelMirror();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
@@ -1998,6 +2024,7 @@ function portal() {
       } else {
         // No token saved → skip splash, jump straight to login.
         this.appReady = true;
+        performance.mark("muselab-app-ready");
       }
     },
 
@@ -2179,94 +2206,129 @@ function portal() {
       this._syncMobileKeyboardViewport();
     },
 
-    // Attach iOS-style pull-to-refresh to a scrollable element. Mobile
-    // only — skips immediately on devices with no touch (matchMedia
-    // `pointer: coarse` would also wrap iPad pencil; we gate on
-    // `hover: hover` instead, which is true for mouse / trackpad).
-    //
-    // Usage: <ul x-init="_attachPTR($el, () => reloadX())">. The
-    // helper inserts an indicator element above the scroller, listens
-    // to touchstart/move/end, applies a damped translateY while the
-    // user is pulling, and calls onRefresh() when released past 60px.
-    // Indicator stays visible during refresh, snaps back when the
-    // promise resolves (so the user sees progress).
+    // Keep small anchored surfaces attached as panes, fonts and the visible
+    // viewport change. Observers only watch surfaces that are currently open.
+    _initAnchoredPopups() {
+      if (this._anchoredPopupsBound) return;
+      this._anchoredPopupsBound = true;
+      const specs = [
+        [".workbench-more-actions", ".workbench-more > summary", () => !!document.querySelector(".workbench-more[open]"), { width: 230, align: "end" }],
+        ["#history-picker-pop", "#history-picker-trigger", () => this.sessionPickerOpen, { width: 320, maxHeight: 320 }],
+        [".tab-picker-pop", ".tab-picker-btn", () => this.editorTabPickerOpen, { width: 280, maxHeight: 320 }],
+        [".ctx-breakdown-pop", ".chat-toolbar-ring", () => this.ctxBreakdown.show, { width: 340, maxHeight: 520, align: "end", above: true }],
+      ];
+      let active = [], frame = 0;
+      const position = () => {
+        frame = 0;
+        for (const item of active) this._positionAnchoredPopup(...item);
+      };
+      const schedule = (event) => {
+        // Scrolling inside the popup must not move it or reset its scroll.
+        if (event?.type === "scroll" && event.target instanceof Node
+            && active.some(([, pop]) => pop.contains(event.target))) return;
+        if (active.length && !frame) frame = requestAnimationFrame(position);
+      };
+      const observer = window.ResizeObserver ? new ResizeObserver(schedule) : null;
+      const sync = () => this.$nextTick(() => {
+        observer?.disconnect();
+        active = [];
+        for (const [selector, anchorSelector, isOpen, options] of specs) {
+          const popup = document.querySelector(selector);
+          const anchor = document.querySelector(anchorSelector);
+          if (!isOpen() || !popup || !anchor || !popup.getClientRects().length) continue;
+          active.push([anchor, popup, options]);
+          observer?.observe(popup);
+          observer?.observe(anchor);
+          const pane = anchor.closest(".pane");
+          if (pane) observer?.observe(pane);
+        }
+        schedule();
+      });
+      for (const key of ["sessionPickerOpen", "editorTabPickerOpen", "ctxBreakdown.show", "mobileTab", "desktopFullPane"]) this.$watch(key, sync);
+      document.addEventListener("toggle", event => {
+        if (event.target.matches?.(".workbench-more")) sync();
+      }, true);
+      document.addEventListener("scroll", schedule, true);
+      window.addEventListener("resize", schedule);
+      window.visualViewport?.addEventListener("resize", schedule);
+      window.visualViewport?.addEventListener("scroll", schedule);
+      sync();
+    },
+    _positionAnchoredPopup(anchor, popup, options) {
+      if (!popup.isConnected || !anchor.isConnected || !popup.getClientRects().length) return;
+      const vv = window.visualViewport;
+      const pad = 8, gap = 6;
+      const pane = anchor.closest(".pane")?.getBoundingClientRect();
+      // Panes clip their descendants, and mobile navigation sits outside them.
+      // Fit within both the visual viewport and the owning pane's visible area.
+      const minX = Math.max(vv?.offsetLeft || 0, pane?.left || 0) + pad;
+      const minY = Math.max(vv?.offsetTop || 0, pane?.top || 0) + pad;
+      const right = Math.min((vv?.offsetLeft || 0) + (vv?.width || window.innerWidth), pane?.right ?? Infinity) - pad;
+      const bottom = Math.min((vv?.offsetTop || 0) + (vv?.height || window.innerHeight), pane?.bottom ?? Infinity) - pad;
+      const a = anchor.getBoundingClientRect();
+      if (!a.width || !a.height || a.bottom < minY || a.top > bottom || a.right < minX || a.left > right) {
+        popup.style.visibility = "hidden";
+        return;
+      }
+      Object.assign(popup.style, {
+        position: "fixed", top: "0px", left: "0px", right: "auto", bottom: "auto",
+        transform: "none", boxSizing: "border-box", overflowY: "auto",
+        width: `${Math.max(1, Math.min(options.width, right - minX))}px`,
+      });
+      // Measure content at its final width, retaining the current height limit
+      // so repositioning does not temporarily expand a scrolled menu and reset it.
+      const origin = popup.getBoundingClientRect();
+      const css = getComputedStyle(popup);
+      const borders = parseFloat(css.borderTopWidth) + parseFloat(css.borderBottomWidth);
+      const cap = Math.max(1, Math.min(options.maxHeight || 520, bottom - minY));
+      const wanted = Math.min(cap, Math.max(origin.height, popup.scrollHeight + borders));
+      const aboveRoom = Math.max(0, a.top - minY - gap);
+      const belowRoom = Math.max(0, bottom - a.bottom - gap);
+      const above = options.above
+        ? aboveRoom >= wanted || aboveRoom >= belowRoom
+        : belowRoom < wanted && aboveRoom > belowRoom;
+      popup.style.maxHeight = `${Math.max(1, Math.min(cap, above ? aboveRoom : belowRoom))}px`;
+      const rect = popup.getBoundingClientRect();
+      const x = Math.max(minX, Math.min(options.align === "end" ? a.right - rect.width : a.left, right - rect.width));
+      const y = Math.max(minY, Math.min(above ? a.top - gap - rect.height : a.bottom + gap, bottom - rect.height));
+      // A transformed containing block can offset fixed coordinates. Subtract
+      // its measured origin instead of adding safe-area offsets a second time.
+      popup.style.left = `${x - origin.left}px`;
+      popup.style.top = `${y - origin.top}px`;
+      popup.style.visibility = "visible";
+    },
+
+    // Attach iOS-style pull-to-refresh to the file tree.
+    // Pull-to-refresh shares reloadTree's loading state and refresh-button
+    // animation; it does not add a second status overlay above the file list.
     _attachPTR(el, onRefresh) {
       if (!el || typeof onRefresh !== "function") return;
       if (window.matchMedia && window.matchMedia("(hover: hover)").matches) return;
-      // Insert indicator just above the scroller (inside the same flex
-      // parent so layout doesn't shift). pointer-events:none — pulling
-      // the indicator itself shouldn't intercept the user's gesture.
-      const ind = document.createElement("div");
-      ind.className = "ptr-indicator";
-      ind.innerHTML = "<span class='ptr-icon'>↓</span><span class='ptr-text'></span>";
-      const txt = ind.querySelector(".ptr-text");
-      const icon = ind.querySelector(".ptr-icon");
-      el.parentElement.insertBefore(ind, el);
-      const THRESHOLD = 60;
+      const THRESHOLD = 120;
       let startY = 0, currentY = 0, pulling = false, refreshing = false;
-      const setLabel = (state) => {
-        const zh = this.lang === "zh";
-        if (state === "pull")    txt.textContent = zh ? "下拉刷新" : "Pull to refresh";
-        else if (state === "release") txt.textContent = zh ? "释放刷新" : "Release to refresh";
-        else if (state === "loading") txt.textContent = zh ? "刷新中…" : "Refreshing…";
-      };
       el.addEventListener("touchstart", (e) => {
-        if (refreshing) return;
-        if (el.scrollTop > 0) return;
-        startY = e.touches[0].clientY;
-        currentY = startY;
+        pulling = false;
+        if (refreshing || el.scrollTop > 0 || e.touches.length !== 1) return;
+        startY = currentY = e.touches[0].clientY;
         pulling = true;
       }, { passive: true });
       el.addEventListener("touchmove", (e) => {
         if (!pulling || refreshing) return;
+        if (e.touches.length !== 1 || el.scrollTop > 0) { pulling = false; return; }
         currentY = e.touches[0].clientY;
-        const dy = currentY - startY;
-        if (dy <= 0) {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-          return;
-        }
-        // Prevent page-level overscroll while the user is actively
-        // pulling — without this, iOS Safari bounces the whole page.
-        // Only block when we're genuinely pulling (dy > a few px).
-        if (dy > 4 && el.scrollTop === 0 && e.cancelable) e.preventDefault();
-        const damped = Math.min(dy * 0.5, 90);
-        ind.style.transform = `translateY(${damped}px)`;
-        ind.style.opacity = String(Math.min(1, damped / 40));
-        icon.style.transform = damped >= THRESHOLD ? "rotate(180deg)" : "";
-        setLabel(damped >= THRESHOLD ? "release" : "pull");
+        // Keep a downward pull at the top from bouncing the whole iOS page.
+        if (currentY - startY > 4 && e.cancelable) e.preventDefault();
       }, { passive: false });
       el.addEventListener("touchend", async () => {
         if (!pulling || refreshing) return;
         pulling = false;
-        const dy = currentY - startY;
-        if (dy * 0.5 >= THRESHOLD) {
-          refreshing = true;
-          ind.style.transform = `translateY(50px)`;
-          ind.style.opacity = "1";
-          icon.style.transform = "";
-          ind.classList.add("ptr-spinning");
-          setLabel("loading");
-          try { await onRefresh(); }
-          catch (e) { /* swallow — the refresh fn's own toast handles err */ }
-          finally {
-            ind.classList.remove("ptr-spinning");
-            ind.style.transform = "";
-            ind.style.opacity = "0";
-            refreshing = false;
-          }
-        } else {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-        }
+        if (currentY - startY < THRESHOLD) return;
+        refreshing = true;
+        try { await onRefresh(); }
+        catch (_) { /* reloadTree owns error feedback. */ }
+        finally { refreshing = false; }
       }, { passive: true });
-      el.addEventListener("touchcancel", () => {
-        pulling = false;
-        if (!refreshing) {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-        }
-      });
+      el.addEventListener("touchcancel", () => { pulling = false; });
     },
 
     async _openStartupActivityDeeplink() {
@@ -2354,19 +2416,8 @@ function portal() {
       // (the already-open-tab case is handled via the SW postMessage above).
       this._openStartupActivityDeeplink();
       this.initSessions().then(() => this._openStartupSessionDeeplink());
-      // First-run hint — surface key shortcuts so the user doesn't have to
-      // hunt for them. Flagged in localStorage so it only fires once. Short
-      // delay lets the splash clear first.
-      if (!localStorage.getItem("muselab_seen_help")) {
-        setTimeout(() => {
-          this.toast(
-            this.lang === "zh"
-              ? "Tip：⌘K 命令面板 · @ 引用文件或目录 · ↑ 回滚上一条"
-              : "Tip: ⌘K command palette · @ to reference files or folders · ↑ to recall last message",
-            "info", 7000);
-          this._setLS("muselab_seen_help", "1");
-        }, 1500);
-      }
+      // Shortcuts remain discoverable in the command button and empty preview.
+      // Boot success needs no extra toast over the first useful interaction.
       // Same preview-file restore that login() does — covers the
       // already-authed boot path (page refresh with saved token).
       if (this._pendingPreviewSelected && this.previewSurface !== "terminal") {
@@ -2498,6 +2549,7 @@ function portal() {
     _markReady() {
       if (this.appReady) return;
       this.appReady = true;
+      performance.mark("muselab-app-ready");
       clearTimeout(this._splashHintTimer);
       clearTimeout(this._splashHardTimeout);
       this.splashHint = "";
@@ -3076,7 +3128,7 @@ function portal() {
         if (Number.isInteger(i) && i >= 0 && i < this.MASCOTS.length) {
           this.mascotIdx = i;
           this.applyFavicon();
-          setTimeout(() => this.greetMascot(this.mascotLabel()), 400);
+          setTimeout(() => this.greetMascot(), 400);
           return;
         }
       }
@@ -3090,7 +3142,7 @@ function portal() {
       this.mascotIdx = Math.abs(h) % this.MASCOTS.length;
       try { localStorage.setItem("muselab_mascot_idx", String(this.mascotIdx)); } catch {}
       this.applyFavicon();
-      setTimeout(() => this.greetMascot(this.mascotLabel()), 400);
+      setTimeout(() => this.greetMascot(), 400);
     },
     mascot() { return this.MASCOTS[this.mascotIdx]; },
     mascotHref() { return "#m-" + this.mascot().id; },
@@ -7249,14 +7301,22 @@ function portal() {
     },
 
     async fetchCodexRateLimit(opts = {}) {
+      if (this.codexLimitLoading) return;
+      this.codexLimitLoading = true;
+      this.codexLimitError = "";
       try {
         const qs = opts.refresh ? "?refresh=1" : "";
         const r = await fetch(`/api/chat/codex-rate-limit${qs}`, {
           headers: this.hdr(),
           cache: "no-store",
+          signal: AbortSignal.timeout(35000),
         });
-        if (r.ok) {
-          const d = await r.json();
+        if (!r.ok) throw new Error("quota_http_failed");
+        const d = await r.json();
+        // Keep the newest known snapshot after a failed refresh. Session logs
+        // may predate a previous successful account read in this browser.
+        const failed = d.refresh?.ok === false || !d.ok;
+        if (!failed || (d.updated_at || 0) > (this.codexLimit.updated_at || 0)) {
           this.codexLimit = {
             ...d,
             windows: d.windows || {},
@@ -7264,11 +7324,33 @@ function portal() {
             ok: !!d.ok,
             provider_authoritative: !!d.provider_authoritative,
           };
-          this.codexBadge = this.codexLimit.provider_authoritative
-            ? this.limitBadgeFromWindows(this.codexLimit.windows)
-            : null;
         }
-      } catch {}
+        if (failed) {
+          this.codexLimit.stale = true;
+          this.codexLimit.account_authoritative = false;
+          this.codexLimitError = d.refresh?.reason || d.reason || "codex_account_rpc_failed";
+        }
+        this.codexBadge = !failed && !this.codexLimit.stale && this.codexLimit.provider_authoritative
+          ? this.limitBadgeFromWindows(this.codexLimit.windows)
+          : null;
+      } catch {
+        this.codexLimitError = "codex_quota_network_failed";
+        this.codexLimit.stale = true;
+        this.codexLimit.account_authoritative = false;
+        this.codexBadge = null;
+      } finally {
+        this.codexLimitLoading = false;
+      }
+    },
+    codexLimitStatusText() {
+      if (this.codexLimitLoading) return this.t("set.cost.codex_quota_loading");
+      const keys = {
+        codex_auth_required: "set.cost.codex_quota_auth",
+        codex_not_found: "set.cost.codex_quota_cli_missing",
+        codex_account_rpc_unsupported: "set.cost.codex_quota_unsupported",
+      };
+      if (this.codexLimitError) return this.t(keys[this.codexLimitError] || "set.cost.codex_quota_failed");
+      return "";
     },
 
     // Pull the current Pro/Max rate-limit snapshot. SSE pushes live deltas
@@ -17160,12 +17242,8 @@ function portal() {
     historyRowClass(sid) {
       return { active: sid === this.currentId, open: this.openTabIds.includes(sid) };
     },
-    // The history picker popup escapes its container via position: fixed
-    // (the parent .chat-tabs has overflow-x: auto which forces overflow-y to
-    // also clip — an absolute-positioned popup gets cut off). We compute the
-    // viewport-anchored position from the 📁 button's bounding rect at click
-    // time so the popup floats just below it.
-    historyPickerStyle: "",
+    // The shared anchored-popup controller escapes overflow clipping and
+    // follows the history button when the viewport or pane geometry changes.
     sessionPickerSearch: "",
     // P2 (perf): the list is windowed to the recent ~100, so the picker's
     // client-side filter can no longer reach old sessions. Search goes to the
@@ -17285,18 +17363,6 @@ function portal() {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
       if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
-      const rect = btn ? btn.getBoundingClientRect() : null;
-      if (rect) {
-        const popW = Math.min(320, window.innerWidth - 16);
-        // Right-align under the button, but stay inside the viewport edges.
-        let left = Math.round(rect.right - popW);
-        if (left < 8) left = 8;
-        const top = Math.round(rect.bottom + 4);
-        this.historyPickerStyle =
-          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
-      } else {
-        this.historyPickerStyle = "";
-      }
       this.sessionPickerOpen = true;
       this.pickerGroupExpanded = {};  // reset collapse state on each open
       this._openFocusSurface(
@@ -17322,25 +17388,9 @@ function portal() {
       }
       this.openTab(sid);
     },
-    // Open-tabs quick picker for the file editor tab bar. Computes a fixed
-    // position from the button rect (same trick as toggleHistoryPicker) so the
-    // dropdown escapes the .tab-bar overflow: auto clip.
+    // The open-tabs picker uses the same anchored-popup controller as history.
     toggleEditorTabPicker(ev) {
       if (this.editorTabPickerOpen) { this.editorTabPickerOpen = false; return; }
-      const btn = ev && ev.currentTarget;
-      const rect = btn ? btn.getBoundingClientRect() : null;
-      if (rect) {
-        const popW = Math.min(280, window.innerWidth - 16);
-        // Left-align under the button, but stay inside the viewport edges.
-        let left = Math.round(rect.left);
-        if (left + popW > window.innerWidth - 8) left = window.innerWidth - 8 - popW;
-        if (left < 8) left = 8;
-        const top = Math.round(rect.bottom + 4);
-        this.editorTabPickerStyle =
-          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
-      } else {
-        this.editorTabPickerStyle = "";
-      }
       this.editorTabPickerOpen = true;
     },
     pickEditorTab(path) {
@@ -20305,6 +20355,33 @@ function portal() {
     },
 
     // ===== settings modal =====
+    settingsDirty() { return !!this._settingsDraftGuard?.dirty(); },
+    async closeSettings() {
+      if (this._settingsLeavePending) return false;
+      if (this.settingsDirty()) {
+        this._settingsLeavePending = true;
+        const leave = await this.confirm({
+          title: this.lang === "zh" ? "设置尚未保存" : "Unsaved settings",
+          body: this.lang === "zh"
+            ? "关闭后草稿会保留在此页面。重新打开可继续编辑；刷新或离开页面前请先保存。"
+            : "Your drafts stay on this page when closed. Reopen to continue; save before refreshing or leaving the page.",
+          okText: this.lang === "zh" ? "保留草稿并关闭" : "Keep drafts & close",
+          cancelText: this.lang === "zh" ? "继续编辑" : "Keep editing",
+        });
+        this._settingsLeavePending = false;
+        if (!leave) return false;
+      }
+      this.settings.show = false;
+      return true;
+    },
+    async discardSettingsDrafts() {
+      const discard = await this.confirm({
+        title: this.lang === "zh" ? "放弃未保存的设置？" : "Discard unsaved settings?",
+        body: this.lang === "zh" ? "已保存的设置不受影响。" : "Saved settings remain unchanged.",
+        okText: this.lang === "zh" ? "放弃草稿" : "Discard drafts", danger: true,
+      });
+      if (discard) this._settingsDraftGuard?.discard();
+    },
     settingsNavigation() {
       const zh = this.lang === "zh";
       return [
@@ -20348,6 +20425,17 @@ function portal() {
       finally { this.settings.serviceLoading = false; }
     },
     async openSettings(activePage = "") {
+      if (!this._settingsDraftGuard) {
+        const { createSettingsDraftGuard } = await import("/static/modules/settings-drafts.mjs");
+        this._settingsDraftGuard = createSettingsDraftGuard(this);
+        this._settingsDraftGuard.capture();
+      }
+      if (this.settingsDirty()) {
+        this.settings.surface = activePage === "memory" ? "memory" : "settings";
+        this.settings.show = true;
+        this.selectSettingsPage(activePage || this.settings.activePage || (this.isWideScreen ? "provider" : null));
+        return;
+      }
       const generation = (this._settingsOpenGeneration || 0) + 1;
       this._settingsOpenGeneration = generation;
       if (this._settingsOpenController) this._settingsOpenController.abort();
@@ -20389,6 +20477,10 @@ function portal() {
         this.busySendMode = this._normalizeBusySendMode(d.defaults.busy_send_mode);
         this.savePrefs();
       }
+      this._settingsDraftGuard.capture([
+        "defaults", "keys", "newProvider",
+        ...d.providers.map(p => `provider:${p.id}`),
+      ]);
       // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
       // Desktop: sidebar is always visible, so land on a default tab
       // (provider — the most-used section) and render only that pane.
@@ -20576,13 +20668,17 @@ function portal() {
       this._memorySettingsGeneration = generation;
       mem.loading = true;
       const load = async (key) => {
+        if (key === "config" && this._settingsDraftGuard?.dirty("memory")) return;
         mem[`${key}Loading`] = true;
         mem[`${key}Error`] = "";
         try {
           const data = await this._settingsRead(`/api/memory/${key}`);
           if (generation !== this._memorySettingsGeneration) return;
           mem[key] = data;
-          if (key === "config") mem.configLoaded = true;
+          if (key === "config") {
+            mem.configLoaded = true;
+            this._settingsDraftGuard?.capture(["memory"]);
+          }
         } catch (e) {
           if (generation === this._memorySettingsGeneration) {
             mem[`${key}Error`] = this._settingsReadError(e);
@@ -20630,6 +20726,7 @@ function portal() {
 
     async saveMemorySettings() {
       const mem = this.settings.memory;
+      const submittedConfig = JSON.parse(JSON.stringify(mem.config));
       mem.saving = true;
       try {
         const r = await fetch("/api/memory/config?probe=true", {
@@ -20639,7 +20736,11 @@ function portal() {
         });
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
-        mem.config = d.config; mem.status = d.status;
+        if (JSON.stringify(mem.config) === JSON.stringify(submittedConfig)) {
+          mem.config = d.config;
+          this._settingsDraftGuard?.capture(["memory"]);
+        } else this._settingsDraftGuard?.accept("memory", submittedConfig);
+        mem.status = d.status;
         this._memoryMonitorEnabled = d.config.mode !== "off";
         this._startMemoryMonitor();
         this.toast(this.lang === "zh" ? "记忆设置已保存" : "Memory settings saved",
@@ -21158,6 +21259,7 @@ function portal() {
     },
     startAddHook() {
       this.settings.hooks.draft = this._newHookDraft();
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     editHook(row) {
       this.settings.hooks.draft = {
@@ -21173,9 +21275,11 @@ function portal() {
         groupIndex: row.groupIndex,
         handlerIndex: row.handlerIndex,
       };
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     cancelHookDraft() {
       this.settings.hooks.draft = { ...this._newHookDraft(), show: false };
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     hookHandlerTemplate(type) {
       const templates = {
@@ -21361,7 +21465,7 @@ function portal() {
       if (this.cost.loading) return;
       if (this.cost.data && !force) return;
       this.cost.loading = true;
-      this.fetchCodexRateLimit({ refresh: true });
+      const quotaRefresh = this.fetchCodexRateLimit({ refresh: true });
       try {
         // Browser timezone offset is -getTimezoneOffset (JS reports east as
         // negative, server expects east-positive minutes).
@@ -21381,6 +21485,7 @@ function portal() {
       } catch (e) {
         this.cost.data = null;
       } finally {
+        await quotaRefresh;
         this.cost.loading = false;
       }
     },
@@ -21583,7 +21688,7 @@ function portal() {
         // the draft so the row collapses back to "已配置" view next render.
         const p = this.settings.providers.find(x => x.env_key === envKey);
         if (p) p.configured = true;
-        this.settings.draftKeys[envKey] = "";
+        if ((this.settings.draftKeys[envKey] || "").trim() === v) this.settings.draftKeys[envKey] = "";
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         // Refresh providers + model list so any newly-enabled model
         // appears in the chat dropdown immediately.
@@ -21635,7 +21740,11 @@ function portal() {
         drafts[p.id].open = false;
         return;
       }
+      if (drafts[p.id] && this._settingsDraftGuard?.dirty(`provider:${p.id}`)) {
+        drafts[p.id].open = true; return;
+      }
       drafts[p.id] = { ...this._draftFromProvider(p), open: true };
+      this._settingsDraftGuard?.capture([`provider:${p.id}`]);
     },
 
     _parseModels(text) {
@@ -21648,12 +21757,17 @@ function portal() {
     toggleAnthropicModels(p) {
       const drafts = this.settings.providerDrafts;
       if (drafts[p.id] && drafts[p.id].open) { drafts[p.id].open = false; return; }
+      if (drafts[p.id] && this._settingsDraftGuard?.dirty(`provider:${p.id}`)) {
+        drafts[p.id].open = true; return;
+      }
       drafts[p.id] = { open: true, models: (p.models || []).join("\n") };
+      this._settingsDraftGuard?.capture([`provider:${p.id}`]);
     },
 
     async saveAnthropicModels(p) {
       const dr = this.settings.providerDrafts[p.id];
       if (!dr) return;
+      const submittedDraft = JSON.parse(JSON.stringify(dr));
       const models = this._parseModels(dr.models);
       try {
         const r = await fetch("/api/settings/providers/anthropic-models", {
@@ -21667,7 +21781,8 @@ function portal() {
           throw new Error(msg);
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
-        if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
+        if (JSON.stringify(dr) === JSON.stringify(submittedDraft)) dr.open = false;
+        this._settingsDraftGuard?.accept(`provider:${p.id}`, submittedDraft);
         await this._reloadProviders();
         await this._fetchModels();
       } catch (e) {
@@ -21691,6 +21806,7 @@ function portal() {
       if (!prov) return 0;
       const dr = this.settings.providerDrafts[prov.id];
       if (!dr || !dr.open) return 0;
+      const submittedDraft = JSON.parse(JSON.stringify(dr));
       const next = this._parseModels(dr.models);
       const cur = prov.models || [];
       if (next.join("\n") === cur.join("\n")) return 0;  // no real change
@@ -21704,11 +21820,14 @@ function portal() {
         try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
         throw new Error(msg);
       }
-      dr.open = false;
+      if (JSON.stringify(dr) === JSON.stringify(submittedDraft)) dr.open = false;
+      this._settingsDraftGuard?.accept(`provider:${prov.id}`, submittedDraft);
       return 1;
     },
 
     async _submitProvider(body, pid) {
+      const submittedDraft = pid && this.settings.providerDrafts[pid]
+        ? JSON.parse(JSON.stringify(this.settings.providerDrafts[pid])) : null;
       try {
         const r = await fetch("/api/settings/providers", {
           method: "POST",
@@ -21722,7 +21841,11 @@ function portal() {
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         if (pid && this.settings.providerDrafts[pid]) {
-          this.settings.providerDrafts[pid].open = false;
+          const draft = this.settings.providerDrafts[pid];
+          const unchanged = JSON.stringify(draft) === JSON.stringify(submittedDraft);
+          if (draft.api_key === submittedDraft.api_key) draft.api_key = "";
+          if (unchanged) draft.open = false;
+          this._settingsDraftGuard?.accept(`provider:${pid}`, {...submittedDraft, api_key:""});
         }
         await this._reloadProviders();
         await this._fetchModels();
@@ -22086,6 +22209,7 @@ function portal() {
     },
 
     async saveSettings() {
+      const submittedDefaults = JSON.parse(JSON.stringify(this.settings.draftDefaults));
       // Flush an open Claude model-list edit first so the global Save captures
       // it too (see _flushAnthropicModelDraft). modelChanges folds into the
       // "Saved N settings" tally below so the toast reflects the model edit
@@ -22098,10 +22222,10 @@ function portal() {
         return;
       }
       const body = {
-        default_model: this.settings.draftDefaults.model,
-        default_permission: this.settings.draftDefaults.permission,
+        default_model: submittedDefaults.model,
+        default_permission: submittedDefaults.permission,
         busy_send_mode: this._normalizeBusySendMode(
-          this.settings.draftDefaults.busy_send_mode,
+          submittedDefaults.busy_send_mode,
         ),
       };
       // Send every typed provider key through the generic provider_keys
@@ -22124,7 +22248,14 @@ function portal() {
       });
       if (r.ok) {
         const d = await r.json();
-        this.settings.show = false;
+        for (const [key, value] of Object.entries(providerKeys)) {
+          if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+        }
+        this._settingsDraftGuard?.accept("defaults", submittedDefaults);
+        this._settingsDraftGuard?.accept("keys", Object.fromEntries(
+          Object.keys(this.settings.draftKeys).map(key => [key, ""])));
+        // Other sections have their own explicit Save; never hide their drafts.
+        if (!this.settingsDirty()) this.settings.show = false;
         // Prefer `updated_count` (user-facing tally) over `updated.length`
         // (raw env-key count). Backend dedupes the MUSELAB_MODEL +
         // MUSELAB_DEFAULT_MODEL pair so changing the model dropdown reads
@@ -22149,20 +22280,20 @@ function portal() {
         // 之前只写了服务端 env，但前端的 this.model 还是 localStorage 里的
         // 老值 → 用户看不到任何变化。同步前端 + localStorage 让"我改了它生效"
         // 的预期成立。已建会话有自己 locked model，不受影响。
-        const newDefaultModel = this.settings.draftDefaults.model;
+        const newDefaultModel = submittedDefaults.model;
         if (newDefaultModel) {
           // newSession() seeds from defaultModel — update it so the change
           // takes effect on the very next new chat without a providers refetch.
           this.defaultModel = newDefaultModel;
           this.savePrefs();
         }
-        const newDefaultPerm = this.settings.draftDefaults.permission;
+        const newDefaultPerm = submittedDefaults.permission;
         if (newDefaultPerm && newDefaultPerm !== this.defaultPermission) {
           this.defaultPermission = newDefaultPerm;
           this.savePrefs();
         }
         const newBusySendMode = this._normalizeBusySendMode(
-          this.settings.draftDefaults.busy_send_mode,
+          submittedDefaults.busy_send_mode,
         );
         if (newBusySendMode !== this.busySendMode) {
           this.busySendMode = newBusySendMode;
@@ -30379,11 +30510,11 @@ function portal() {
     // Idempotent: only touches the listener when the desired state changes,
     // so it never leaves a stale handler attached (which would break bfcache).
     _syncBeforeUnloadGuard() {
-      const wantGuard = this._editorDirty();
+      const wantGuard = this._editorDirty() || this.settingsDirty();
       if (wantGuard && !this._beforeUnloadFn) {
         this._beforeUnloadFn = (e) => {
           // Re-check at fire time — state may have changed since attach.
-          if (!this._editorDirty()) return;
+          if (!this._editorDirty() && !this.settingsDirty()) return;
           e.preventDefault();
           // Legacy browsers need returnValue set to trigger the native prompt;
           // the string itself is ignored by modern browsers.
@@ -32748,6 +32879,8 @@ function portal() {
       // from `this.currentId` here. That was the bug.
       const streamSid = sendSid;
       const streamState = sendState;
+      const uiMetricTurn = isReconnect ? this._browserMetrics?.currentTurn(streamSid)
+        : this._browserMetrics?.startTurn(streamSid);
       // Transport/render capability is fixed for the lifetime of this stream.
       // Viewport changes mid-reply must not silently switch replay policy.
       const streamMobile = this._isMobileLayout();
@@ -33336,6 +33469,7 @@ function portal() {
         lastPlainPaint = Date.now();
         streamState._streamPlainRenderCount++;
         _scrollIfActive();
+        if (acc) this._browserMetrics?.paint(uiMetricTurn, "first", curBubble._k);
       };
       const schedulePlainPaint = () => {
         if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
@@ -34178,6 +34312,8 @@ function portal() {
             ta.focus();
           });
         }
+        if (stampedAssistant) this._browserMetrics?.paint(uiMetricTurn, "first", stampedAssistant._k);
+        if (tailCandidate) this._browserMetrics?.paint(uiMetricTurn, "final", tailCandidate._k);
         return {
           followTail: followedTail,
           userScrollAt: Math.max(
@@ -35352,6 +35488,9 @@ function portal() {
       // better to show something technical than swallow useful info.
       const zh = this.lang === "zh";
       const s = String(raw || "");
+      if (/runtime_buffer_exceeded/i.test(s)) return zh
+        ? "输出积压过大，运行已停止。请先刷新会话历史确认结果，再决定是否重试。"
+        : "Output backlog stopped the run. Reload conversation history to confirm the result before retrying.";
       if (/401|unauthorized|invalid.api.key/i.test(s))
         return zh ? "API key 无效，去 Settings 检查" : "Invalid API key — check Settings";
       if (/429|rate.?limit|too many/i.test(s))

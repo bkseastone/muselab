@@ -93,6 +93,8 @@ muselab 只作为 Images API 客户端，不再启动本地生图模型或 Codex
 | `MUSELAB_MAX_UPLOAD_MB` | Files API 单文件上传上限 MiB | `100` |
 | `MUSELAB_MAX_TURNS` | 每会话最大回合数，`0` 表示不额外限制 | `0` |
 | `MUSELAB_THINKING_BUDGET` | 扩展思考 token 预算 | `10000` |
+| `MUSELAB_RUNTIME_BUFFER_EVENTS` | 每个回合／后台 SDK 交接队列的消息数上限，最小 1 | `8192` |
+| `MUSELAB_RUNTIME_BUFFER_BYTES` | 每个 SDK 交接队列的对象内存估算字节上限，最小 1024 | `67108864` |
 | `MUSELAB_CLIENT_POOL_CAP` | 保活 SDK client 数量 | `3` |
 | `MUSELAB_RECENT_TURN_TTL` | 已结束回合供重连接回的秒数 | `60` |
 | `MUSELAB_STREAM_REPLAY_MAX_EVENTS` | 移动端最大 replay 事件数，超过后 resync | `512` |
@@ -102,6 +104,17 @@ muselab 只作为 Images API 客户端，不再启动本地生图模型或 Codex
 | `MUSELAB_PRUNE_EMPTY_SESSIONS` | 清理满足严格条件的空会话 | `false` |
 | `MUSELAB_TRASH_TTL_DAYS` | 回收站保留天数，`0` 表示永久 | `30` |
 | `MUSELAB_VAPID_SUBJECT` | Web Push VAPID subject | `mailto:noreply@muselab.dev` |
+
+SDK 交接预算位于浏览器 SSE 回放之前，孤立消息暂存另有 512 条上限。
+单条超大消息或累计积压超限时，会明确返回 `runtime_buffer_exceeded`，中断并断开所属的精确 SDK client，
+进入既有失败回合与历史恢复流程；不会静默淘汰消息，也不会让唯一 SDK reader 等待队列空间。
+这里限制的是 Python 对象内存估算值，不是 token 或上传大小。修改后需重启服务。
+
+服务面板从 `GET /api/settings/service` 的 `diagnostics.runtime_buffers` 读取纯数字指标：
+当前队列深度／估算字节、最老等待、已观测的单队列深度／字节峰值与出队等待峰值、进程累计溢出次数。
+日志不记录提示词、工具结果、路径或协议载荷。
+MCP 状态／重连接口采用统一三秒观察截止时间，最多并发四个控制请求；未完成项明确标记为 `pending`。
+后续完成超时仍由 SDK 负责，重复请求共享正在执行的操作，避免取消泄漏或重复重连。
 
 VAPID keypair 不是环境变量，会自动生成在 `$MUSELAB_ROOT/.muselab/vapid.json`。
 

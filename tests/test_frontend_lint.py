@@ -4877,7 +4877,10 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     assert "db.onversionchange = () => {" in cache
     assert "databasePromise = undefined" in cache
     assert "db.close()" in cache
-    assert "persistent-cache.mjs" in makefile
+    assert "bash scripts/check-frontend.sh" in makefile
+    frontend_gate = (FRONTEND.parent / "scripts/check-frontend.sh").read_text(encoding="utf-8")
+    assert "frontend/modules/*.mjs" in frontend_gate
+    assert 'node --check "$file"' in frontend_gate
 
     boot_start = app.index("async _bootApp()")
     boot_end = app.index("\n    // Start the always-on", boot_start)

@@ -1183,8 +1183,12 @@ def delete_session(sid: str) -> bool:
             with _runtime_task_overlay_lock(sid):
                 if _delete_runtime_task_overlays(sid):
                     removed = True
+            from . import task_delivery
+            task_delivery.delete_data(sid)
             for path in (
                 SESS_DIR / f"{sid}.transcript-index.json",
+                SESS_DIR / f"{sid}.transcript-index.sqlite3",
+                SESS_DIR / f"{sid}.transcript-index.sqlite3-journal",
                 _queue_path(sid),
             ):
                 if path.exists():
@@ -1291,10 +1295,10 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
                     q.unlink()
                 except OSError:
                     pass
-            transcript_index = SESS_DIR / f"{sid}.transcript-index.json"
-            if transcript_index.exists():
+            for suffix in ("json", "sqlite3", "sqlite3-journal"):
+                transcript_index = SESS_DIR / f"{sid}.transcript-index.{suffix}"
                 try:
-                    transcript_index.unlink()
+                    transcript_index.unlink(missing_ok=True)
                 except OSError:
                     pass
 

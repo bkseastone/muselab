@@ -7,8 +7,8 @@ The preferred path is Codex app-server's versioned JSON-RPC surface:
 * ``account/usage/read`` returns account-wide token usage.
 
 The script never reads Codex auth files and never sends a prompt.  Older Codex
-builds that do not expose the account RPCs fall back to the newest rate-limit
-snapshot already present in local session JSONL files.
+builds that do not expose the account RPCs report a refresh failure. The HTTP
+API can then show a clearly marked historical snapshot from local session logs.
 """
 from __future__ import annotations
 
@@ -100,8 +100,9 @@ def _from_payload(payload: dict[str, Any], source: Path, ts: str | None) -> dict
             updated_at = 0.0
     return {
         "ok": True,
-        "source": "codex-cli-exec",
-        "source_scope": "codex_cli_exec_rate_limits",
+        "source": "codex-session-log",
+        "source_scope": "codex_cli_session_log",
+        "stale": True,
         "provider_authoritative": False,
         "source_file": str(source),
         "updated_at": updated_at,
@@ -235,6 +236,7 @@ def _normalize_account_snapshot(
         # cannot prove that a separately configured gateway uses that account.
         "provider_authoritative": False,
         "account_authoritative": True,
+        "stale": False,
         "gateway_account_verified": False,
         "updated_at": now,
         "timestamp": timestamp,
@@ -302,6 +304,18 @@ def _send(proc: subprocess.Popen, payload: dict[str, Any]) -> None:
         raise RuntimeError("codex app-server stdin unavailable")
     proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
     proc.stdin.flush()
+
+
+def _rpc_failure_reason(error: Any) -> str:
+    """Expose a stable category, never raw account RPC messages."""
+    message = str(error.get("message", "") if isinstance(error, dict) else error).lower()
+    if "authentication required" in message or "unauthorized" in message or "401" in message:
+        return "codex_auth_required"
+    if isinstance(error, dict) and error.get("code") == -32601:
+        return "codex_account_rpc_unsupported"
+    if "timeout" in message:
+        return "codex_account_rpc_timeout"
+    return "codex_account_rpc_failed"
 
 
 def _read_app_server(timeout: int) -> dict[str, Any]:
@@ -380,18 +394,19 @@ def _read_app_server(timeout: int) -> dict[str, Any]:
         if not isinstance(rate_result, dict) and not isinstance(usage_result, dict):
             return {
                 "ok": False,
-                "reason": "codex_account_rpc_failed",
-                "rate_limits_error": rate_response.get("error") or "timeout",
-                "account_usage_error": usage_response.get("error") or "timeout",
+                "reason": _rpc_failure_reason(rate_response.get("error") or "timeout"),
                 "elapsed_s": round(time.time() - started, 1),
                 "stderr_tail": stderr_tail,
             }
         snapshot = _normalize_account_snapshot(rate_result, usage_result)
         snapshot["elapsed_s"] = round(time.time() - started, 1)
         if not isinstance(usage_result, dict):
-            snapshot["account_usage_error"] = usage_response.get("error") or "timeout"
+            snapshot["account_usage_error"] = _rpc_failure_reason(usage_response.get("error") or "timeout")
         if not isinstance(rate_result, dict):
-            snapshot["rate_limits_error"] = rate_response.get("error") or "timeout"
+            snapshot["refresh"] = {
+                "ok": False,
+                "reason": _rpc_failure_reason(rate_response.get("error") or "timeout"),
+            }
         return snapshot
     finally:
         try:
@@ -419,10 +434,6 @@ def main() -> int:
         result = _latest_rate_limits(args.max_files)
     else:
         result = _read_app_server(args.timeout)
-        if not result.get("ok"):
-            fallback = _latest_rate_limits(args.max_files)
-            fallback["app_server"] = result
-            result = fallback
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("ok") else 1
 

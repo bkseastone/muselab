@@ -30,7 +30,7 @@ def test_native_and_docker_cli_pins_match_bundled_cli():
     assert native_pin == docker_pin == bundled_cli_version
 
 
-def test_gateway_docs_share_the_installed_sdk_cli_baseline():
+def test_gateway_docs_distinguish_pins_from_dated_live_baseline():
     english = (ROOT / "docs" / "codex-gateway.md").read_text(encoding="utf-8")
     chinese = (ROOT / "docs" / "codex-gateway_zh.md").read_text(encoding="utf-8")
 
@@ -48,4 +48,12 @@ def test_gateway_docs_share_the_installed_sdk_cli_baseline():
     ).groups()
 
     assert english_baseline == chinese_baseline
-    assert english_baseline[2:] == (sdk_version, bundled_cli_version)
+    en_pin = _required_match(
+        r"Pinned runtime: Claude Agent SDK `([^`]+)`, bundled Claude CLI `([^`]+)`",
+        english, "docs/codex-gateway.md",
+    ).groups()
+    zh_pin = _required_match(
+        r"当前固定运行时：Claude Agent SDK `([^`]+)`，内置 Claude CLI `([^`]+)`",
+        chinese, "docs/codex-gateway_zh.md",
+    ).groups()
+    assert en_pin == zh_pin == (sdk_version, bundled_cli_version)

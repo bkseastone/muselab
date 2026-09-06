@@ -9,7 +9,6 @@ chat composition root.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 import inspect
@@ -17,6 +16,8 @@ import sys
 from typing import Any, Callable, Collection, Iterable
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeSDKError
+
+from .runtime_buffer import RuntimeBufferExceeded, RuntimeMessageDeque, RuntimeMessageQueue
 
 
 ClientKey = tuple[str, str, str, str]
@@ -337,7 +338,7 @@ class SessionStream:
         self.client = client
         self._turn: asyncio.Queue | None = None
         self._background: asyncio.Queue | None = None
-        self._orphans: deque = deque(maxlen=self._ORPHAN_MAX)
+        self._orphans = RuntimeMessageDeque(maxlen=self._ORPHAN_MAX, lane="orphan")
         self._closed = False
         self._failure: Exception | None = None
         self.task: asyncio.Task = asyncio.create_task(self._pump())
@@ -347,7 +348,7 @@ class SessionStream:
             queue.put_nowait(self._orphans.popleft())
 
     def attach_turn(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = RuntimeMessageQueue(lane="turn", eof=STREAM_EOF)
         self._turn = queue
         return queue
 
@@ -363,17 +364,35 @@ class SessionStream:
                 break
             if message is STREAM_EOF:
                 continue
-            self._orphans.append(message)
+            self._park_message(message)
 
     def park_messages(self, messages: Iterable[Any]) -> None:
         """Return side-delivery messages to the background/orphan lane."""
         for message in messages:
             if message is STREAM_EOF:
                 continue
+            self._park_message(message)
+
+    def _park_message(self, message: Any) -> None:
+        try:
             self._orphans.append(message)
+        except RuntimeBufferExceeded as exc:
+            self._failure = exc
+            self._closed = True
+            for queue in (self._turn, self._background):
+                if queue is not None:
+                    queue.put_nowait(STREAM_EOF)
+            if not self.task.done():
+                self.task.cancel()
+            # A task cancelled before its first tick never runs finally.
+            # Always retain a cleanup owner; disconnect joining deduplicates
+            # it with a pump that has already entered its own finally block.
+            cleanup = asyncio.create_task(_require_hooks().evict_failed_session_stream(self))
+            _require_hooks().retain_detached_cleanup(cleanup)
+            raise
 
     def attach_background(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = RuntimeMessageQueue(lane="background", eof=STREAM_EOF)
         self._background = queue
         self._adopt_orphans(queue)
         return queue
@@ -460,18 +479,43 @@ def stream_for(client: ClaudeSDKClient) -> SessionStream | None:
 
 
 async def evict_failed_session_stream(stream: SessionStream) -> None:
+    """Retain one exact-client cleanup owner across racing pump/park failures."""
+    task = getattr(stream, "_failure_cleanup_task", None)
+    if task is None:
+        task = asyncio.create_task(_evict_failed_session_stream_owned(stream))
+        stream._failure_cleanup_task = task
+        retain = getattr(_require_hooks(), "retain_detached_cleanup", None)
+        if callable(retain):
+            retain(task)
+    await asyncio.shield(task)
+
+
+async def _evict_failed_session_stream_owned(stream: SessionStream) -> None:
     key = stream.key
     client = stream.client
+    notify_disconnected = False
     async with CLIENT_LOCK:
         if CLIENTS.get(key) is client:
             CLIENTS.pop(key, None)
+            notify_disconnected = not any(candidate[0] == key[0] for candidate in CLIENTS)
             CLIENT_PERMISSION.pop(key, None)
             CLIENT_PLAN_RETURN.pop(key, None)
             if key in CLIENT_LRU:
                 CLIENT_LRU.remove(key)
         if SESSION_STREAMS.get(key) is stream:
             SESSION_STREAMS.pop(key, None)
-    _require_hooks().session_runtime_disconnected(key[0])
+    if notify_disconnected:
+        _require_hooks().session_runtime_disconnected(key[0])
+    if isinstance(stream._failure, RuntimeBufferExceeded):
+        interrupt = getattr(client, "interrupt", None)
+        if callable(interrupt):
+            try:
+                # SDK control responses are handled below receive_messages(),
+                # so this does not require draining the overflowing app queue.
+                await asyncio.wait_for(interrupt(), timeout=2.0)
+            except (asyncio.CancelledError, Exception):
+                # Disconnect remains mandatory even if interruption fails.
+                pass
     try:
         if not await _require_hooks().join_session_disconnects(key[0], (client,)):
             raise RuntimeCleanupTimeout(
