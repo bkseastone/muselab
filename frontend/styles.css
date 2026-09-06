@@ -1787,32 +1787,9 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   display: flex; flex-direction: column;
   overflow: hidden;
   container-type: inline-size;
-  /* Position context for the absolutely-positioned PTR indicator —
-     it floats above the list without taking layout space. */
   position: relative;
 }
 
-/* Pull-to-refresh indicator — injected by _attachPTR(). Sits absolutely
-   at the top of the scroll container, slides DOWN as the user pulls.
-   opacity controlled by JS based on pull distance. */
-.ptr-indicator {
-  position: absolute; top: -50px; left: 0; right: 0;
-  height: 50px;
-  display: flex; align-items: center; justify-content: center; gap: var(--sp-2);
-  font-size: var(--fs-sm); color: var(--c-fg-2);
-  background: transparent;
-  pointer-events: none;
-  opacity: 0;
-  transition: transform var(--t-base) ease, opacity var(--t-base) ease;
-  z-index: 3;
-}
-.ptr-indicator .ptr-icon {
-  font-size: var(--fs-lg); display: inline-block;
-  transition: transform var(--t-base) ease;
-}
-.ptr-indicator.ptr-spinning .ptr-icon {
-  animation: ptr-spin 0.9s linear infinite;
-}
 @keyframes ptr-spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
@@ -6546,10 +6523,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ctx-meter.danger .ctx-meter-fill { background: var(--c-danger); }
 .ctx-meter.warn .ctx-meter-label { color: var(--c-warn); }
 .ctx-meter.danger .ctx-meter-label { color: var(--c-danger); font-weight: var(--fw-semibold); }
-/* Context breakdown popup — anchored top-right of viewport, fixed so it
-   floats over any pane. Shows SDK get_context_usage() per-category data. */
+/* Context breakdown follows the composer ring via the anchored-popup controller. */
 .ctx-breakdown-pop {
-  position: fixed; top: 56px; right: 12px;
+  position: fixed;
   width: 340px; max-width: calc(100vw - 24px);
   background: var(--c-bg-0);
   border: 1px solid var(--c-border);
@@ -12558,7 +12534,6 @@ html[data-theme="eyecare"] .tool-error-hint {
 .memory-empty-guide { padding:20px; border:1px dashed var(--c-border); border-radius:var(--r-md); margin:16px 0; }
 .memory-source summary { cursor:pointer; }
 .memory-source > span { display:block; overflow-wrap:anywhere; margin-top:6px; }
-@media (max-width:720px) { .workbench-more-actions { position:fixed; top:110px; right:12px; max-width:calc(100vw - 24px); } }
 
 .html-annotation-panel { flex-shrink:0; padding:10px 14px; background:var(--c-bg-2); border-bottom:1px solid var(--c-border); font-size:var(--fs-sm); }
 .html-annotation-head { display:flex; align-items:center; gap:12px; justify-content:space-between; }

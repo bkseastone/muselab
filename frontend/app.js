@@ -1752,6 +1752,7 @@ function portal() {
       this._initArtifacts();
       this._initStreamSelectionGuard();
       this._initPreviewSelection();
+      this._initAnchoredPopups();
       const startBrowserMetrics = () => { void this.loadBrowserMetrics(); };
       if (window.requestIdleCallback) window.requestIdleCallback(startBrowserMetrics, {timeout:3000});
       else setTimeout(startBrowserMetrics, 1500);
@@ -2205,94 +2206,129 @@ function portal() {
       this._syncMobileKeyboardViewport();
     },
 
-    // Attach iOS-style pull-to-refresh to a scrollable element. Mobile
-    // only — skips immediately on devices with no touch (matchMedia
-    // `pointer: coarse` would also wrap iPad pencil; we gate on
-    // `hover: hover` instead, which is true for mouse / trackpad).
-    //
-    // Usage: <ul x-init="_attachPTR($el, () => reloadX())">. The
-    // helper inserts an indicator element above the scroller, listens
-    // to touchstart/move/end, applies a damped translateY while the
-    // user is pulling, and calls onRefresh() when released past 60px.
-    // Indicator stays visible during refresh, snaps back when the
-    // promise resolves (so the user sees progress).
+    // Keep small anchored surfaces attached as panes, fonts and the visible
+    // viewport change. Observers only watch surfaces that are currently open.
+    _initAnchoredPopups() {
+      if (this._anchoredPopupsBound) return;
+      this._anchoredPopupsBound = true;
+      const specs = [
+        [".workbench-more-actions", ".workbench-more > summary", () => !!document.querySelector(".workbench-more[open]"), { width: 230, align: "end" }],
+        ["#history-picker-pop", "#history-picker-trigger", () => this.sessionPickerOpen, { width: 320, maxHeight: 320 }],
+        [".tab-picker-pop", ".tab-picker-btn", () => this.editorTabPickerOpen, { width: 280, maxHeight: 320 }],
+        [".ctx-breakdown-pop", ".chat-toolbar-ring", () => this.ctxBreakdown.show, { width: 340, maxHeight: 520, align: "end", above: true }],
+      ];
+      let active = [], frame = 0;
+      const position = () => {
+        frame = 0;
+        for (const item of active) this._positionAnchoredPopup(...item);
+      };
+      const schedule = (event) => {
+        // Scrolling inside the popup must not move it or reset its scroll.
+        if (event?.type === "scroll" && event.target instanceof Node
+            && active.some(([, pop]) => pop.contains(event.target))) return;
+        if (active.length && !frame) frame = requestAnimationFrame(position);
+      };
+      const observer = window.ResizeObserver ? new ResizeObserver(schedule) : null;
+      const sync = () => this.$nextTick(() => {
+        observer?.disconnect();
+        active = [];
+        for (const [selector, anchorSelector, isOpen, options] of specs) {
+          const popup = document.querySelector(selector);
+          const anchor = document.querySelector(anchorSelector);
+          if (!isOpen() || !popup || !anchor || !popup.getClientRects().length) continue;
+          active.push([anchor, popup, options]);
+          observer?.observe(popup);
+          observer?.observe(anchor);
+          const pane = anchor.closest(".pane");
+          if (pane) observer?.observe(pane);
+        }
+        schedule();
+      });
+      for (const key of ["sessionPickerOpen", "editorTabPickerOpen", "ctxBreakdown.show", "mobileTab", "desktopFullPane"]) this.$watch(key, sync);
+      document.addEventListener("toggle", event => {
+        if (event.target.matches?.(".workbench-more")) sync();
+      }, true);
+      document.addEventListener("scroll", schedule, true);
+      window.addEventListener("resize", schedule);
+      window.visualViewport?.addEventListener("resize", schedule);
+      window.visualViewport?.addEventListener("scroll", schedule);
+      sync();
+    },
+    _positionAnchoredPopup(anchor, popup, options) {
+      if (!popup.isConnected || !anchor.isConnected || !popup.getClientRects().length) return;
+      const vv = window.visualViewport;
+      const pad = 8, gap = 6;
+      const pane = anchor.closest(".pane")?.getBoundingClientRect();
+      // Panes clip their descendants, and mobile navigation sits outside them.
+      // Fit within both the visual viewport and the owning pane's visible area.
+      const minX = Math.max(vv?.offsetLeft || 0, pane?.left || 0) + pad;
+      const minY = Math.max(vv?.offsetTop || 0, pane?.top || 0) + pad;
+      const right = Math.min((vv?.offsetLeft || 0) + (vv?.width || window.innerWidth), pane?.right ?? Infinity) - pad;
+      const bottom = Math.min((vv?.offsetTop || 0) + (vv?.height || window.innerHeight), pane?.bottom ?? Infinity) - pad;
+      const a = anchor.getBoundingClientRect();
+      if (!a.width || !a.height || a.bottom < minY || a.top > bottom || a.right < minX || a.left > right) {
+        popup.style.visibility = "hidden";
+        return;
+      }
+      Object.assign(popup.style, {
+        position: "fixed", top: "0px", left: "0px", right: "auto", bottom: "auto",
+        transform: "none", boxSizing: "border-box", overflowY: "auto",
+        width: `${Math.max(1, Math.min(options.width, right - minX))}px`,
+      });
+      // Measure content at its final width, retaining the current height limit
+      // so repositioning does not temporarily expand a scrolled menu and reset it.
+      const origin = popup.getBoundingClientRect();
+      const css = getComputedStyle(popup);
+      const borders = parseFloat(css.borderTopWidth) + parseFloat(css.borderBottomWidth);
+      const cap = Math.max(1, Math.min(options.maxHeight || 520, bottom - minY));
+      const wanted = Math.min(cap, Math.max(origin.height, popup.scrollHeight + borders));
+      const aboveRoom = Math.max(0, a.top - minY - gap);
+      const belowRoom = Math.max(0, bottom - a.bottom - gap);
+      const above = options.above
+        ? aboveRoom >= wanted || aboveRoom >= belowRoom
+        : belowRoom < wanted && aboveRoom > belowRoom;
+      popup.style.maxHeight = `${Math.max(1, Math.min(cap, above ? aboveRoom : belowRoom))}px`;
+      const rect = popup.getBoundingClientRect();
+      const x = Math.max(minX, Math.min(options.align === "end" ? a.right - rect.width : a.left, right - rect.width));
+      const y = Math.max(minY, Math.min(above ? a.top - gap - rect.height : a.bottom + gap, bottom - rect.height));
+      // A transformed containing block can offset fixed coordinates. Subtract
+      // its measured origin instead of adding safe-area offsets a second time.
+      popup.style.left = `${x - origin.left}px`;
+      popup.style.top = `${y - origin.top}px`;
+      popup.style.visibility = "visible";
+    },
+
+    // Attach iOS-style pull-to-refresh to the file tree.
+    // Pull-to-refresh shares reloadTree's loading state and refresh-button
+    // animation; it does not add a second status overlay above the file list.
     _attachPTR(el, onRefresh) {
       if (!el || typeof onRefresh !== "function") return;
       if (window.matchMedia && window.matchMedia("(hover: hover)").matches) return;
-      // Insert indicator just above the scroller (inside the same flex
-      // parent so layout doesn't shift). pointer-events:none — pulling
-      // the indicator itself shouldn't intercept the user's gesture.
-      const ind = document.createElement("div");
-      ind.className = "ptr-indicator";
-      ind.innerHTML = "<span class='ptr-icon'>↓</span><span class='ptr-text'></span>";
-      const txt = ind.querySelector(".ptr-text");
-      const icon = ind.querySelector(".ptr-icon");
-      el.parentElement.insertBefore(ind, el);
-      const THRESHOLD = 60;
+      const THRESHOLD = 120;
       let startY = 0, currentY = 0, pulling = false, refreshing = false;
-      const setLabel = (state) => {
-        const zh = this.lang === "zh";
-        if (state === "pull")    txt.textContent = zh ? "下拉刷新" : "Pull to refresh";
-        else if (state === "release") txt.textContent = zh ? "释放刷新" : "Release to refresh";
-        else if (state === "loading") txt.textContent = zh ? "刷新中…" : "Refreshing…";
-      };
       el.addEventListener("touchstart", (e) => {
-        if (refreshing) return;
-        if (el.scrollTop > 0) return;
-        startY = e.touches[0].clientY;
-        currentY = startY;
+        pulling = false;
+        if (refreshing || el.scrollTop > 0 || e.touches.length !== 1) return;
+        startY = currentY = e.touches[0].clientY;
         pulling = true;
       }, { passive: true });
       el.addEventListener("touchmove", (e) => {
         if (!pulling || refreshing) return;
+        if (e.touches.length !== 1 || el.scrollTop > 0) { pulling = false; return; }
         currentY = e.touches[0].clientY;
-        const dy = currentY - startY;
-        if (dy <= 0) {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-          return;
-        }
-        // Prevent page-level overscroll while the user is actively
-        // pulling — without this, iOS Safari bounces the whole page.
-        // Only block when we're genuinely pulling (dy > a few px).
-        if (dy > 4 && el.scrollTop === 0 && e.cancelable) e.preventDefault();
-        const damped = Math.min(dy * 0.5, 90);
-        ind.style.transform = `translateY(${damped}px)`;
-        ind.style.opacity = String(Math.min(1, damped / 40));
-        icon.style.transform = damped >= THRESHOLD ? "rotate(180deg)" : "";
-        setLabel(damped >= THRESHOLD ? "release" : "pull");
+        // Keep a downward pull at the top from bouncing the whole iOS page.
+        if (currentY - startY > 4 && e.cancelable) e.preventDefault();
       }, { passive: false });
       el.addEventListener("touchend", async () => {
         if (!pulling || refreshing) return;
         pulling = false;
-        const dy = currentY - startY;
-        if (dy * 0.5 >= THRESHOLD) {
-          refreshing = true;
-          ind.style.transform = `translateY(50px)`;
-          ind.style.opacity = "1";
-          icon.style.transform = "";
-          ind.classList.add("ptr-spinning");
-          setLabel("loading");
-          try { await onRefresh(); }
-          catch (e) { /* swallow — the refresh fn's own toast handles err */ }
-          finally {
-            ind.classList.remove("ptr-spinning");
-            ind.style.transform = "";
-            ind.style.opacity = "0";
-            refreshing = false;
-          }
-        } else {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-        }
+        if (currentY - startY < THRESHOLD) return;
+        refreshing = true;
+        try { await onRefresh(); }
+        catch (_) { /* reloadTree owns error feedback. */ }
+        finally { refreshing = false; }
       }, { passive: true });
-      el.addEventListener("touchcancel", () => {
-        pulling = false;
-        if (!refreshing) {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-        }
-      });
+      el.addEventListener("touchcancel", () => { pulling = false; });
     },
 
     async _openStartupActivityDeeplink() {
@@ -17206,12 +17242,8 @@ function portal() {
     historyRowClass(sid) {
       return { active: sid === this.currentId, open: this.openTabIds.includes(sid) };
     },
-    // The history picker popup escapes its container via position: fixed
-    // (the parent .chat-tabs has overflow-x: auto which forces overflow-y to
-    // also clip — an absolute-positioned popup gets cut off). We compute the
-    // viewport-anchored position from the 📁 button's bounding rect at click
-    // time so the popup floats just below it.
-    historyPickerStyle: "",
+    // The shared anchored-popup controller escapes overflow clipping and
+    // follows the history button when the viewport or pane geometry changes.
     sessionPickerSearch: "",
     // P2 (perf): the list is windowed to the recent ~100, so the picker's
     // client-side filter can no longer reach old sessions. Search goes to the
@@ -17331,18 +17363,6 @@ function portal() {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
       if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
-      const rect = btn ? btn.getBoundingClientRect() : null;
-      if (rect) {
-        const popW = Math.min(320, window.innerWidth - 16);
-        // Right-align under the button, but stay inside the viewport edges.
-        let left = Math.round(rect.right - popW);
-        if (left < 8) left = 8;
-        const top = Math.round(rect.bottom + 4);
-        this.historyPickerStyle =
-          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
-      } else {
-        this.historyPickerStyle = "";
-      }
       this.sessionPickerOpen = true;
       this.pickerGroupExpanded = {};  // reset collapse state on each open
       this._openFocusSurface(
@@ -17368,25 +17388,9 @@ function portal() {
       }
       this.openTab(sid);
     },
-    // Open-tabs quick picker for the file editor tab bar. Computes a fixed
-    // position from the button rect (same trick as toggleHistoryPicker) so the
-    // dropdown escapes the .tab-bar overflow: auto clip.
+    // The open-tabs picker uses the same anchored-popup controller as history.
     toggleEditorTabPicker(ev) {
       if (this.editorTabPickerOpen) { this.editorTabPickerOpen = false; return; }
-      const btn = ev && ev.currentTarget;
-      const rect = btn ? btn.getBoundingClientRect() : null;
-      if (rect) {
-        const popW = Math.min(280, window.innerWidth - 16);
-        // Left-align under the button, but stay inside the viewport edges.
-        let left = Math.round(rect.left);
-        if (left + popW > window.innerWidth - 8) left = window.innerWidth - 8 - popW;
-        if (left < 8) left = 8;
-        const top = Math.round(rect.bottom + 4);
-        this.editorTabPickerStyle =
-          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
-      } else {
-        this.editorTabPickerStyle = "";
-      }
       this.editorTabPickerOpen = true;
     },
     pickEditorTab(path) {

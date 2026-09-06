@@ -500,6 +500,7 @@
             <button class="root-action" type="button"
                     @click.stop="reloadTree()"
                     :disabled="treeLoading"
+                    :aria-busy="treeLoading"
                     :title="t('btn.refresh')"
                     aria-label="Refresh file tree">
               <svg :class="{ spinning: treeLoading }" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-refresh"/></svg>
@@ -888,7 +889,6 @@
           </button>
           <div x-show="editorTabPickerOpen" x-transition.opacity.duration.150ms
                class="session-picker-pop tab-picker-pop"
-               :style="editorTabPickerStyle"
                role="listbox">
             <template x-for="term in terminals" :key="'terminal-'+term.id">
               <div class="session-picker-row"
@@ -1705,7 +1705,6 @@
           <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
                id="history-picker-pop"
                class="session-picker-pop"
-               :style="historyPickerStyle"
                role="dialog"
                :aria-label="lang==='zh' ? '历史会话选择器' : 'Session history picker'"
                @keydown.escape="if (!_isImeComposingEvent($event)) { $event.stopPropagation(); $event.preventDefault(); closeHistoryPicker(); }">

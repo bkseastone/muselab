@@ -44,3 +44,5 @@ Only numeric diagnostics remain in this page's memory; conversation text, file p
 Stream queue status comes from the service and shows depth, estimated bytes, oldest-event wait and overflows since service startup. Older services explicitly report unavailable metrics.
 
 Codex quota refresh reads the account authenticated on the MuseLab host. Sign in with `codex login` on that host if authentication is missing or expired. A Gateway login does not establish a local Codex login. Refresh failures stay visible; historical snapshots retain their original timestamp and are marked as historical, never as current remaining quota. The refresh button waits for both usage and quota requests.
+
+Small popups (More tools, session history, open file tabs and context breakdown) follow their trigger as the pane or visible viewport changes. They stay inside the pane and above mobile navigation, flip when space is limited, and scroll when necessary. Pulling down on the file tree refreshes it using the existing refresh-button spinner; no separate status strip is displayed.
