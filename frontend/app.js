@@ -1100,6 +1100,8 @@ function portal() {
     // RPCs and falls back to local JSONL; neither path reads OAuth credentials
     // or sends a model request. The Gateway may use a different account.
     codexLimit: { windows: {}, updated_at: 0, ok: false },
+    codexLimitLoading: false,
+    codexLimitError: "",
     codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
@@ -7263,14 +7265,22 @@ function portal() {
     },
 
     async fetchCodexRateLimit(opts = {}) {
+      if (this.codexLimitLoading) return;
+      this.codexLimitLoading = true;
+      this.codexLimitError = "";
       try {
         const qs = opts.refresh ? "?refresh=1" : "";
         const r = await fetch(`/api/chat/codex-rate-limit${qs}`, {
           headers: this.hdr(),
           cache: "no-store",
+          signal: AbortSignal.timeout(35000),
         });
-        if (r.ok) {
-          const d = await r.json();
+        if (!r.ok) throw new Error("quota_http_failed");
+        const d = await r.json();
+        // Keep the newest known snapshot after a failed refresh. Session logs
+        // may predate a previous successful account read in this browser.
+        const failed = d.refresh?.ok === false || !d.ok;
+        if (!failed || (d.updated_at || 0) > (this.codexLimit.updated_at || 0)) {
           this.codexLimit = {
             ...d,
             windows: d.windows || {},
@@ -7278,11 +7288,33 @@ function portal() {
             ok: !!d.ok,
             provider_authoritative: !!d.provider_authoritative,
           };
-          this.codexBadge = this.codexLimit.provider_authoritative
-            ? this.limitBadgeFromWindows(this.codexLimit.windows)
-            : null;
         }
-      } catch {}
+        if (failed) {
+          this.codexLimit.stale = true;
+          this.codexLimit.account_authoritative = false;
+          this.codexLimitError = d.refresh?.reason || d.reason || "codex_account_rpc_failed";
+        }
+        this.codexBadge = !failed && !this.codexLimit.stale && this.codexLimit.provider_authoritative
+          ? this.limitBadgeFromWindows(this.codexLimit.windows)
+          : null;
+      } catch {
+        this.codexLimitError = "codex_quota_network_failed";
+        this.codexLimit.stale = true;
+        this.codexLimit.account_authoritative = false;
+        this.codexBadge = null;
+      } finally {
+        this.codexLimitLoading = false;
+      }
+    },
+    codexLimitStatusText() {
+      if (this.codexLimitLoading) return this.t("set.cost.codex_quota_loading");
+      const keys = {
+        codex_auth_required: "set.cost.codex_quota_auth",
+        codex_not_found: "set.cost.codex_quota_cli_missing",
+        codex_account_rpc_unsupported: "set.cost.codex_quota_unsupported",
+      };
+      if (this.codexLimitError) return this.t(keys[this.codexLimitError] || "set.cost.codex_quota_failed");
+      return "";
     },
 
     // Pull the current Pro/Max rate-limit snapshot. SSE pushes live deltas
@@ -21429,7 +21461,7 @@ function portal() {
       if (this.cost.loading) return;
       if (this.cost.data && !force) return;
       this.cost.loading = true;
-      this.fetchCodexRateLimit({ refresh: true });
+      const quotaRefresh = this.fetchCodexRateLimit({ refresh: true });
       try {
         // Browser timezone offset is -getTimezoneOffset (JS reports east as
         // negative, server expects east-positive minutes).
@@ -21449,6 +21481,7 @@ function portal() {
       } catch (e) {
         this.cost.data = null;
       } finally {
+        await quotaRefresh;
         this.cost.loading = false;
       }
     },

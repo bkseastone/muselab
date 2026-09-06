@@ -113,7 +113,10 @@ def test_delivery_artifact_evidence_diff_and_guarded_preview(
         ],
     )
     _app_eval(page, "await app.loadSession(arg);", sid)
-    page.locator(".task-delivery-trigger").click()
+    page.locator(".workbench-more > summary").click()
+    page.locator(".workbench-more .task-delivery-trigger").click()
+    expect(page.locator(".workbench-more")).not_to_have_attribute("open", "")
+    assert page.locator(".task-delivery-trigger use").get_attribute("href") != page.locator(".session-todo-btn use").get_attribute("href")
     panel = page.locator(".task-delivery-panel")
     expect(panel).to_be_visible()
     assert panel.evaluate("el => getComputedStyle(el).backgroundColor") == page.evaluate(
@@ -129,25 +132,20 @@ def test_delivery_artifact_evidence_diff_and_guarded_preview(
     expect(page.locator(f'.msg[data-uuid="{mid}"]')).to_have_class(
         __import__("re").compile(r"msg-highlight")
     )
-    page.locator(".task-delivery-trigger").click()
+    page.locator(".workbench-more > summary").click()
+    page.locator(".workbench-more .task-delivery-trigger").click()
     panel.get_by_role("button", name="result.txt", exact=True).click()
     expect(panel).not_to_be_visible()
     page.wait_for_function(
         "() => document.querySelector('#app')._x_dataStack[0].selected === 'result.txt'"
     )
-    expect(page.locator(".preview-runtime-source")).to_contain_text("File service")
-    expect(page.locator(".preview-runtime-source")).to_have_attribute(
-        "title", __import__("re").compile(__import__("re").escape(str(root)))
-    )
+    expect(page.locator(".preview-runtime-source")).to_have_count(0)
     page.locator(".terminal-manager-btn").click()
     page.locator(".terminal-create-btn").click()
     page.wait_for_function(
         "() => document.querySelector('#app')._x_dataStack[0].activeTerminal()?.status === 'running'"
     )
-    expect(page.locator(".preview-runtime-source")).to_contain_text("Terminal process")
-    expect(page.locator(".preview-runtime-source")).to_have_attribute(
-        "title", __import__("re").compile(__import__("re").escape(str(root)))
-    )
+    expect(page.locator(".preview-runtime-source")).to_have_count(0)
     terminal = _app_eval(page, "return app.activeTerminal();")
     assert terminal["cwd"] == str(root)
     # Close the fixture shell via its authenticated API; it ran no command.
@@ -155,7 +153,8 @@ def test_delivery_artifact_evidence_diff_and_guarded_preview(
         f"{backend_url}/api/terminals/{terminal['id']}",
         headers={"X-Auth-Token": auth_token, "X-Workspace": str(root)},
     )
-    page.locator(".task-delivery-trigger").click()
+    page.locator(".workbench-more > summary").click()
+    page.locator(".workbench-more .task-delivery-trigger").click()
     panel.get_by_role("button", name="Preview restore scope", exact=True).click()
     preview = panel.locator(".delivery-restore-preview")
     expect(preview).to_contain_text("result.txt")

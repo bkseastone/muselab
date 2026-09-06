@@ -9679,6 +9679,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
+.codex-quota-stale { color: var(--c-warn); }
 .codex-quota-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -9824,7 +9825,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   align-items: flex-end;
   gap: 3px;
   height: 130px;
-  padding: 0 4px;
+  /* Keep centered date labels within the chart on narrow screens. */
+  padding: 0 16px;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);

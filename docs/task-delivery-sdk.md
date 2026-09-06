@@ -2,7 +2,7 @@
 
 [中文](task-delivery-sdk_zh.md)
 
-Open **Task delivery and environment** beside Activity in the chat toolbar.
+Open **More tools → Task delivery and environment** in the chat toolbar (package icon).
 Choose a task to inspect its observed files, executed commands, message evidence,
 Git changes and file checkpoints. The panel is useful in non-Git workspaces too.
 
@@ -26,9 +26,8 @@ Git changes and file checkpoints. The panel is useful in non-Git workspaces too.
 
 The environment panel shows the registered workspace, branch/worktree, dirty
 state, backend and host. The service origin is the authenticated browser origin.
-Preview and terminal labels use their own workspace, which can differ from the
-current chat. A terminal label identifies its process workspace; it does not
-claim that the shell runs through the model backend. Automatic Git probes cache
+The preview header has no persistent service-identity label. Inspect session
+environment details in this panel; a terminal may use a different workspace. Automatic Git probes cache
 for five seconds; opening or refreshing the delivery panel refreshes identity.
 Git probes are read-only, have a two-second timeout per command and bounded
 output, and disable filesystem-monitor commands from Git configuration.

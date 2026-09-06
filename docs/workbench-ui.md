@@ -12,7 +12,7 @@ Conversation defaults and API keys use the footer Save button. Provider editors,
 
 ## File and conversation controls
 
-More tools in the conversation header contains Skills, MCP, image generation, scheduled tasks and Reload. The command palette retains its shortcut and search entry.
+More tools in the conversation header contains Task delivery and environment, Skills, MCP, image generation, scheduled tasks and Reload. The command palette retains its shortcut and search entry.
 
 The empty preview offers search, creation and upload actions. On desktop, Hide preview focuses the conversation. Existing layout preferences are preserved across startup.
 
@@ -42,3 +42,5 @@ The observer loads during browser idle time and the panel reports its actual sta
 Only numeric diagnostics remain in this page's memory; conversation text, file paths and request URLs are not uploaded. Refresh resets them. Device, tab visibility and network conditions affect results; these are not direct measurements of model latency.
 
 Stream queue status comes from the service and shows depth, estimated bytes, oldest-event wait and overflows since service startup. Older services explicitly report unavailable metrics.
+
+Codex quota refresh reads the account authenticated on the MuseLab host. Sign in with `codex login` on that host if authentication is missing or expired. A Gateway login does not establish a local Codex login. Refresh failures stay visible; historical snapshots retain their original timestamp and are marked as historical, never as current remaining quota. The refresh button waits for both usage and quota requests.

@@ -26,11 +26,9 @@
 .delivery-restore-button{font-weight:600}
 .task-runtime-strip{font-size:11px;color:var(--c-fg-3);padding:4px 12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-height:22px;box-sizing:border-box}
 .task-runtime-strip button{font:inherit;color:inherit;border:0;padding:0;background:transparent;cursor:pointer}
-.preview-runtime-source{font-size:10px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--c-fg-3)}
 @media(max-width:600px){.task-delivery-panel{padding:14px}
 .task-delivery-panel>header{top:-14px}
 .delivery-environment dl{grid-template-columns:85px minmax(0,1fr)}
 .delivery-command>div{flex-wrap:wrap}
-.preview-runtime-source{max-width:100px}
 }
 

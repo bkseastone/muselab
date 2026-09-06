@@ -3,9 +3,6 @@ window.museTaskDelivery = function () {
   return {
     taskDelivery: { show: false, loading: false, sid: "", selectedTurn: "", data: null, error: "", preview: null, restoring: false, confirmation: false, seq: 0 },
     runtimeIdentity: null,
-    deliverySurfaceIdentity: null,
-    _deliverySurfaceKey: "",
-    _deliverySurfaceSeq: 0,
     _taskRuntimeSeq: 0,
     async fetchTaskRuntime(sid) {
       const seq = ++this._taskRuntimeSeq;
@@ -13,23 +10,6 @@ window.museTaskDelivery = function () {
       if (!sid || !this.authed || this.workspaceSwitching) return;
       const result = await this.api(`/api/chat/sessions/${encodeURIComponent(sid)}/runtime`);
       if (seq === this._taskRuntimeSeq && sid === this.currentId && result.ok) this.runtimeIdentity = result.data;
-    },
-    async fetchDeliverySurfaceIdentity(surface, cwd) {
-      const sid = this.currentId;
-      const key = [sid, surface, cwd, this.authed, this.workspaceSwitching].join("|");
-      if (key === this._deliverySurfaceKey) return;
-      this._deliverySurfaceKey = key;
-      const seq = ++this._deliverySurfaceSeq;
-      this.deliverySurfaceIdentity = null;
-      if (!sid || !cwd || !this.authed || this.workspaceSwitching) return;
-      const result = await this.api(`/api/chat/sessions/${encodeURIComponent(sid)}/runtime`, { query: { workspace: cwd } });
-      if (seq === this._deliverySurfaceSeq && result.ok) this.deliverySurfaceIdentity = { ...result.data, surface };
-    },
-    deliverySurfaceLabel() {
-      const r = this.deliverySurfaceIdentity;
-      const source = this.previewSurface === "terminal" ? (this.lang === "zh" ? "终端进程" : "Terminal process") : (this.lang === "zh" ? "文件服务" : "File service");
-      if (!r || r.surface !== this.previewSurface) return source;
-      return [source, r.workspace.split("/").filter(Boolean).pop(), r.branch, r.is_worktree ? "worktree" : "", r.dirty === true ? (this.lang === "zh" ? "有修改" : "modified") : ""].filter(Boolean).join(" · ");
     },
     deliveryError(error, fallback) {
       if (typeof error === "string") return this.deliveryLabel(error);
@@ -60,7 +40,6 @@ window.museTaskDelivery = function () {
       state.data = result.data;
       if (sid === this.currentId) {
         this.runtimeIdentity = result.data.runtime;
-        if (this.deliverySurfaceIdentity?.workspace === result.data.runtime.workspace) this.deliverySurfaceIdentity = { ...result.data.runtime, backend: "MuseLab workspace service", surface: this.previewSurface };
       }
     },
     closeTaskDelivery() {

@@ -9328,9 +9328,11 @@ def codex_rate_limit(refresh: bool = Query(default=False)) -> dict:
         if refreshed.get("ok"):
             return refreshed
         fallback = _latest_codex_rate_limits()
-        fallback["refresh"] = refreshed
+        fallback["stale"] = True
+        fallback["account_authoritative"] = False
+        fallback["refresh"] = {"ok": False, "reason": refreshed.get("reason", "codex_account_rpc_failed")}
         return fallback
-    return _latest_codex_rate_limits()
+    return {**_latest_codex_rate_limits(), "stale": True, "account_authoritative": False}
 
 
 @router.get("/usage", dependencies=[Depends(require_token)])

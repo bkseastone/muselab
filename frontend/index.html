@@ -731,9 +731,6 @@
         <!-- Preview zoom (browser-like −/percentage/+). Shown only for the
              zoomable modes (md/text/img/xlsx/csv/html); pdf has native zoom.
              Click the percentage to reset to 100%. -->
-        <span class="preview-runtime-source" x-effect="fetchDeliverySurfaceIdentity(previewSurface, previewSurface==='terminal' ? activeTerminal()?.cwd : fileWorkspacePath())"
-          :title="deliverySurfaceIdentity ? [deliverySurfaceIdentity.workspace, deliverySurfaceIdentity.host, deliverySurfaceIdentity.backend].join(' · ') : (previewSurface==='terminal' ? activeTerminal()?.cwd : fileWorkspacePath())"
-          x-text="deliverySurfaceLabel()"></span>
         <div class="preview-zoom" x-show="previewSurface==='file' && previewZoomable()">
           <button class="preview-zoom-btn" @click="zoomPreviewOut()"
                   :disabled="previewZoom <= PREVIEW_ZOOM_MIN"
@@ -1419,11 +1416,6 @@
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
         </button>
-        <button class="task-delivery-trigger icon-btn" type="button" @click="openTaskDelivery()"
-                :disabled="!currentId" :aria-label="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'"
-                :title="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'">
-          <svg><use href="#i-check-circle"/></svg>
-        </button>
         <button class="session-todo-btn icon-btn" type="button"
                 @click="toggleSessionTodoBoard()"
                 :class="{ active: sessionTodoOpen, 'has-active': sessionTodoCount(false) }"
@@ -1487,6 +1479,12 @@
           <summary class="icon-btn" :title="lang==='zh'?'更多工具':'More tools'"
                    :aria-label="lang==='zh'?'更多工具':'More tools'">•••</summary>
           <div class="workbench-more-actions" @click="if ($event.target.closest('button')) $el.closest('details').removeAttribute('open')">
+        <button class="task-delivery-trigger icon-btn" type="button" @click="openTaskDelivery()"
+                :disabled="!currentId" :aria-label="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'"
+                :title="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'">
+          <svg><use href="#i-package"/></svg>
+          <span class="workbench-action-label" x-text="lang==='zh' ? '任务交付与环境' : 'Task delivery and environment'"></span>
+        </button>
         <button @click="toggleSkillsDrawer()" class="icon-btn"
                 :title="t('set.skills.drawer_open')"
                 aria-label="Open skills list">
@@ -5271,12 +5269,16 @@
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
           </template>
-          <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at">
+          <div class="settings-hint codex-quota-status" role="status" aria-live="polite"
+               x-show="codexLimitStatusText()" x-text="codexLimitStatusText()"></div>
+          <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at"
+               :aria-busy="codexLimitLoading">
             <div class="codex-quota-head">
               <div class="codex-quota-title-group">
                 <div class="cost-block-title" x-text="t('set.cost.codex_quota')"></div>
                 <div class="codex-quota-source-row">
-                  <span x-text="t('set.cost.codex_quota_source')"></span>
+                  <span x-text="t(codexLimit.source === 'codex-app-server' ? 'set.cost.codex_quota_source' : 'set.cost.codex_quota_log_source')"></span>
+                  <span class="codex-quota-stale" x-show="codexLimit.stale" x-text="t('set.cost.codex_quota_stale')"></span>
                   <span x-show="codexLimitUpdatedText()"
                         x-text="t('set.cost.updated', { t: codexLimitUpdatedText() })"></span>
                 </div>
@@ -5294,7 +5296,7 @@
                   <div class="codex-quota-metric">
                     <span class="codex-quota-value"
                           x-text="w.remaining_percent == null ? '—' : w.remaining_percent + '%'"></span>
-                    <span class="codex-quota-metric-label" x-text="t('set.cost.remaining')"></span>
+                    <span class="codex-quota-metric-label" x-text="t(codexLimit.stale ? 'set.cost.codex_quota_previous_remaining' : 'set.cost.remaining')"></span>
                   </div>
                   <div class="codex-quota-track" role="progressbar"
                        :aria-label="codexWindowLabel(w)"
@@ -5324,7 +5326,7 @@
             <div class="codex-quota-footnote"
                  x-text="t('set.cost.codex_quota_footnote')"></div>
           </div>
-          <template x-if="codexLimit && !codexLimit.updated_at">
+          <template x-if="codexLimit && !codexLimit.updated_at && !codexLimitLoading && !codexLimitError">
             <div class="settings-hint" x-text="t('set.cost.codex_quota_empty')"></div>
           </template>
           <!-- Skeleton while the (uncached / cold) dashboard scan runs — the
