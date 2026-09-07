@@ -2251,6 +2251,9 @@ class _FakeWatchClient:
     def __init__(self, messages):
         self._messages = messages
 
+    async def disconnect(self):
+        pass
+
     async def receive_messages(self):
         for m in self._messages:
             yield m
@@ -2268,6 +2271,9 @@ class _BatchedWatchClient:
         self._batches = list(batches)
         self.queries = []
         self._receive_count = 0
+
+    async def disconnect(self):
+        pass
 
     async def query(self, prompt_or_gen):
         items = []
@@ -3186,6 +3192,9 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
     )
 
     class _PartialClient:
+        async def disconnect(self):
+            pass
+
         async def receive_messages(self):
             yield notification
             yield partial
@@ -4242,6 +4251,8 @@ def test_replay_corruption_is_typed_and_subscriber_resyncs_once(
     chat_mod = stream_env
     monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
     spool = chat_mod._ReplaySpool()
+    # Corrupt an accepted record, not bytes outside the committed replay prefix.
+    spool.append({"event": "done", "data": "{}"})
     spool.path.write_bytes(b'{"event":"done","data":7}\n')
     try:
         with pytest.raises(chat_mod._ReplayRecordCorruption):
@@ -6822,6 +6833,9 @@ def test_watcher_timeout_waits_for_terminal_stop_before_queue_drain(
             self.stop_calls = []
             self.stop_requested = asyncio.Event()
             self.release_terminal = asyncio.Event()
+
+        async def disconnect(self):
+            pass
 
         async def stop_task(self, requested):
             self.stop_calls.append(requested)

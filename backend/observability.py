@@ -204,7 +204,7 @@ def perf_event(event: str, /, **fields: Any) -> None:
         raise ValueError(
             "sensitive or invalid performance field(s): " + ", ".join(unsafe)
         )
-    payload: dict[str, Any] = {"event": event}
+    payload: dict[str, Any] = {"event": event, "at_ms": round(time.time() * 1000)}
     for name, value in fields.items():
         if value is not None:
             payload[name] = _safe_value(value)

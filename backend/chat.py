@@ -94,6 +94,7 @@ from .ask_user_question import (
 from . import permission_request as perm
 from . import memory_client as mem0
 from . import observability as obs
+from . import replay_io
 from .private_storage import (
     UnsafePrivatePath,
     ensure_private_directory,
@@ -680,6 +681,8 @@ class _ReplaySpool:
         self._bytes = 0
         self._closed = False
         self._usable = True
+        self._written_bytes = 0
+        self._io = replay_io.ReplayIO()
 
     def append(self, event: dict) -> None:
         if self._closed:
@@ -688,7 +691,17 @@ class _ReplaySpool:
             raise RuntimeError("replay spool is unusable")
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         blob = payload.encode("utf-8") + b"\n"
-        start = self._bytes
+        self._io.check()
+        if replay_io.in_event_loop():
+            self._io.submit(lambda: self._write_blob(blob), size=len(blob))
+        else:
+            self._io.flush()
+            self._write_blob(blob)
+        self._count += 1
+        self._bytes += len(blob)
+
+    def _write_blob(self, blob: bytes) -> None:
+        start = self._written_bytes
         written = 0
         try:
             while written < len(blob):
@@ -703,8 +716,10 @@ class _ReplaySpool:
             except OSError:
                 self._usable = False
             raise
-        self._count += 1
-        self._bytes += len(blob)
+        self._written_bytes += len(blob)
+
+    async def flush_async(self) -> None:
+        await self._io.flush_async()
 
     def size(self) -> int:
         """Bytes written so far. A subscriber records this at attach time to
@@ -714,13 +729,14 @@ class _ReplaySpool:
         return self._bytes
 
     def open_reader(self):
-        return self.path.open("rb")
+        return replay_io.ReplayReader(self.path, self._io, lambda: self._written_bytes)
 
     def __len__(self) -> int:
         return self._count
 
     def __iter__(self):
-        with self.open_reader() as reader:
+        self._io.flush()
+        with self.path.open("rb") as reader:
             for line in reader:
                 yield _decode_replay_record(line)
 
@@ -738,6 +754,15 @@ class _ReplaySpool:
         if self._closed:
             return
         self._closed = True
+        if replay_io.in_event_loop():
+            self._io.submit(self._close_file, cleanup=True)
+        else:
+            try:
+                self._io.flush()
+            finally:
+                self._close_file()
+
+    def _close_file(self):
         os.close(self._fd)
         with suppress(OSError):
             self.path.unlink()
@@ -783,6 +808,8 @@ class _TurnSubscriber:
         self._draining_live_barrier = False
         self._wake = asyncio.Event()
         self._done = False
+        self._pending_spool_read = None
+        self._replay_revision = 0
 
     async def get(self):
         while True:
@@ -798,6 +825,18 @@ class _TurnSubscriber:
                     "data": json.dumps(payload),
                 }
             if self._initial_events:
+                if self._replay is not None and hasattr(self._replay, "ready"):
+                    try:
+                        await self._replay.ready()
+                    except (OSError, RuntimeError):
+                        self.resync("replay_storage_error")
+                        self._initial_events.clear()
+                        continue
+                if self._resync_payload:
+                    continue
+                if self._replay is None:
+                    self._initial_events.clear()
+                    return None
                 event = dict(self._initial_events.popleft())
                 event.pop("_coalesced", None)
                 return event
@@ -828,7 +867,7 @@ class _TurnSubscriber:
                     continue
                 await self._wake.wait()
                 continue
-            event = self._next_spool_event()
+            event = await self._next_spool_event()
             if self._resync_payload:
                 continue
             if event is _LIVE_MESSAGE_BARRIER:
@@ -850,7 +889,7 @@ class _TurnSubscriber:
             self._wake.clear()
             # Close the clear/append race: publish() may have written between
             # the first EOF read and clear(). Recheck before sleeping.
-            event = self._next_spool_event()
+            event = await self._next_spool_event()
             if self._resync_payload:
                 continue
             if event is _LIVE_MESSAGE_BARRIER:
@@ -868,27 +907,52 @@ class _TurnSubscriber:
                 return None
             await self._wake.wait()
 
-    def _next_spool_event(self):
-        """Next spool line this subscriber should actually emit, or None when
-        the spool is exhausted. Drops coalesced text that this subscriber
-        already received as live deltas."""
+    async def _read_spool_record(self, reader):
+        revision = self._replay_revision
+        if hasattr(reader, "ready"):
+            await reader.ready()
+        def read():
+            offset = reader.tell()
+            line = reader.readline()
+            return offset, _decode_replay_record(line) if line else None
+        offset, event = await replay_io.read_io(read)
+        return revision, offset, event
+
+    async def _next_spool_event(self):
         while True:
-            offset = self._replay.tell()
-            line = self._replay.readline()
-            if not line:
+            reader = self._replay
+            if reader is None:
                 return None
+            if self._pending_spool_read is None:
+                self._pending_spool_read = asyncio.create_task(
+                    self._read_spool_record(reader))
+                # A disconnected subscriber may never consume a late disk failure.
+                self._pending_spool_read.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None)
+            task = self._pending_spool_read
             try:
-                event = _decode_replay_record(line)
+                # HTTP wait_for timeouts must not lose a record whose disk read
+                # continues. The next get() consumes this same completed read.
+                revision, offset, event = await asyncio.shield(task)
             except _ReplayRecordCorruption:
+                self._pending_spool_read = None
                 self.resync("replay_corrupt")
+                return None
+            except (OSError, RuntimeError, ValueError):
+                self._pending_spool_read = None
+                self.resync("replay_storage_error")
+                return None
+            self._pending_spool_read = None
+            if self._replay is not reader:
+                return None
+            if event is None:
+                # A publish/finish during the worker read invalidates EOF. In
+                # particular, never let mux inactivity overtake an accepted done.
+                if revision != self._replay_revision:
+                    continue
                 return None
             coalesced = event.pop("_coalesced", False)
             if coalesced and offset >= self._skip_from:
-                # Streamed to us live, token by token — emitting the coalesced
-                # form too would duplicate the whole message. Stop at its
-                # live-channel delimiter before reading a later tool/done row;
-                # otherwise a slow subscriber observes `done` before the text
-                # still queued for this exact segment.
                 return _LIVE_MESSAGE_BARRIER
             return event
 
@@ -897,6 +961,7 @@ class _TurnSubscriber:
 
     def publish(self, event: dict) -> bool:
         """Wake this subscriber for a newly-appended spool event."""
+        self._replay_revision += 1
         if self._done:
             return False
         self._wake.set()
@@ -937,6 +1002,7 @@ class _TurnSubscriber:
         self._wake.set()
 
     def close(self) -> None:
+        self._replay_revision += 1
         self._done = True
         self._wake.set()
 
@@ -1794,15 +1860,14 @@ _TASK_STOP_SETTLE_GRACE_S = max(
     0.1, env_float("MUSELAB_TASK_STOP_SETTLE_GRACE_S", 5.0))
 _TASK_TERMINATION_RETRY_S = max(
     0.1, env_float("MUSELAB_TASK_TERMINATION_RETRY_S", 5.0))
-# After the LAST in-flight task delivers its terminal notification, the CLI
-# auto-continues a short turn (model reacts to the result). The probe (§3.4)
-# measured it landing ~1.3s later, but it's not strictly guaranteed for every
-# task type / status. So once all tasks have settled and a continuation
-# broadcast is open, the watcher waits at most this long for the auto-continue's
-# AssistantMessage + ResultMessage before closing the continuation and
-# unpinning — bounding the worst case (no auto-continue ever comes) instead of
-# holding the client + the _active_turns slot for the full _TASK_WATCH_TIMEOUT.
+# Allow a short window for the CLI to START its automatic continuation before
+# nudging it once. This is not an inter-message timeout: thinking and foreground
+# tools in an already-started continuation routinely take longer than 8 seconds.
 _CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 8, min_value=2)
+# Once requested/started, use an absolute lease, including silent model/tool
+# execution. Expiry must terminate the owning runtime before admitting a turn.
+_CONTINUATION_TIMEOUT = env_int(
+    "MUSELAB_CONTINUATION_TIMEOUT", _TASK_WATCH_TIMEOUT, min_value=60)
 # Short grace for USER-STOPPED tasks: the CLI doesn't auto-continue after a
 # deliberate stop, so the watcher only needs a token window before closing
 # the continuation (frees the attached FE from an idle "streaming…" footer).
@@ -2626,6 +2691,16 @@ def _capability_from_model_item(item: Any, *, source: str) -> dict | None:
         "context_limit_source": source,
         "context_limit_is_estimate": False,
     }
+
+
+async def _post_turn_context_usage(client) -> dict:
+    """Finish promptly; warm an exact-client measurement for the next turn."""
+    if isinstance(client, MuseLabSDKClient):
+        cached = client.cached_context_usage(max_age_s=300)
+        client.warm_context_usage()
+        return cached or {}
+    # Keep the adapter seam for runtimes/tests without the owned probe API.
+    return await asyncio.wait_for(client.get_context_usage(), timeout=3.0)
 
 
 async def _detect_gateway_context_capability(model: str) -> dict | None:
@@ -4334,6 +4409,8 @@ async def shutdown_runtime() -> None:
     }.values()
     for broadcast in broadcasts:
         broadcast.close()
+    await asyncio.gather(*(broadcast.events.flush_async() for broadcast in broadcasts),
+                         return_exceptions=True)
     for delivery in scheduled_deliveries:
         if delivery.broadcast.activity_started:
             await _finish_activity(
@@ -14666,6 +14743,7 @@ async def _watch_inflight_tasks(
     subagent_mux = chat_subagents.SubagentStreamMux(session_id)
     watcher_failed = False
     watcher_cancelled = False
+    runtime_terminated = False
     # The continuation is a real assistant turn for display/accounting even
     # though it has no user bubble.  Keep the session's public model id on its
     # broadcast so live and persisted footers do not reload with a blank model.
@@ -14721,6 +14799,8 @@ async def _watch_inflight_tasks(
             # reaction starts. In that case the watcher explicitly nudges the
             # same SDK session once; this flag prevents an infinite retry loop.
             "explicit_resume_requested": False,
+            "started": False,
+            "wait_started_at": None,
             "incomplete_error": None,
         }
 
@@ -14760,11 +14840,12 @@ async def _watch_inflight_tasks(
     async def _close_continuation(
         cancelled: bool = False,
         duration_ms: int | None = None,
+        result: ResultMessage | None = None,
     ) -> None:
         """Emit a terminal `done`, finish the broadcast, drop it from
         _active_turns (identity-checked so we never pop a newer turn's slot),
         and grace-keep it for a slightly-late FE reconnect."""
-        nonlocal cont, cont_state
+        nonlocal cont, cont_state, watcher_failed, watcher_cancelled, watch_error_kind
         b = cont
         state = cont_state
         cont = None
@@ -14776,6 +14857,25 @@ async def _watch_inflight_tasks(
         # a streamed prefix is not a truthful completed Agent reply.
         cancelled = bool(cancelled or b.cancelled)
         incomplete_error = (state or {}).get("incomplete_error")
+        result_error = _sdk_result_error(result) if result is not None else None
+        error_message = str(
+            (result_error or {}).get("message") or incomplete_error or "")
+        error_class = (
+            _classify_stream_error(error_message) if result_error else
+            {"kind": "background_continuation_incomplete", "cta": "retry",
+             "retryable": True} if incomplete_error else {}
+        )
+        terminal_reason = sdk_lifecycle.normalize_terminal_reason(
+            getattr(result, "terminal_reason", None))
+        terminal_status = sdk_lifecycle.terminal_status(
+            terminal_reason, is_error=bool(error_message), cancelled=cancelled)
+        cancelled = terminal_status == "cancelled"
+        b.cancelled = cancelled
+        watcher_cancelled = watcher_cancelled or cancelled
+        watcher_failed = watcher_failed or terminal_status in {"failed", "stopped"}
+        if error_message:
+            watcher_failed = True
+            watch_error_kind = str(error_class.get("kind") or "unknown")
         completed_at_ms = int(time.time() * 1000)
         assistant_uuid = str((state or {}).get("assistant_uuid") or "")
         cont_elapsed = (
@@ -14783,15 +14883,10 @@ async def _watch_inflight_tasks(
             if duration_ms
             else round(max(0.0, time.time() - b.started_at), 1)
         )
-        terminal_status = (
-            "cancelled" if cancelled else
-            "failed" if incomplete_error else
-            "completed"
-        )
-        b.perf_status = terminal_status
+        b.perf_status = "failed" if terminal_status == "stopped" else terminal_status
         b.perf_error_kind = (
             "cancelled" if cancelled else
-            "background_continuation_incomplete" if incomplete_error else
+            str(error_class.get("kind") or "unknown") if error_message else
             "none"
         )
         b.perf_background_count = len(pending)
@@ -14805,13 +14900,17 @@ async def _watch_inflight_tasks(
             "completed_at_ms": completed_at_ms,
             "background_tasks_pending": len(pending),
         }
-        if incomplete_error:
+        done_payload.update({
+            "is_error": bool(error_message),
+            "status": terminal_status,
+            "terminal_reason": terminal_reason,
+        })
+        if error_message:
             done_payload.update({
-                "is_error": True,
-                "error": incomplete_error,
-                "kind": "background_continuation_incomplete",
-                "cta": "retry",
-                "retryable": True,
+                "error": error_message,
+                **error_class,
+                "result_subtype": getattr(result, "subtype", None),
+                "api_error_status": (result_error or {}).get("api_error_status"),
             })
         # AssistantMessage already supplied the exact persisted UUID. Commit its
         # footer before publishing done so an immediate refresh cannot beat the
@@ -14857,7 +14956,7 @@ async def _watch_inflight_tasks(
                 completed_at_ms=completed_at_ms,
                 elapsed_s=cont_elapsed,
                 terminal_status=terminal_status,
-                incomplete_error=str(incomplete_error or ""),
+                incomplete_error=error_message,
                 file_path=_runtime_continuation_outbox_path(
                     session_id, str(b.turn_id or "")),
             )
@@ -14873,8 +14972,9 @@ async def _watch_inflight_tasks(
         """Ask the existing SDK session to finish the originating request.
 
         Claude Code normally starts this turn itself after a completed
-        TaskNotification. A stream EOF or grace timeout before ResultMessage
-        means that auto-resume was missed. Send one metadata-only user record
+        TaskNotification. Only nudge a continuation that has not started;
+        silence during model/tool execution does not mean it was missed.
+        Send one metadata-only user record
         so it is available to the live model but excluded from normal
         transcript rendering/conversation counts by the SDK's `isMeta`
         semantics.
@@ -14882,6 +14982,7 @@ async def _watch_inflight_tasks(
         nonlocal watcher_failed, watch_error_kind
         if (pending or cont is None or cont_state is None
                 or last_settle_status == "stopped"
+                or cont_state["started"]
                 or cont_state["explicit_resume_requested"]):
             return False
         cont_state["explicit_resume_requested"] = True
@@ -14908,7 +15009,12 @@ async def _watch_inflight_tasks(
             sys.stderr.write(
                 f"[chat] task watcher: auto-continuation missing "
                 f"sid={session_id[:8]} ({reason}); requesting explicit resume\n")
-            await client.query(_meta_prompt())
+            waited = (
+                asyncio.get_running_loop().time() - cont_state["wait_started_at"]
+                if cont_state["wait_started_at"] is not None else 0.0)
+            await asyncio.wait_for(
+                client.query(_meta_prompt()),
+                timeout=max(0.001, _CONTINUATION_TIMEOUT - waited))
             return True
         except Exception as e:
             watcher_failed = True
@@ -14924,8 +15030,9 @@ async def _watch_inflight_tasks(
             return False
 
     def _mark_incomplete() -> None:
-        nonlocal watcher_failed
+        nonlocal watcher_failed, watch_error_kind
         watcher_failed = True
+        watch_error_kind = "background_continuation_incomplete"
         if cont_state is not None and not cont_state.get("incomplete_error"):
             cont_state["incomplete_error"] = (
                 "后台任务已经完成，但没有生成最终答复。请发送“继续”让 Muse "
@@ -14965,9 +15072,8 @@ async def _watch_inflight_tasks(
     # intent), so waiting the full _CONTINUATION_GRACE leaves the attached
     # frontend spinning "streaming…" after the card already flipped ⏹
     # (2026-06-11 footer complaint). Use a short grace
-    # for stopped settles; a reaction that somehow arrives later is not
-    # lost — it buffers in the SDK queue and the next turn's in-turn
-    # dispatch drains it.
+    # for stopped settles. Without a Result boundary, disconnect the runtime
+    # before releasing the reader; late reactions must never reach a new turn.
     last_settle_status: str | None = None
 
     async def _consume_timeout_terminal(msg: Any) -> bool:
@@ -15058,6 +15164,36 @@ async def _watch_inflight_tasks(
                 })
         last_settle_status = "stopped"
 
+    async def _terminate_runtime() -> None:
+        """Keep ownership until exact-client cleanup confirms process death.
+
+        This also applies after every task has settled: a missing Result can
+        leave the parent model/tools running, independently of task pins.
+        Disconnect attempts use the existing bounded TERM/KILL lifecycle and
+        sticky admission fence; failed attempts cannot open a queue window.
+        """
+        nonlocal runtime_terminated
+        attempt = 0
+        while not runtime_terminated and _owns_generation():
+            attempt += 1
+            try:
+                await _disconnect_background_task_owner(session_id, client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt == 1 or attempt % 6 == 0:
+                    sys.stderr.write(
+                        f"[chat] task watcher sid={session_id[:8]} "
+                        f"runtime termination pending attempt={attempt} "
+                        f"exc={type(exc).__name__}\n")
+                    sys.stderr.flush()
+                await asyncio.sleep(min(
+                    30.0, _TASK_TERMINATION_RETRY_S * attempt))
+                continue
+            runtime_terminated = True
+            if pending:
+                await _settle_after_confirmed_disconnect()
+
     async def _terminate_expired_tasks(reason: str) -> None:
         """Stop expired tasks without ever opening an unsafe queue window.
 
@@ -15131,7 +15267,7 @@ async def _watch_inflight_tasks(
                 continue
             if isinstance(msg, ResultMessage):
                 await _close_continuation(
-                    duration_ms=getattr(msg, "duration_ms", None))
+                    duration_ms=getattr(msg, "duration_ms", None), result=msg)
             elif cont is not None and cont_state is not None:
                 for event in _render_continuation_message(msg, cont_state):
                     cont.publish(event)
@@ -15139,30 +15275,7 @@ async def _watch_inflight_tasks(
         if not pending:
             return
 
-        # No terminal marker arrived.  Stop the entire owning runtime so a
-        # late command/result cannot cross into the queued user turn.  SDK
-        # disconnect already owns graceful -> TERM -> KILL escalation.  If it
-        # is still running at its bounded public deadline, keep this watcher
-        # and its pins alive and retry; never turn a timeout into an unpin.
-        attempt = 0
-        while pending and _owns_generation():
-            attempt += 1
-            try:
-                await _disconnect_background_task_owner(session_id, client)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if attempt == 1 or attempt % 6 == 0:
-                    sys.stderr.write(
-                        f"[chat] task watcher sid={session_id[:8]} "
-                        f"runtime termination pending attempt={attempt} "
-                        f"exc={type(exc).__name__}\n")
-                    sys.stderr.flush()
-                await asyncio.sleep(min(
-                    30.0, _TASK_TERMINATION_RETRY_S * attempt))
-                continue
-            await _settle_after_confirmed_disconnect()
-            return
+        await _terminate_runtime()
 
     try:
         async with asyncio.timeout(
@@ -15176,15 +15289,24 @@ async def _watch_inflight_tasks(
                     None if remaining is None else loop.time() + remaining)
 
             while True:
-                # Once every task has settled and we're only waiting on the
-                # auto-continue, cap the read so a task that produces no
-                # continuation can't pin the client for the full watch timeout.
                 read_to = None
-                if not pending and cont is not None:
-                    read_to = (_STOPPED_CONTINUATION_GRACE
-                               if last_settle_status == "stopped"
-                               else _CONTINUATION_GRACE)
+                if not pending and cont_state is not None:
+                    now = loop.time()
+                    if cont_state["wait_started_at"] is None:
+                        cont_state["wait_started_at"] = now
+                    elapsed = now - cont_state["wait_started_at"]
+                    lease = _CONTINUATION_TIMEOUT
+                    if not (cont_state["started"]
+                            or cont_state["explicit_resume_requested"]):
+                        lease = (_STOPPED_CONTINUATION_GRACE
+                                 if last_settle_status == "stopped"
+                                 else _CONTINUATION_GRACE)
+                    # Absolute lease, never refreshed by progress/heartbeat
+                    # messages. Started model/tool execution may be silent.
+                    read_to = lease - elapsed
                 try:
+                    if read_to is not None and read_to <= 0:
+                        raise asyncio.TimeoutError
                     msg = await _next_message(read_to)
                 except asyncio.TimeoutError:
                     if await _request_explicit_resume("continuation grace elapsed"):
@@ -15204,7 +15326,8 @@ async def _watch_inflight_tasks(
                         await _terminate_expired_tasks(
                             "message stream ended before task settlement")
                         break
-                    if await _request_explicit_resume("message stream ended"):
+                    if (bg_q is None
+                            and await _request_explicit_resume("message stream ended")):
                         _reopen_stream()
                         continue
                     if (not pending and cont is not None
@@ -15306,6 +15429,9 @@ async def _watch_inflight_tasks(
                         )
                     )
                     if accepted_start:
+                        if cont_state is not None:
+                            cont_state["started"] = True
+                            cont_state["wait_started_at"] = None
                         watched_task_ids.add(tid)
                         pending[tid] = desc
                         _pin_background_task(session_id, tid)
@@ -15372,11 +15498,18 @@ async def _watch_inflight_tasks(
                     # continuation. If tasks remain in flight, keep reading for
                     # their (later) notifications; otherwise we're done.
                     await _close_continuation(
-                        duration_ms=getattr(msg, "duration_ms", None))
+                        duration_ms=getattr(msg, "duration_ms", None), result=msg)
                     if not pending:
                         break
                 else:
                     if cont is not None and cont_state is not None:
+                        if isinstance(msg, (StreamEvent, AssistantMessage)) or (
+                            isinstance(msg, UserMessage)
+                            and isinstance(msg.content, list)
+                            and any(isinstance(block, ToolResultBlock)
+                                    for block in msg.content)
+                        ):
+                            cont_state["started"] = True
                         for ev in _render_continuation_message(msg, cont_state):
                             cont.publish(ev)
     except asyncio.CancelledError:
@@ -15399,6 +15532,14 @@ async def _watch_inflight_tasks(
             f"{type(e).__name__}; entering safe termination\n")
         await _terminate_expired_tasks("failed before task settlement")
     finally:
+        # An open collector has not received ResultMessage. Task settlement is
+        # not a parent-turn boundary: stop the exact runtime before releasing
+        # its reader, including EOF, stopped tasks, timeout and cancellation.
+        # A replacement generation already owns cleanup; never kill its client.
+        if cont is not None and _owns_generation():
+            if not watcher_cancelled and last_settle_status != "stopped":
+                _mark_incomplete()
+            await _terminate_runtime()
         # Release our slot on the session pump so a later turn's messages are
         # not routed to a watcher that has exited.
         if _bg_stream is not None and bg_q is not None:
@@ -16724,7 +16865,7 @@ async def _start_turn(
             # This probe is advisory when no compact is needed. Never let a
             # wedged SDK control request delay the user's real prompt for the
             # full compact window.
-            cached = (client.cached_context_usage()
+            cached = (client.cached_context_usage(max_age_s=300)
                       if isinstance(client, MuseLabSDKClient) else None)
             # Reuse only an unchanged, freshly measured SDK generation with
             # ample headroom. Background/scheduled writers always force a probe.
@@ -18298,7 +18439,7 @@ async def _start_turn(
                 # its real context ceiling.
                 sdk_max = sdk_raw = sdk_threshold = sdk_total = 0
                 try:
-                    cu = await asyncio.wait_for(client.get_context_usage(), timeout=3.0)
+                    cu = await _post_turn_context_usage(client)
                     sdk_max = _positive_int(cu.get("maxTokens"))
                     sdk_raw = _positive_int(cu.get("rawMaxTokens"))
                     sdk_threshold = _positive_int(cu.get("autoCompactThreshold"))
@@ -18339,7 +18480,7 @@ async def _start_turn(
                         / sess_u["context_limit"] * 100, 1)
             else:
                 try:
-                    cu = await asyncio.wait_for(client.get_context_usage(), timeout=3.0)
+                    cu = await _post_turn_context_usage(client)
                     real_max = int(cu.get("maxTokens") or 0)
                     real_total = int(cu.get("totalTokens") or 0)
                     if real_max:

@@ -925,7 +925,8 @@ def test_hidden_runtime_successors_repair_tabs_drafts_and_task_links():
     pull_start = app.index("async _pullSessionListOnce(")
     pull_end = app.index("\n    async refreshSessions()", pull_start)
     pull = app[pull_start:pull_end]
-    assert "(data && data.session_redirects) || {}" in pull
+    assert "this._applySessionRedirects(data.session_redirects || {}, data.sessions)" in pull
+    assert "!Array.isArray(data.sessions)" in pull
     assert pull.index("this._applySessionRedirects(") < pull.index(
         "this._applySessionList(")
 
@@ -1340,7 +1341,7 @@ def test_session_sync_deadlines_and_activity_transport_backoff_are_bounded():
     fetch_start = app.index("    async _fetchWithDeadline(")
     fetch_end = app.index("\n    _staticAssetUrl", fetch_start)
     deadline_fetch = app[fetch_start:fetch_end]
-    assert "Promise.race([fetch(url, fetchOptions), control])" in deadline_fetch
+    assert "Promise.race([operation, control])" in deadline_fetch
     assert 'abort("request deadline exceeded")' in deadline_fetch
 
     activity_start = app.index("    async fetchActivity(opts = {}) {")
@@ -1772,7 +1773,7 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     load = app[start:end]
     failed = load[
         load.index("if (!r.ok) {"):
-        load.index("const parsedSession = await r.json()")
+        load.index("const s = this._retainExpectedSessionSettings(parsedSession)")
     ]
 
     assert "return false" in failed
@@ -2821,7 +2822,7 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     assert "m._steeringAdjustment === true || m._turnRoot === false" in continuity
 
     preserve_start = app.index(
-        "    _preserveCanonicalMessageIdentity(st, incoming) {")
+        "    _preserveCanonicalMessageIdentity(st, incoming, completedBoundary = null) {")
     preserve_end = app.index("\n    _assignLiveKey", preserve_start)
     preserve = app[preserve_start:preserve_end]
     assert preserve.index("Reserve every durable identity") < preserve.index(
@@ -3245,7 +3246,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "st._composerSubmitToken || st._queueAdmission" in app
     assert "|| this._hasAdmissionBubble(st)" in app
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
-    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true)")
+    reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true, onFirstReveal = null)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
     assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
     assert "const CH = this._isMobileLayout() ? 1 : 2" in reveal
@@ -3270,12 +3271,12 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "expectedText" in app
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
-    assert "all = this._preserveCanonicalMessageIdentity(st, all)" in load
+    assert "all = this._preserveCanonicalMessageIdentity(st, all, completedBoundary)" in load
     assert "const quietRangeSnapshot = quiet" in load
     assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
     assert "this._historyReplaceStillOwns(st, historyReplaceToken)" in load
     assert "await new Promise(resolve => this.$nextTick(resolve))" in load
-    assert "this._revealMessagesChunked(sid, st, visible, true)" in load
+    assert "this._revealMessagesChunked(sid, st, visible, true, () =>" in load
     assert "this._revealMessagesChunked(sid, st, visible, !quiet)" not in load
     assert "delete canonicalFields._k" in app
     assert "matched._k = mountedKey" in app
@@ -3631,7 +3632,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     fork = app[fork_start:fork_end]
     assert "if (message.forkUuid) return message.forkUuid" in fork
 
-    preserve_start = app.index("_preserveCanonicalMessageIdentity(st, incoming)")
+    preserve_start = app.index("_preserveCanonicalMessageIdentity(st, incoming, completedBoundary = null)")
     preserve_end = app.index("\n    _assignLiveKey", preserve_start)
     preserve = app[preserve_start:preserve_end]
     assert 'mountedKey.includes(":live:")' in preserve
@@ -4067,8 +4068,8 @@ def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     range_helper_end = app.index("    _captureViewportMessageAnchor", range_helper_start)
     range_helper = app[range_helper_start:range_helper_end]
     assert "startIdentity:" in range_helper and "endIdentity:" in range_helper
-    assert "_historyMessageIndex(messages, snapshot.startIdentity)" in range_helper
-    assert "_historyMessageIndex(messages, snapshot.endIdentity)" in range_helper
+    assert "resolveIndex(snapshot.startIdentity, snapshot.startKey)" in range_helper
+    assert "resolveIndex(snapshot.endIdentity, snapshot.endKey)" in range_helper
     assert "_historyReplaceStillOwns" in range_helper
     assert "_historyPageStillOwns" in range_helper
 

@@ -271,3 +271,64 @@ def test_final_visibility_converges_through_real_session_scheduler(
     }
     assert sum("?tail=" in url for url in reads) == (2 if mode == "replay_retry" else 1)
     _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+@pytest.mark.parametrize("known_uuid", [True, False])
+def test_completed_partial_viewport_adopts_final_without_refresh(
+    page, backend_url, auth_token, width, known_uuid,
+):
+    """A verified completion keeps the scrolled live node as it acquires a UUID."""
+    page.set_viewport_size({"width": width, "height": 900})
+    errors, _, _ = _prepare(page, backend_url, auth_token)
+    result = _app_eval(page, """
+        const st = app.tabState[arg.sid];
+        st.atBottom = false;
+        st.messageRange.visibleStart = 1;
+        st.messageRange.visibleEnd = 2;
+        st._userScrollAt = 10;
+        const live = st.messages.at(-1);
+        const loaded = await app._runCompletedTurnSync(arg.sid, st, {
+          expectedText: 'LIVE_PARTIAL',
+          expectedAssistantUuid: arg.known ? 'fixture-final' : '',
+          completedTurnId: 'fixture-turn', followTail: false,
+        });
+        return {loaded, text: st.messages.at(-1).text,
+          sameNodeOwner: st.messages.at(-1) === live,
+          key: st.messages.at(-1)._k, atBottom: st.atBottom,
+          pending: st._pendingCompletedTurnSync,
+          followTail: window.visibilityScrolls};
+    """, {"sid": SID, "known": known_uuid})
+    assert result == {
+        "loaded": True, "text": FINAL, "sameNodeOwner": True,
+        "key": f"{SID}:live:partial", "atBottom": False,
+        "pending": None, "followTail": [False],
+    }
+    expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text(FINAL)
+    _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("same_turn", [True, False])
+def test_lost_done_viewport_uses_only_retired_turn_commit(
+    page, backend_url, auth_token, same_turn,
+):
+    """List recovery gets the same mapping only for its exact retired stream."""
+    errors, _, _ = _prepare(page, backend_url, auth_token)
+    result = _app_eval(page, """
+        const st = app.tabState[arg.sid];
+        st.atBottom = false;
+        st.messageRange.visibleStart = 1;
+        st.messageRange.visibleEnd = 2;
+        st.activeTurnId = arg.same ? 'fixture-turn' : 'another-turn';
+        st.streaming = true;
+        const live = st.messages.at(-1);
+        app._retireStaleSessionStream(arg.sid, st);
+        const loaded = await app._runHistoryRevisionSync(arg.sid, st);
+        return {loaded, text:st.messages.at(-1).text,
+          sameOwner:st.messages.at(-1) === live, atBottom:st.atBottom};
+    """, {"sid": SID, "same": same_turn})
+    assert result == {
+        "loaded": same_turn, "text": FINAL if same_turn else "LIVE_PARTIAL",
+        "sameOwner": True, "atBottom": False,
+    }
+    _assert_no_browser_errors(page, errors)

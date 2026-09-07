@@ -804,7 +804,15 @@ def _run_worker_job(tmp_path, monkeypatch, failures, *, kind="reindex_memory"):
     monkeypatch.setattr(instance.store, "finish_job", finish_and_advance)
     _run(instance._worker())
     job = next(row for row in instance.store.list_jobs() if row["id"] == job_id)
-    return calls, job, events
+    starts = [fields for event, fields in events if event == "memory.job_start"]
+    outcomes = [(event, fields) for event, fields in events if event == "memory.job"]
+    assert len(starts) == len(outcomes)
+    assert len({fields["job_ref"] for _, fields in outcomes}) == 1
+    for start, (_, finish) in zip(starts, outcomes):
+        assert start["job_ref"] == finish["job_ref"]
+        assert len(start["job_ref"]) == 12
+        assert start["attempt"] == finish["attempt"]
+    return calls, job, outcomes
 
 
 @pytest.mark.parametrize(("exc", "retryable", "category", "status"), [

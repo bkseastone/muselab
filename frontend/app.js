@@ -5959,7 +5959,7 @@ function portal() {
       return error;
     },
     async _fetchWithDeadline(
-      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS,
+      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS, consumeResponse = null,
     ) {
       const upstream = options.signal;
       if (upstream && upstream.aborted) throw this._abortError();
@@ -5986,7 +5986,12 @@ function portal() {
       try {
         // Keep the explicit race even though native fetch observes AbortSignal:
         // test doubles and embedded WebViews are not always abort-cooperative.
-        return await Promise.race([fetch(url, fetchOptions), control]);
+        const operation = (async () => {
+          const response = await fetch(url, fetchOptions);
+          if (consumeResponse) await consumeResponse(response);
+          return response;
+        })();
+        return await Promise.race([operation, control]);
       } finally {
         settled = true;
         clearTimeout(timer);
@@ -11304,6 +11309,10 @@ function portal() {
           followTail: followTailStillOwned,
           signal: options.signal,
           historySnapshot: history,
+          completedBoundary: (expectedAssistantUuid
+              ? messages[finalIndex].uuid === expectedAssistantUuid
+              : committedState?.completed_turn_id === completedTurnId)
+            ? { uuid: messages[finalIndex].uuid, text: expectedText } : null,
         });
         if (!loaded) retry();
         else {
@@ -12641,21 +12650,19 @@ function portal() {
         }
       }
       const _ids = encodeURIComponent(_idSet.join(","));
-      let r;
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
+      let r, data;
       try {
-        r = await fetch(`/api/chat/sessions?limit=100&ids=${_ids}`, {
-          headers,
-          signal: controller.signal,
-        });
+        r = await this._fetchWithDeadline(
+          `/api/chat/sessions?limit=100&ids=${_ids}`, { headers },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+          async response => {
+            if (response.ok) data = await response.json();
+          },
+        );
       } catch (_) {
-        return false;  // network blip; next tick retries
-      } finally {
-        clearTimeout(timeout);
+        // Preserve both the installed list and its ETag when headers arrive
+        // but the response body fails or stalls. The next poll owns a new read.
+        return false;
       }
       if (r.status === 304) {
         // A transcript revision may have been deferred while its local stream
@@ -12663,16 +12670,11 @@ function portal() {
         this._reconcileOpenSession(this.sessions);
         return false;
       }
-      if (!r.ok) return false;
-      const et = r.headers.get("etag");
-      if (et) this._sessionsEtag = et;
-      let data = null;
-      try { data = await r.json(); } catch { data = null; }
-      this._applySessionRedirects(
-        (data && data.session_redirects) || {},
-        (data && data.sessions) || [],
-      );
-      this._applySessionList((data && data.sessions) || []);
+      if (!r.ok || !data || !Array.isArray(data.sessions)) return false;
+      this._applySessionRedirects(data.session_redirects || {}, data.sessions);
+      this._applySessionList(data.sessions);
+      // Commit the cache validator only after its complete body is installed.
+      this._sessionsEtag = r.headers.get("etag") || "";
       return true;
     },
     async refreshSessions() {
@@ -18105,7 +18107,7 @@ function portal() {
       // One privacy-bounded summary per canonical history load. Never include a
       // session id, message text, URL, model name, or error string.
       const numeric = [
-        "total_ms", "fetch_ms", "parse_ms", "shape_ms", "markdown_ms",
+        "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms", "shape_ms", "markdown_ms",
         "install_ms", "response_bytes", "block_count", "assistant_blocks",
         "long_task_count", "longest_task_ms",
       ];
@@ -18115,6 +18117,9 @@ function portal() {
         mode: ["cold", "quiet", "prefetch"].includes(fields.mode)
           ? fields.mode : "cold",
         foreground: !!fields.foreground,
+        visibility: ["visible", "hidden"].includes(fields.visibility) ? fields.visibility : "unknown",
+        cancel_reason: ["none", "superseded", "live_owner", "revision_changed", "anchor_missing", "aborted"]
+          .includes(fields.cancel_reason) ? fields.cancel_reason : "none",
       };
       for (const name of numeric) {
         const value = Math.round(Number(fields[name]) || 0);
@@ -18465,7 +18470,9 @@ function portal() {
         status: "cancelled",
         mode: quiet ? "quiet" : (isCurrent ? "cold" : "prefetch"),
         foreground: isCurrent,
-        total_ms: 0, fetch_ms: 0, parse_ms: 0, shape_ms: 0,
+        cancel_reason: "none",
+        visibility: typeof document !== "undefined" ? document.visibilityState : "unknown",
+        total_ms: 0, fetch_ms: 0, receive_ms: 0, parse_ms: 0, first_reveal_ms: 0, shape_ms: 0,
         markdown_ms: 0, install_ms: 0, response_bytes: 0,
         block_count: 0, assistant_blocks: 0,
         long_task_count: 0, longest_task_ms: 0,
@@ -18505,8 +18512,26 @@ function portal() {
           : preserveFullOrder
             ? "?full=1&tail=" + requestedTail
             : "?tail=" + requestedTail;
-        let r;
+        let r, parsedSession;
         const fetchStarted = perfNow();
+        let receivedHeaders = false;
+        const consumeHistory = async response => {
+          receivedHeaders = true;
+          historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
+          if (!response.ok) return;
+          const receiveStarted = perfNow();
+          if (typeof response.text === "function") {
+            const raw = await response.text();
+            historyPerf.receive_ms = Math.round(perfNow() - receiveStarted);
+            const parseStarted = perfNow();
+            parsedSession = JSON.parse(raw);
+            historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
+          } else {
+            // Reusable in-memory snapshots and older response adapters.
+            parsedSession = await response.json();
+            historyPerf.receive_ms = Math.round(perfNow() - receiveStarted);
+          }
+        };
         try {
           const snapshot = opts.historySnapshot;
           const reusable = snapshot && !full && !preserveFullOrder
@@ -18519,19 +18544,22 @@ function portal() {
               offset: (Number(snapshot.offset) || 0) + trim,
               has_more: (Number(snapshot.offset) || 0) + trim > 0,
             }) };
+            await consumeHistory(r);
           } else {
           r = await this._fetchWithDeadline(
             "/api/chat/sessions/" + sid + qs,
             { headers: this.hdr(), signal: opts.signal },
             full ? 60_000
               : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
+            consumeHistory,
           );
           }
         } catch (_) {
-          historyPerf.status = "error";
+          historyPerf.status = opts.signal?.aborted ? "cancelled" : "error";
+          if (opts.signal?.aborted) historyPerf.cancel_reason = "aborted";
           return false;
         } finally {
-          historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
+          if (!receivedHeaders) historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
         }
         if (!r.ok) {
           historyPerf.status = "error";
@@ -18539,15 +18567,16 @@ function portal() {
         }
         historyPerf.response_bytes = Math.max(
           0, Number(r.headers.get("content-length")) || 0);
-        const parseStarted = perfNow();
-        const parsedSession = await r.json();
-        historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
         const s = this._retainExpectedSessionSettings(parsedSession);
         if (this.tabState[sid] !== st
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          historyPerf.cancel_reason = "superseded";
           return false;
         }
-        if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+        if (st.streaming || st.es || this._hasAdmissionBubble(st)) {
+          historyPerf.cancel_reason = "live_owner";
+          return false;
+        }
         const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
         const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
         // A different load for this same tab adopted another presentation
@@ -18557,6 +18586,7 @@ function portal() {
         // server revision is picked up by the existing poll/reconcile retry.
         if (currentRuntimeUiRevision !== runtimeUiRevisionAtLoad
             && currentRuntimeUiRevision !== loadedRuntimeUiRevision) {
+          historyPerf.cancel_reason = "revision_changed";
           return false;
         }
         const loadedUpdated = Number(s.updated_at) || 0;
@@ -18605,7 +18635,22 @@ function portal() {
           // in-place splice so Alpine keeps the existing bubble elements
           // mounted instead of destroying `sid:live:*` nodes and recreating
           // them as `sid:uuid:*` / `sid:hist:*`.
-          all = this._preserveCanonicalMessageIdentity(st, all);
+          let completedBoundary = opts.completedBoundary;
+          const completion = s.completion_state;
+          // A lost done frame reaches us through revision/replay recovery,
+          // rather than completed_turn. A stable idle snapshot for the exact
+          // retired stream supplies the same boundary without guessing across
+          // successor turns or an older around/full history window.
+          if (!completedBoundary && !s.has_later && completion?.stable
+              && !completion.active && completion.completed_turn_id
+              && [st.activeTurnId, st._lastTerminalTurnId]
+                .includes(completion.completed_turn_id)) {
+            const final = all.findLast(message => message.role === "assistant"
+              && message.uuid && !message.display_kind);
+            const live = st.messages.findLast(message => message.role === "assistant");
+            if (final && live) completedBoundary = { uuid: final.uuid, text: live.text || "" };
+          }
+          all = this._preserveCanonicalMessageIdentity(st, all, completedBoundary);
         }
         const incomingCount = all.length;
         historyPerf.block_count = incomingCount;
@@ -18632,6 +18677,7 @@ function portal() {
         if (this.tabState[sid] !== st || st.streaming || st.es
             || this._hasAdmissionBubble(st)
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          historyPerf.cancel_reason = "superseded";
           return false;
         }
         // Publish the canonical repository atomically. A 100-row in-place
@@ -18639,7 +18685,10 @@ function portal() {
         // make Alpine's keyed mover observe an inconsistent intermediate
         // lookup. The matched message objects and their `_k` values are still
         // reused, so stable bubbles keep their DOM identity on the normal path.
-        if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+        if (st.streaming || st.es || this._hasAdmissionBubble(st)) {
+          historyPerf.cancel_reason = "live_owner";
+          return false;
+        }
         // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
         // canonical refresh can move visibleStart from a narrow recent tail to
         // an older coordinate; carrying the same numbers across that change
@@ -18665,6 +18714,7 @@ function portal() {
         // repository and expose the jump-to-latest affordance instead of silently
         // applying old numeric indices to unrelated messages.
         if (quiet && !quietRangeResolved) {
+          historyPerf.cancel_reason = "anchor_missing";
           st.atBottom = false;
           return false;
         }
@@ -18692,12 +18742,15 @@ function portal() {
         if (quiet) {
           await new Promise(resolve => this.$nextTick(resolve));
         } else {
-          await this._revealMessagesChunked(sid, st, visible, true);
+          await this._revealMessagesChunked(sid, st, visible, true, () => {
+            historyPerf.first_reveal_ms = Math.round(perfNow() - historyPerfStarted);
+          });
         }
         historyPerf.install_ms = Math.round(perfNow() - installStarted);
         if (this.tabState[sid] !== st || st.streaming || st.es
             || this._hasAdmissionBubble(st)
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          historyPerf.cancel_reason = "superseded";
           return false;
         }
         if (quiet) {
@@ -19010,7 +19063,7 @@ function portal() {
     // Reveal the resident repository in small coordinate steps. The newest tail is
     // immediate; older rows are installed through _yieldHistoryInstall so mobile
     // input gets priority instead of Alpine occupying every animation frame.
-    async _revealMessagesChunked(sid, st, visible, tailFirst = true) {
+    async _revealMessagesChunked(sid, st, visible, tailFirst = true, onFirstReveal = null) {
       // Alpine row creation is the remaining dominant long task: one row can
       // contain many nested directives, tool cards and x-html bodies. Keep each
       // commit deliberately small so transcript installation yields to shell
@@ -19062,6 +19115,7 @@ function portal() {
         await new Promise(resolve => this.$nextTick(resolve));
         if (active && sid === this.currentId && this.tabState[sid] === st) {
           if (!st.messagesReady) st.messagesReady = true;
+          if (onFirstReveal) { onFirstReveal(); onFirstReveal = null; }
           if (st.atBottom !== false) {
             this._scrollChatTailNow(sid, st);
           } else if (scrollEl) {
@@ -19376,7 +19430,7 @@ function portal() {
       push("summary", m.summary);
       return out;
     },
-    _preserveCanonicalMessageIdentity(st, incoming) {
+    _preserveCanonicalMessageIdentity(st, incoming, completedBoundary = null) {
       const existing = st.messages;
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
       const existingTail = existing[existing.length - 1];
@@ -19479,6 +19533,26 @@ function portal() {
         result[index] = matched;
         return true;
       };
+
+      // Completion reconciliation already verified the exact persisted final
+      // boundary and that no successor owns the pane. Its live text may be
+      // incomplete, so ordinary text matching cannot retain the viewport node.
+      // Bind only one unambiguous live assistant to that verified boundary;
+      // durable identities and repeated prose never get reassigned by this hint.
+      if (completedBoundary?.uuid) {
+        const canonicalIndexes = incoming.map((message, index) => (
+          message.role === "assistant" && message.uuid === completedBoundary.uuid
+            ? index : -1
+        )).filter(index => index >= 0);
+        const liveMatches = existing.filter(message =>
+          message.role === "assistant" && !message.uuid
+          && (!message.forkUuid || message.forkUuid === completedBoundary.uuid)
+          && String(message._k || "").includes(":live:")
+          && String(message.text || "") === completedBoundary.text);
+        if (canonicalIndexes.length === 1 && liveMatches.length === 1) {
+          adopt(canonicalIndexes[0], liveMatches[0], "strong");
+        }
+      }
 
       // Reserve every durable identity before considering prose continuity.
       // Otherwise canonical turn B can weak-match turn A's identical text and
@@ -19731,6 +19805,10 @@ function portal() {
         followTail: st.atBottom !== false && !this._messageRangeHasLater(st),
         startIdentity: this._historyMessageIdentity(st.messages[start]),
         endIdentity: this._historyMessageIdentity(st.messages[end - 1]),
+        // A completed live row can acquire its UUID during reconciliation.
+        // Its retained render key still identifies the same viewport node.
+        startKey: st.messages[start]?._k || "",
+        endKey: st.messages[end - 1]?._k || "",
         visibleCount: Math.max(0, end - start),
         order: range.order,
         generation: range.generation,
@@ -19746,8 +19824,13 @@ function portal() {
         };
       }
       const count = Math.max(1, Number(snapshot.visibleCount) || 1);
-      const startIndex = this._historyMessageIndex(messages, snapshot.startIdentity);
-      const endIndex = this._historyMessageIndex(messages, snapshot.endIdentity);
+      const resolveIndex = (identity, key) => {
+        const index = this._historyMessageIndex(messages, identity);
+        return index >= 0 || !key ? index
+          : messages.findIndex(message => message._k === key);
+      };
+      const startIndex = resolveIndex(snapshot.startIdentity, snapshot.startKey);
+      const endIndex = resolveIndex(snapshot.endIdentity, snapshot.endKey);
       if (startIndex >= 0 && endIndex >= startIndex) {
         return { start: startIndex, end: endIndex + 1 };
       }

@@ -46,6 +46,50 @@ log show --predicate 'process == "muselab"' --last 5m
 
 `[perf]` 行只包含阶段耗时、计数、状态分类和短关联 ID。慢请求阈值可通过 `MUSELAB_SLOW_REQUEST_MS` 调整（默认 `500`）；仅在确实要完全关闭性能摘要时设置 `MUSELAB_PERF_LOG=0`。
 
+**如何区分历史加载慢和服务卡顿。**
+性能事件的 `at_ms` 是生成事件时的 Unix 毫秒时间，可用于对齐前后端记录。
+`client.history_load` 的 `fetch_ms` 记录收到响应头前的等待，`receive_ms`
+记录读取响应内容和调度等待，`parse_ms` 仅记录 `JSON.parse`。
+旧版本的 `parse_ms` 包含内容读取，不能直接解释为 JSON 解析占用 CPU。
+历史请求的超时和上游取消现在覆盖响应内容读取。
+
+`first_reveal_ms` 记录当前会话首批 DOM 就绪，`install_ms` 包括后续分批安装；
+两者都不是浏览器实际绘制时间。`visibility` 是加载开始时页面的可见状态，
+`foreground` 仅表示日志结束时是否为选中会话。`cancel_reason` 区分请求取消、
+视图被替换、流接管、版本变化和锚点缺失；这些保护性退出不等同于请求失败。
+
+回放的追加、订阅读取和解码在专用线程执行，保持每个回放文件的写入顺序。
+待写任务共享 64 MiB / 8192 项上限；超限会显式失败。写盘失败的订阅回退到
+`resync`，不会把缺失回放当作完成。该机制缓解事件循环阻塞，但不能修复慢盘、
+网络挂载或磁盘空间不足；长期 I/O 停顿仍需检查部署机器。
+
+完成后的 SDK 上下文测量在后台运行，最长 10 秒；同一状态的请求共享测量。
+下一轮仅在状态未变化、缓存不超过 5 分钟、用量低于窗口一半且没有后台写入时
+复用，临近上限仍重新检查。记忆生成优先采用成功 `ResultMessage` 的最终文本；
+缺少终止结果或错误结果均不会把中间文本作为成功输出。网络和认证失败仍需
+检查对应 provider 配置。
+
+**完成的答复需要刷新页面才能看到。**
+完成同步会把可明确识别的不完整实时答复绑定到已验证的最终 UUID，保留消息节点
+和阅读位置；已知 UUID 仍不能被无关的后续轮次替换。会话列表的超时覆盖完整响应
+读取，ETag 只在有效列表安装后更新；响应失败时保留上一份列表，让下一次轮询恢复。
+
+**后台任务完成后，最终答复仍提示未完成。**
+`MUSELAB_CONTINUATION_GRACE`（默认 8 秒）仅用于等待续答启动。一旦主模型开始
+思考、输出文字或调用工具，就改用绝对总时限 `MUSELAB_CONTINUATION_TIMEOUT`。
+该时限默认继承 `MUSELAB_TASK_WATCH_TIMEOUT`（默认 3600 秒），不会因持续消息而
+延长。系统最多补发一次续答请求；缺少结束结果时，须先完成旧运行时清理，下一轮
+才能接管。SDK 返回的失败结果会在实时消息与持久化完成状态中一致标为失败。
+
+**记忆生成反复失败。**
+默认性能日志会输出 `memory.job_start`、`memory.generation` 和 `memory.job`。
+用相同的 `job_ref` 关联同一任务的调用与重试；`attempt`、`outcome` 和
+`retry_seconds` 区分重试与最终失败。生成记录包含 SDK/DUCC/HTTP 路径、
+超时设置、耗时，以及哈希化的模型标识。`reason` 区分 `timeout`、
+`transport_error`、`sdk_result_error`、`missing_terminal`、`empty_output`、
+`invalid_json` 和 `non_object_json`；`cause_kind` 保留受限的底层错误类型。
+这些日志不输出提示词、回答、原始异常、模型配置原文或凭据。
+
 **注销后服务就停了（Linux）。**
 开启 lingering，让用户服务持续运行：`sudo loginctl enable-linger $USER`。
 

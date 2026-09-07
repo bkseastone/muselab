@@ -180,6 +180,8 @@ class MuseLabSDKClient(ClaudeSDKClient):
         self._muselab_input_lock = asyncio.Lock()
         self._muselab_context_revision = 0
         self._muselab_context_snapshot = None
+        self._muselab_context_probes = {}
+        self._muselab_context_warmup = None
 
     def _invalidate_context_snapshot(self) -> None:
         self._muselab_context_revision += 1
@@ -187,10 +189,46 @@ class MuseLabSDKClient(ClaudeSDKClient):
 
     async def get_context_usage(self) -> dict:
         revision = self._muselab_context_revision
-        usage = await super().get_context_usage()
-        if revision == self._muselab_context_revision:
-            self._muselab_context_snapshot = (revision, time.monotonic(), dict(usage))
-        return usage
+        probes = self._muselab_context_probes
+        task = probes.get(revision)
+        if task is None:
+            async def measure():
+                usage = await asyncio.wait_for(super(MuseLabSDKClient, self).get_context_usage(), 10)
+                if revision == self._muselab_context_revision:
+                    self._muselab_context_snapshot = (revision, time.monotonic(), dict(usage))
+                return usage
+            task = asyncio.create_task(measure())
+            probes[revision] = task
+            def settled(done):
+                if probes.get(revision) is done:
+                    probes.pop(revision, None)
+                if not done.cancelled():
+                    done.exception()
+            task.add_done_callback(settled)
+        # A UI deadline must not destroy a useful measurement shared with an
+        # idle warmup. The probe itself has a hard deadline and a client owner.
+        return dict(await asyncio.shield(task))
+
+    def warm_context_usage(self) -> None:
+        task = self._muselab_context_warmup
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self.get_context_usage())
+        self._muselab_context_warmup = task
+        task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+
+    async def disconnect(self) -> None:
+        pending = set(self._muselab_context_probes.values())
+        if self._muselab_context_warmup is not None:
+            pending.add(self._muselab_context_warmup)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._muselab_context_probes.clear()
+        self._muselab_context_warmup = None
+        self._invalidate_context_snapshot()
+        await super().disconnect()
 
     def cached_context_usage(self, *, max_age_s: float = 20.0) -> dict | None:
         snapshot = self._muselab_context_snapshot
