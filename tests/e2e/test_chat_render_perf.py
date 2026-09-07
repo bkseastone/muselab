@@ -3106,7 +3106,7 @@ def test_effort_fast_capabilities_and_session_restore(
             status: 200,
             headers: { get: () => null },
             json: async () => payload,
-            text: async () => "",
+            text: async () => JSON.stringify(payload),
           });
           try {
             app._fetchTabUsage = async () => {};

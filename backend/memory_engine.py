@@ -37,6 +37,7 @@ from .memory_providers import (
     EmbeddingProvider,
     GenerationError,
     GenerationProvider,
+    generation_job_ref,
     Reranker,
     vector_store,
 )
@@ -184,6 +185,8 @@ def classify_memory_failure(exc: BaseException) -> tuple[bool, dict[str, object]
     }
     if status is not None:
         detail["status"] = status
+    if isinstance(exc, GenerationError) and exc.reason != "unknown":
+        detail["reason"] = exc.reason
     return retryable, detail
 
 
@@ -578,6 +581,9 @@ class MemoryEngine:
             failure: dict[str, object] | None = None
             attempts = int(job.get("attempts", 0)) + 1
             safe_kind = job["kind"] if job.get("kind") in _KNOWN_JOB_KINDS else "unknown"
+            job_ref = hashlib.sha256(str(job["id"]).encode()).hexdigest()[:12]
+            perf_event("memory.job_start", job_ref=job_ref, kind=safe_kind, attempt=attempts)
+            job_trace_token = generation_job_ref.set(job_ref)
             try:
                 # Owner fence. Jobs carry the owner that enqueued them; the
                 # handlers below resolve everything else from the LIVE config.
@@ -607,19 +613,25 @@ class MemoryEngine:
             except Exception as exc:
                 retryable, failure = classify_memory_failure(exc)
                 error = _failure_record(failure)
-                log.warning(
-                    "memory job failed category=%s exception_class=%s status=%s",
-                    failure["category"], failure["exception_class"],
-                    failure.get("status"),
-                )
+            finally:
+                generation_job_ref.reset(job_trace_token)
             retry_seconds = (
                 min(300.0, 2 ** attempts)
                 if error and retryable and attempts < 3 else None
             )
+            outcome = "retry" if retry_seconds is not None else "failed" if error else "done"
+            if failure:
+                log.warning(
+                    "memory job outcome=%s job_ref=%s attempt=%s category=%s reason=%s status=%s",
+                    outcome, job_ref, attempts, failure["category"],
+                    failure.get("reason", "unknown"), failure.get("status"))
             await self._store_call(lambda store: store.finish_job(
                 job["id"], error=error, retry_seconds=retry_seconds))
             perf_event(
                 "memory.job",
+                job_ref=job_ref,
+                retry_seconds=retry_seconds,
+                reason=failure.get("reason") if failure else None,
                 kind=safe_kind,
                 attempt=attempts,
                 duration_ms=elapsed_ms(started),

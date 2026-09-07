@@ -94,3 +94,61 @@ async def test_old_hook_generation_cannot_recreate_purged_trace(app_module, monk
     chat._hook_diagnostic_generations[sid] = 1
     chat._hook_trace_job(asyncio.get_running_loop(), sid, object(), "", "foreground", None, 0)
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_context_probe_shared_and_survives_one_caller_cancellation(monkeypatch):
+    from backend.sdk_compat import MuseLabSDKClient, ClaudeSDKClient
+    client = MuseLabSDKClient()
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def context(self):
+        calls.append(True)
+        entered.set()
+        await release.wait()
+        return {"totalTokens": 100, "maxTokens": 10000}
+
+    monkeypatch.setattr(ClaudeSDKClient, "get_context_usage", context)
+    first = asyncio.create_task(client.get_context_usage())
+    await entered.wait()
+    second = asyncio.create_task(client.get_context_usage())
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    assert await second == {"totalTokens": 100, "maxTokens": 10000}
+    assert calls == [True]
+    assert client.cached_context_usage()["totalTokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_post_turn_warmup_does_not_delay_completion_and_is_owned(app_module, monkeypatch):
+    from backend import chat
+    from backend.sdk_compat import MuseLabSDKClient, ClaudeSDKClient
+    client = MuseLabSDKClient()
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    disconnects = []
+
+    async def context(self):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    async def disconnect(self):
+        disconnects.append(True)
+
+    monkeypatch.setattr(ClaudeSDKClient, "get_context_usage", context)
+    monkeypatch.setattr(ClaudeSDKClient, "disconnect", disconnect)
+    assert await asyncio.wait_for(chat._post_turn_context_usage(client), 0.2) == {}
+    await entered.wait()
+    client.warm_context_usage()
+    assert len(client._muselab_context_probes) == 1
+    await client.disconnect()
+    assert cancelled.is_set()
+    assert disconnects == [True]
+    assert client._muselab_context_probes == {}
+    assert client.cached_context_usage() is None

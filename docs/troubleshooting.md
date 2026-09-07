@@ -70,6 +70,64 @@ short correlation IDs only. Tune the slow-request boundary with
 `MUSELAB_SLOW_REQUEST_MS` (default `500`); set `MUSELAB_PERF_LOG=0` only when
 you need to disable these summaries entirely.
 
+**Separate slow history loading from a stalled service.**
+Performance events include `at_ms`, the Unix millisecond time when the event was
+created. For `client.history_load`, `fetch_ms` ends at response headers,
+`receive_ms` covers reading the response and scheduling delays, and `parse_ms`
+measures only `JSON.parse`. Older `parse_ms` values also included response
+reading and cannot be interpreted as JSON CPU time. History deadlines and
+upstream cancellation now cover response consumption.
+
+`first_reveal_ms` records the selected session's first DOM batch becoming ready;
+`install_ms` includes subsequent incremental batches. Neither measures actual
+browser paint. `visibility` describes document visibility at load start;
+`foreground` only identifies the selected session at log completion.
+`cancel_reason` distinguishes abortion, superseded views, live ownership,
+revision changes, and missing anchors. Protective exits are not request failures.
+
+Replay appends, subscriber reads, and decoding use dedicated threads while
+preserving per-file write order. Pending writes share a 64 MiB / 8192-job budget;
+overflow fails explicitly. Disk failures produce `resync` instead of presenting
+missing replay as completed. This isolates event-loop stalls but cannot repair
+slow disks, network mounts, or insufficient disk space. Persistent I/O stalls
+still require investigation on the deployment host.
+
+Post-turn SDK context measurements run in the background with a 10-second
+limit; requests for the same state share a probe. The next turn reuses a sample
+only when state is unchanged, age is at most five minutes, usage is below half
+the window, and no background writer is present. Near-limit turns still probe.
+Memory generation prefers final text from a successful `ResultMessage`; missing
+or error terminal results cannot make intermediate text a successful output.
+Network and authentication failures still require provider configuration checks.
+
+**A completed reply appears only after reloading.**
+Completion reconciliation binds an unambiguous incomplete live assistant row to
+its verified final UUID, preserving the mounted key and the reader's scroll
+position. A known UUID still cannot be replaced by an unrelated successor.
+The session-list deadline covers reading its complete response, and its ETag
+advances only after a valid list is installed; a broken response retains the
+last good list so the next poll can recover.
+
+**Background tasks finished but the final reply is incomplete.**
+`MUSELAB_CONTINUATION_GRACE` (default `8` seconds) waits only for a continuation
+to start. Once the parent emits thinking, text, or tool activity, it uses the
+absolute `MUSELAB_CONTINUATION_TIMEOUT` instead. That limit defaults to
+`MUSELAB_TASK_WATCH_TIMEOUT` (`3600` seconds); activity does not reset it.
+An explicit resume is sent at most once. Missing terminal results require the
+old runtime to be cleaned up before another turn can acquire it. SDK error
+results remain failures in both live delivery and persisted completion state.
+
+**Memory generation repeatedly fails.**
+Default performance logs include `memory.job_start`, `memory.generation`, and
+`memory.job`. Correlate calls and retries using `job_ref`; `attempt`, `outcome`,
+and `retry_seconds` distinguish retries from terminal failures. Generation
+records include SDK/DUCC/HTTP route, timeout setting, duration, and a hashed
+model reference. `reason` distinguishes `timeout`, `transport_error`,
+`sdk_result_error`, `missing_terminal`, `empty_output`, `invalid_json`, and
+`non_object_json`; `cause_kind` retains only an allowed underlying error type.
+Prompts, responses, raw exceptions, raw model configuration, and credentials
+are excluded.
+
 **Service stops when I log out (Linux).**
 Enable lingering so the user service keeps running:
 `sudo loginctl enable-linger $USER`.

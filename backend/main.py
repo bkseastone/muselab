@@ -1393,18 +1393,30 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
         return min(100_000_000, max(0, value))
 
     allowed_fields = {
-        "status", "mode", "foreground", "total_ms", "fetch_ms", "parse_ms",
+        "status", "mode", "foreground", "visibility", "cancel_reason",
+        "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms",
         "shape_ms", "markdown_ms", "install_ms", "response_bytes",
         "block_count", "assistant_blocks", "long_task_count", "longest_task_ms",
     }
     if any(name not in allowed_fields for name in payload):
         return JSONResponse(
             {"ok": False, "error": "invalid_payload"}, status_code=422)
+    visibility = payload.get("visibility", "unknown")
+    cancel_reason = payload.get("cancel_reason", "none")
+    if (not isinstance(visibility, str) or not isinstance(cancel_reason, str)
+            or visibility not in {"visible", "hidden", "unknown"}
+            or cancel_reason not in {"none", "superseded", "live_owner",
+                                     "revision_changed", "anchor_missing", "aborted"}):
+        return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
     try:
         perf_event(
             "client.history_load",
             status=status,
             mode=mode,
+            visibility=visibility,
+            cancel_reason=cancel_reason,
+            receive_ms=bounded_int("receive_ms"),
+            first_reveal_ms=bounded_int("first_reveal_ms"),
             foreground=bool(payload.get("foreground")),
             total_ms=bounded_int("total_ms"),
             fetch_ms=bounded_int("fetch_ms"),

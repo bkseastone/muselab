@@ -29,6 +29,7 @@ def test_perf_event_is_one_bounded_structured_line(monkeypatch, capsys):
     )
 
     payload = _payload(capsys.readouterr().err)
+    assert isinstance(payload.pop("at_ms"), int)
     assert payload == {
         "event": "chat.turn",
         "sid": "12345678",
