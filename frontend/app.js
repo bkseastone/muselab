@@ -18786,13 +18786,28 @@ function portal() {
         const followTailAtInstall = quiet && (
           opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
         );
+        // Only a complete, stable snapshot of the retired turn can prove a
+        // missing reader anchor was removed, rather than merely outside a tail
+        // page. Rebase to a surviving neighbor in that case; preserve the old
+        // window for partial/full-order or successor snapshots.
+        const completion = s.completion_state;
+        const verifiedCompletion = completion?.stable === true && !completion.active
+          && (opts.completedBoundary?.uuid
+            ? all.some(message => message.uuid === opts.completedBoundary.uuid)
+            : !!completion.completed_turn_id
+              && [st.activeTurnId, st._lastTerminalTurnId]
+                .includes(completion.completed_turn_id));
+        const allowRemovedAnchors = verifiedCompletion
+          && !full && !preserveFullOrder && !s.has_more && !s.has_later
+          && Number(s.offset) === 0 && Number(s.total) === all.length;
         const quietRangeResolved = quiet
           ? (followTailAtInstall
             ? {
               start: Math.max(0, all.length - this._liveMessageDomCap()),
               end: all.length,
             }
-            : this._resolveMessageRangeSnapshot(all, quietRangeSnapshot))
+            : this._resolveMessageRangeSnapshot(
+              all, quietRangeSnapshot, allowRemovedAnchors))
           : null;
         // A quiet response that no longer contains the reader's stable message
         // anchor belongs to another coordinate system (for example full/around vs
@@ -19889,6 +19904,13 @@ function portal() {
       const end = Math.max(start, Math.min(range.visibleEnd, st.messages.length));
       return {
         followTail: st.atBottom !== false && !this._messageRangeHasLater(st),
+        // Edges may be transient tool/live blocks removed by canonicalization.
+        // Retain identities throughout the range, plus neighbors for a verified
+        // complete replacement. Never infer identity from repeated prose.
+        anchors: st.messages.map((message, index) => ({
+          identity: this._historyMessageIdentity(message),
+          key: message._k || "", relativeIndex: index - start,
+        })),
         startIdentity: this._historyMessageIdentity(st.messages[start]),
         endIdentity: this._historyMessageIdentity(st.messages[end - 1]),
         // A completed live row can acquire its UUID during reconciliation.
@@ -19900,7 +19922,7 @@ function portal() {
         generation: range.generation,
       };
     },
-    _resolveMessageRangeSnapshot(messages, snapshot) {
+    _resolveMessageRangeSnapshot(messages, snapshot, allowRemovedAnchors = false) {
       if (!snapshot) return null;
       if (snapshot.followTail) {
         const end = messages.length;
@@ -19925,6 +19947,26 @@ function portal() {
       }
       if (endIndex >= 0) {
         return { start: Math.max(0, endIndex - count + 1), end: endIndex + 1 };
+      }
+      // Surviving interior rows are as authoritative as the old endpoints.
+      // Preserve their relative position when transient range edges disappear.
+      const anchors = snapshot.anchors || [];
+      const interior = anchors.filter(anchor => anchor.relativeIndex >= 0
+        && anchor.relativeIndex < count);
+      const neighbors = allowRemovedAnchors
+        ? anchors.filter(anchor => anchor.relativeIndex < 0
+            || anchor.relativeIndex >= count).sort((a, b) => {
+          const distance = anchor => anchor.relativeIndex < 0
+            ? -anchor.relativeIndex : anchor.relativeIndex - count + 1;
+          return distance(a) - distance(b);
+        }) : [];
+      for (const anchor of [...interior, ...neighbors]) {
+        const index = resolveIndex(anchor.identity, anchor.key);
+        if (index < 0) continue;
+        const start = Math.max(0, Math.min(
+          index - anchor.relativeIndex, Math.max(0, messages.length - count),
+        ));
+        return { start, end: Math.min(messages.length, start + count) };
       }
       return null;
     },
