@@ -3271,7 +3271,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "if (!isContinuation)" in send
     assert "all = this._preserveCanonicalMessageIdentity(st, all, completedBoundary)" in load
     assert "const quietRangeSnapshot = quiet" in load
-    assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
+    assert re.search(r"this\._resolveMessageRangeSnapshot\(\s*all, quietRangeSnapshot, allowRemovedAnchors\)", load)
     assert "this._historyReplaceStillOwns(st, historyReplaceToken)" in load
     assert "await new Promise(resolve => this.$nextTick(resolve))" in load
     assert "this._revealMessagesChunked(sid, st, visible, true, () =>" in load
@@ -4059,7 +4059,7 @@ def test_quiet_canonical_reload_rebases_virtual_window_before_alpine_paints():
     assert converge.index(mismatch) < converge.index(takeover) < converge.index(remount)
     assert converge.count(takeover) == 2
     assert "opts.followTail === true" in load
-    assert "this._resolveMessageRangeSnapshot(all, quietRangeSnapshot)" in load
+    assert re.search(r"this\._resolveMessageRangeSnapshot\(\s*all, quietRangeSnapshot, allowRemovedAnchors\)", load)
     assert "if (quiet && !quietRangeResolved)" in load
 
     range_helper_start = app.index("    _captureMessageRangeSnapshot(st) {")

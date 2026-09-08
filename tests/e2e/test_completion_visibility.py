@@ -332,3 +332,96 @@ def test_lost_done_viewport_uses_only_retired_turn_commit(
         "sameOwner": True, "atBottom": False,
     }
     _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+@pytest.mark.parametrize("anchor_kind", ["interior", "transient_only"])
+@pytest.mark.parametrize("background", [False, True])
+def test_completion_recovers_removed_range_edges(
+    page, backend_url, auth_token, anchor_kind, background, width,
+):
+    page.set_viewport_size({"width": width, "height": 900})
+    errors, _, reads = _prepare(page, backend_url, auth_token)
+    result = _app_eval(page, """
+        const st = app.tabState[arg.sid];
+        st.atBottom = false;
+        const prompt = st.messages[0];
+        const partial = st.messages[1];
+        const ephemeral = n => ({role:'assistant', text:'transient ' + n,
+            _k:arg.sid + ':live:transient-' + n});
+        st.messages = arg.kind === 'interior'
+          ? [ephemeral(1), prompt, ephemeral(2), partial]
+          : [prompt, ephemeral(1), partial];
+        st.messageRange.visibleStart = arg.kind === 'interior' ? 0 : 1;
+        st.messageRange.visibleEnd = arg.kind === 'interior' ? 3 : 2;
+        st.messageRange.total = st.messages.length;
+        st._userScrollAt = 10;
+        if (arg.background) app.currentId = 'other-tab';
+        const loaded = await app._runCompletedTurnSync(arg.sid, st, {
+          expectedText:'LIVE_PARTIAL', expectedAssistantUuid:'fixture-final',
+          completedTurnId:'fixture-turn', followTail:false,
+        });
+        const first = {loaded, final:st.messages.at(-1).text,
+          atBottom:st.atBottom, pending:!!st._pendingCompletedTurnSync};
+        if (arg.background) {app.currentId = arg.sid; app._activateTabState(arg.sid);}
+        return first;
+    """, {"sid": SID, "kind": anchor_kind, "background": background})
+    assert result == {"loaded": True, "final": FINAL,
+                      "atBottom": False, "pending": False}
+    expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text(FINAL)
+    _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("boundary", ["partial", "full_order", "unrelated", "active"])
+def test_missing_reader_anchor_does_not_authorize_unrelated_replacement(
+    page, backend_url, auth_token, boundary,
+):
+    errors, history, _ = _prepare(page, backend_url, auth_token)
+    if boundary == "partial":
+        history.update(offset=20, total=22, has_more=True)
+    elif boundary == "active":
+        history["completion_state"]["active"] = True
+    elif boundary == "unrelated":
+        history["completion_state"]["completed_turn_id"] = "another-turn"
+    result = _app_eval(page, """
+        const st = app.tabState[arg.sid];
+        st.activeTurnId = 'fixture-turn';
+        st.atBottom = false;
+        st.messages.splice(1, 0, {role:'assistant', text:'reader anchor',
+          _k:arg.sid + ':live:reader'});
+        st.messageRange.visibleStart = 1;
+        st.messageRange.visibleEnd = 2;
+        st.messageRange.total = 3;
+        if (arg.boundary === 'full_order') st.messageRange.order = 'full';
+        const anchor = st.messages[1];
+        const loaded = await app.loadSession(arg.sid, {quiet:true, probeActive:false});
+        return {loaded, preserved:st.messages[1] === anchor, atBottom:st.atBottom};
+    """, {"sid": SID, "boundary": boundary})
+    assert result == {"loaded": False, "preserved": True, "atBottom": False}
+    _assert_no_browser_errors(page, errors)
+
+
+def test_removed_anchor_recovery_settles_real_scheduler(page, backend_url, auth_token):
+    errors, _, reads = _prepare(page, backend_url, auth_token)
+    _app_eval(page, """
+        const st = app.tabState[arg];
+        st.atBottom = false;
+        st.messages.splice(1, 0, {role:'assistant', text:'transient reader block',
+          _k:arg + ':live:reader'});
+        Object.assign(st.messageRange, {visibleStart:1, visibleEnd:2, total:3});
+        app._requestSessionSync = window.realVisibilityRequest;
+        app._reconcileCompletedTurn(arg, st, 'LIVE_PARTIAL', 0,
+          'fixture-final', 'fixture-turn', {followTail:false});
+    """, SID)
+    page.wait_for_function("""sid => {
+        const st = document.querySelector('#app')._x_dataStack[0].tabState[sid];
+        return !st._pendingCompletedTurnSync && st._installedCanonicalCount === 2;
+    }""", arg=SID)
+    result = _app_eval(page, """
+        const st = app.tabState[arg];
+        return {atBottom:st.atBottom, text:st.messages.at(-1).text};
+    """, SID)
+    assert result == {"atBottom": False, "text": FINAL}
+    expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text(FINAL)
+    assert sum('?tail=' in url for url in reads) == 1
+    _assert_no_browser_errors(page, errors)
