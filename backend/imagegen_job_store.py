@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import sys
 import threading
@@ -81,6 +82,7 @@ class ImagegenJobStore:
     ) -> None:
         self.path = Path(path)
         self.max_jobs = max(1, max_jobs)
+        self.archive_dir = self.path.with_name(f"{self.path.stem}-archive")
         self._clock = clock
         self._writer = writer or _default_writer
         self._state_lock = threading.RLock()
@@ -155,16 +157,32 @@ class ImagegenJobStore:
                         flush=True,
                     )
 
+    def _archive_path(self, job_id: str) -> Path:
+        # IDs originate in API routes as well as legacy metadata. Hashing keeps
+        # archived lookup within its private directory for every possible ID.
+        name = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+        return self.archive_dir / f"{name}.json"
+
+    def _read_archive(self, job_id: str) -> Job | None:
+        try:
+            job = json.loads(self._archive_path(job_id).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        if not isinstance(job, dict) or job.get("id") != job_id:
+            raise ValueError("invalid archived image generation job")
+        return job
+
     def _prepared(self, snapshot: Jobs) -> tuple[Jobs, str]:
-        ordered = dict(
-            sorted(snapshot.items(), key=_created_at, reverse=True)[
-                : self.max_jobs
-            ]
-        )
+        rows = sorted(snapshot.items(), key=_created_at, reverse=True)
+        # max_jobs limits the hot history window, never the lifetime of a
+        # user's result. Active/unknown states are retained until terminal.
+        ordered = {
+            job_id: job for index, (job_id, job) in enumerate(rows)
+            if index < self.max_jobs
+            or job.get("status") not in {"succeeded", "failed", "cancelled"}
+        }
         payload = json.dumps(
-            {"jobs": ordered},
-            ensure_ascii=False,
-            separators=(",", ":"),
+            {"jobs": ordered}, ensure_ascii=False, separators=(",", ":"),
         )
         return ordered, payload
 
@@ -180,6 +198,12 @@ class ImagegenJobStore:
                     revision = self._revision
                     snapshot = copy.deepcopy(self._jobs or {})
             ordered, payload = self._prepared(snapshot)
+            # Archive first. If any archive/main write fails, the old hot file
+            # and in-memory rows still own every result; a later flush retries.
+            for job_id, job in snapshot.items():
+                if job_id not in ordered:
+                    self._writer(self._archive_path(job_id), json.dumps(
+                        job, ensure_ascii=False, separators=(",", ":")))
             self._writer(self.path, payload)
             with self._state_lock:
                 self._persisted_revision = max(
@@ -200,7 +224,9 @@ class ImagegenJobStore:
         self._ensure_loaded()
         with self._state_lock:
             job = (self._jobs or {}).get(job_id)
-            return copy.deepcopy(job) if job is not None else None
+            if job is not None:
+                return copy.deepcopy(job)
+        return self._read_archive(job_id)
 
     def list(self, limit: int) -> list[Job]:
         self._ensure_loaded()
@@ -228,12 +254,12 @@ class ImagegenJobStore:
         return copy.deepcopy(stored)
 
     def update(self, job_id: str, **patch: Any) -> Job | None:
-        self._ensure_loaded()
+        existing = self.get(job_id)
+        if existing is None:
+            return None
         with self._state_lock:
             assert self._jobs is not None
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
+            job = self._jobs.setdefault(job_id, existing)
             job.update(copy.deepcopy(patch))
             job["updated_at"] = self._clock()
             self._revision += 1
@@ -257,7 +283,8 @@ class ImagegenJobStore:
                     continue
                 changed = ordered != self._jobs
                 if changed:
-                    self._jobs = copy.deepcopy(ordered)
+                    # Persist the full snapshot so _persist_snapshot can archive
+                    # displaced rows before publishing the smaller hot window.
                     self._revision += 1
                 revision = self._revision
                 current = copy.deepcopy(self._jobs)

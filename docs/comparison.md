@@ -5,18 +5,32 @@
 These tables are provided to help you determine quickly whether muselab fits
 your use case, or whether one of the alternatives is a better match.
 
+**Review date: 2026-09-08.** This is a comparison of product scope, not a
+cross-product benchmark. This update checked CloudCLI's public repository and
+package dependencies; other product entries have not received a complete
+version-specific verification. Features and subscription access can vary by
+version, plan, provider, and model. Configuring a model does not establish full
+SDK feature compatibility; validate the tools and workflows you need.
+
+CloudCLI (formerly Claude Code UI, repository `claudecodeui`) documents a
+one-command self-hosted start, `npx @cloudcli-ai/cloudcli`, with Node.js 22+.
+Its package declares both `@anthropic-ai/claude-agent-sdk` and
+`@openai/codex-sdk`; dependencies alone do not prove which runtime every
+execution path uses. Sources: [official repository](https://github.com/siteboon/claudecodeui)
+and [package.json](https://github.com/siteboon/claudecodeui/blob/main/package.json).
+
 ## vs. general chat UIs
 
-|  | muselab | claudecodeui | LobeChat | AnythingLLM | Claude Code CLI |
+|  | muselab | CloudCLI / claudecodeui | LobeChat | AnythingLLM | Claude Code CLI |
 |---|---|---|---|---|---|
-| Primary purpose | Local workspaces + executable Agent | IDE for multi-CLI agents | Multi-model chat + plugin store | RAG over your docs | Terminal coding agent |
-| Self-hosted | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Primary purpose | Local workspaces + executable Agent | Web/mobile UI for coding agents | Multi-model chat + plugin store | Document chat; broader agent scope not verified | Terminal coding agent |
+| Self-hosted | ✅ | ✅ | ✅ | ✅ | N/A (runs locally) |
 | Browser access | ✅ | ✅ | ✅ | ✅ | ❌ |
 | HTML / PDF / image preview | ✅ | ⚠️ | ⚠️ | ⚠️ | ❌ |
 | Real PTY terminal in browser | ✅ multi-terminal + profiles | ✅ multi-tab | ❌ | ❌ | n/a (runs in your terminal) |
-| **Full agent SDK on every model** | ✅ | ⚠️ Claude-mostly | ⚠️ own agent + MCP | ❌ RAG focus | ✅ Claude only |
+| Agent / SDK integration | Claude Agent SDK; verify capabilities per provider/model | Claude Agent SDK and Codex SDK dependencies; verify capabilities per provider/model | Not verified | Not verified | N/A (CLI) |
 | Reuse Claude Pro subscription | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Install command count | 1 (curl \| bash) | many | docker compose | docker | brew / npm |
+| Setup entry point | curl \| bash | npx (one command; Node.js 22+) | docker compose | docker | brew / npm |
 
 For **IDE breadth**, consider claudecodeui or code-server.
 For a **plugin marketplace**, consider LobeChat.
@@ -45,13 +59,13 @@ Other names that often come up in the same search:
 
 ## vs. other Claude harnesses
 
-|  | muselab | Claude Code CLI | Claude Desktop | claudecodeui | claude-code-router |
+|  | muselab | Claude Code CLI | Claude Desktop | CloudCLI / claudecodeui | claude-code-router |
 |---|---|---|---|---|---|
-| Uses official **Claude Agent SDK** | ✅ direct | ✅ (canonical impl) | ✅ | ❌ wraps CLI process | ❌ protocol translator |
+| Official **Claude Agent SDK** integration | Direct | N/A (CLI) | Internal SDK use not publicly verified | Declared dependency; also includes Codex SDK | Not verified |
 | Web UI in browser | ✅ | ❌ TTY | ❌ desktop | ✅ | ❌ |
 | Files + previews + real terminal | ✅ integrated | ⚠️ terminal-first | ⚠️ no real terminal | ✅ | ❌ |
-| **Same agent loop on non-Claude models** | ✅ via vendor anthropic-compat | ❌ Anthropic only | ❌ Anthropic only | partial | ⚠ via translation, drops features |
-| Self-host friendly | ✅ | n/a (you already have it) | ❌ closed binary | ✅ | ✅ |
+| Non-Claude model compatibility | Via provider compatibility layer; validate required SDK capabilities per provider/model | Not verified | Not verified | Verify per provider/model; SDK dependencies do not establish feature parity | Verify per provider/model |
+| Self-host friendly | ✅ | N/A (runs locally) | N/A (desktop app) | ✅ | ✅ |
 | Open source | ✅ MIT | ❌ | ❌ | ✅ AGPL-3.0 | ✅ MIT |
 
 muselab puts the Agent loop in a self-hosted local workspace that is accessible

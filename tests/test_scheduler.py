@@ -352,6 +352,9 @@ async def test_sdk_turn_rejects_pooled_eof_without_result(
         async def query(self, _prompt):
             stream.queue.put_nowait(chat._STREAM_EOF)
 
+        async def disconnect(self):
+            return None
+
     monkeypatch.setattr(
         sessions,
         "get_session",

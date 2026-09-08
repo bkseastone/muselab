@@ -115,3 +115,7 @@ process during a rolling restart: unique records are appended safely.
 7. Run `bash scripts/doctor.sh` for a basic health check.
 
 Backups contain tokens, API keys, OAuth credentials, and Push private keys. Terminal profiles can also contain user-written commands. Encrypt them and never commit them to Git or place them on a shared drive.
+
+## Persistent Docker configuration layout
+
+The `/app/sessions` mount also contains `config/.env`, `config/mcp.json`, `config/provider_overrides.json` and `state/muselab/vendor-cli/`. Back up the entire mount as well as the workspace and Claude state mounts. Configuration is not rebuildable cache. Saved UI values override matching bootstrap env-file values; back up and explicitly edit the persistent file when resetting them. Before upgrading an older image, export its unmounted state using the [migration guide](docker-state-migration.md).

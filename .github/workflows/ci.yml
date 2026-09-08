@@ -99,9 +99,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Check all owned frontend JS and manifest
         run: bash scripts/check-frontend.sh
+      - name: Verify bundled vendor hashes and notices
+        run: python3 scripts/check-vendor.py
 
   # Dependency vulnerability scan. dependabot keeps deps current, but doesn't
   # surface KNOWN CVEs in the currently-pinned set — pip-audit does. Runs
@@ -109,6 +111,7 @@ jobs:
   # frozen baseline is clean, so a newly introduced known vulnerability blocks
   # the change instead of being hidden behind a green workflow conclusion.
   security:
+    # Keep the existing check name for branch-protection compatibility.
     name: pip-audit (dependency CVE scan)
     runs-on: ubuntu-latest
     steps:
@@ -123,6 +126,8 @@ jobs:
         # Audit the resolved environment. pip-audit is pulled ephemerally via
         # `uv run --with` so it doesn't touch the frozen lockfile.
         run: uv run --with pip-audit pip-audit
+      - name: Audit shipped frontend dependency versions
+        run: uv run --frozen python scripts/check-vendor.py --audit
 
   # Small, deliberately stable browser subset fails fast on critical journeys.
   # The required full suite below remains the release gate for the complete

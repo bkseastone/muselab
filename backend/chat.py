@@ -13512,39 +13512,16 @@ async def attach_image_generate_job_image(job_id: str, image_id: str) -> dict:
 
 
 def _validate_xlsx_archive(body: bytes) -> None:
-    """Reject encrypted, oversized, or suspiciously compressed workbooks."""
-    import io
-    import zipfile
+    """Share workbook validation while preserving import-time compatibility."""
+    from .spreadsheet_safety import validate_xlsx_archive
 
-    try:
-        with zipfile.ZipFile(io.BytesIO(body)) as archive:
-            infos = archive.infolist()
-    except (zipfile.BadZipFile, zipfile.LargeZipFile):
-        raise HTTPException(
-            422,
-            "failed to parse spreadsheet (file may be corrupt or unsupported)",
-        ) from None
-    if len(infos) > _XLSX_ARCHIVE_MAX_ENTRIES:
-        raise HTTPException(422, "spreadsheet archive exceeds safe entry budget")
-    total_uncompressed = 0
-    for info in infos:
-        if info.flag_bits & 0x1:
-            raise HTTPException(
-                422, "encrypted spreadsheets are not supported")
-        if info.file_size > _XLSX_ARCHIVE_MAX_MEMBER_BYTES:
-            raise HTTPException(
-                422, "spreadsheet archive member exceeds safe size budget")
-        total_uncompressed += info.file_size
-        if total_uncompressed > _XLSX_ARCHIVE_MAX_UNCOMPRESSED_BYTES:
-            raise HTTPException(
-                422, "spreadsheet archive exceeds safe unpacked size budget")
-        if (
-            info.file_size > 0
-            and info.file_size
-            > max(1, info.compress_size) * _XLSX_ARCHIVE_MAX_COMPRESSION_RATIO
-        ):
-            raise HTTPException(
-                422, "spreadsheet archive exceeds safe compression ratio")
+    validate_xlsx_archive(
+        body,
+        max_entries=_XLSX_ARCHIVE_MAX_ENTRIES,
+        max_uncompressed_bytes=_XLSX_ARCHIVE_MAX_UNCOMPRESSED_BYTES,
+        max_member_bytes=_XLSX_ARCHIVE_MAX_MEMBER_BYTES,
+        max_compression_ratio=_XLSX_ARCHIVE_MAX_COMPRESSION_RATIO,
+    )
 
 
 def _xlsx_to_text(body: bytes, name: str) -> str:
@@ -14707,7 +14684,8 @@ async def _watch_inflight_tasks(
     pending: dict[str, str | None],
     generation: int | None = None,
     origin_turn_id: str = "",
-) -> None:
+    drain_queue: bool = True,
+) -> dict[str, Any]:
     """Detached reader keeping an originating CLI client alive past its turn so
     SDK background tasks started in that turn can deliver their terminal
     TaskNotification (the probe showed it lands AFTER ResultMessage) AND so the
@@ -14734,6 +14712,8 @@ async def _watch_inflight_tasks(
     this watcher has delivered every settlement + auto-continuation. This is
     deliberately stricter than cancelling the watcher: cancellation could
     leave an old continuation buffered for the next user turn to misattribute."""
+    watch_result = {"text": "", "status": "failed", "terminal_reason": "",
+               "error": "background tasks ended without a final response"}
     watch_started = obs.monotonic()
     watched_task_ids = set(pending)
     continuation_seen = False
@@ -14869,6 +14849,17 @@ async def _watch_inflight_tasks(
             getattr(result, "terminal_reason", None))
         terminal_status = sdk_lifecycle.terminal_status(
             terminal_reason, is_error=bool(error_message), cancelled=cancelled)
+        # The UI scheduler awaits this same owner; expose the final parent
+        # answer without making it consume the SDK stream a second time.
+        watch_result.update(
+            text="".join((state or {}).get("streamed", []))
+                 or str(getattr(result, "result", None) or ""),
+            status=terminal_status if result is not None else (
+                "cancelled" if cancelled else "stopped"
+                if last_settle_status == "stopped" else "failed"),
+            terminal_reason=terminal_reason,
+            error=error_message,
+        )
         cancelled = terminal_status == "cancelled"
         b.cancelled = cancelled
         watcher_cancelled = watcher_cancelled or cancelled
@@ -15599,25 +15590,34 @@ async def _watch_inflight_tasks(
                     and not _sessions_with_inflight_tasks.get(session_id)):
                 _background_turn_started_at.pop(session_id, None)
                 _background_origin_turn_id.pop(session_id, None)
-                if session_id in _pending_runtime_rebuilds:
+                if drain_queue:
+                    if session_id in _pending_runtime_rebuilds:
+                        try:
+                            await _rebuild_session_runtime(session_id)
+                        except Exception as e:
+                            sys.stderr.write(
+                                f"[chat] post-task runtime rebuild failed "
+                                f"sid={session_id[:8]} "
+                                f"exc={type(e).__name__}\n")
                     try:
-                        await _rebuild_session_runtime(session_id)
+                        await _maybe_drain_queue(session_id)
                     except Exception as e:
                         sys.stderr.write(
-                            f"[chat] post-task runtime rebuild failed "
+                            f"[chat] post-task queue drain failed "
                             f"sid={session_id[:8]} "
                             f"exc={type(e).__name__}\n")
-                try:
-                    await _maybe_drain_queue(session_id)
-                except Exception as e:
-                    sys.stderr.write(
-                        f"[chat] post-task queue drain failed "
-                        f"sid={session_id[:8]} "
-                        f"exc={type(e).__name__}\n")
         if (_owns_generation()
                 and not _sessions_with_inflight_tasks.get(session_id)):
             await _settle_active_turn_sidecar_owned(
                 session_id, release=True)
+
+    if watcher_cancelled:
+        watch_result["status"] = "cancelled"
+    elif (watcher_failed or pending) and watch_result["status"] == "completed":
+        watch_result["status"] = "failed"
+    if watch_result["status"] != "completed" and not watch_result["error"]:
+        watch_result["error"] = "background continuation " + watch_result["status"]
+    return watch_result
 
 
 def _merge_session_inflight(
@@ -15657,7 +15657,8 @@ def _spawn_task_watcher(
     *,
     started_at: float | None = None,
     origin_turn_id: str = "",
-) -> None:
+    drain_queue: bool = True,
+) -> asyncio.Task:
     """Start (or replace) the cross-turn watcher for a session whose just-ended
     turn left background tasks in flight."""
     pending = {
@@ -15680,7 +15681,9 @@ def _spawn_task_watcher(
             pending,
             generation,
             origin_turn_id=origin_turn_id,
+            drain_queue=drain_queue,
         ))
+    return _task_watchers[session_id]
 
 
 async def _retire_unpinned_task_watcher(session_id: str) -> None:
@@ -21120,10 +21123,23 @@ async def _observe_scheduled_task_lifecycle(
     delivery: _ScheduledDelivery,
     message: Any,
 ) -> bool:
-    """Handle task lifecycle frames owned by an autonomous Cron turn."""
-    session_id = delivery.key[0]
-    broadcast = delivery.broadcast
-    pending = delivery.pending_tasks
+    return await _observe_background_task_lifecycle(
+        delivery.key[0], delivery.pending_tasks, message,
+        publish=delivery.broadcast.publish,
+    )
+
+
+async def _observe_background_task_lifecycle(
+    session_id: str,
+    pending: dict[str, dict[str, Any]],
+    message: Any,
+    *,
+    publish=None,
+) -> bool:
+    """Share native Cron and UI scheduler task ownership and settlement."""
+    if publish is None:
+        def publish(_event):
+            pass
     if isinstance(message, TaskStartedMessage):
         task_id = str(getattr(message, "task_id", "") or "")
         description = getattr(message, "description", None)
@@ -21139,7 +21155,7 @@ async def _observe_scheduled_task_lifecycle(
                 "description": description,
             }
             _pin_background_task(session_id, task_id)
-            broadcast.publish({"event": "task_started", "data": json.dumps({
+            publish({"event": "task_started", "data": json.dumps({
                 "task_id": task_id,
                 "tool_use_id": getattr(message, "tool_use_id", None),
                 "description": description,
@@ -21147,7 +21163,7 @@ async def _observe_scheduled_task_lifecycle(
             })})
         return True
     if isinstance(message, TaskProgressMessage):
-        broadcast.publish({"event": "task_progress", "data": json.dumps({
+        publish({"event": "task_progress", "data": json.dumps({
             "task_id": getattr(message, "task_id", "") or "",
             "tool_use_id": getattr(message, "tool_use_id", None),
             "last_tool_name": getattr(message, "last_tool_name", None),
@@ -21183,7 +21199,7 @@ async def _observe_scheduled_task_lifecycle(
         pending.pop(task_id, None)
     if outcome:
         terminal["background_tasks_pending"] = len(pending)
-        broadcast.publish({
+        publish({
             "event": "task_notification",
             "data": json.dumps(terminal),
         })

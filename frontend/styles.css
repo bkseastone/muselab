@@ -714,7 +714,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   cursor: pointer; padding: 0;
   transition: color var(--t-fast);
 }
-.mobile-tab-bar button.active { color: var(--c-accent); }
+.mobile-tab-bar button.active { color: var(--c-accent-fg); }
 .mobile-tab-bar button .icon svg { width: 14px; height: 14px; }
 
 /* ==========================================================================
@@ -1689,7 +1689,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   min-width: 0; max-height: 100%; overflow: hidden; line-height: 1.25;
 }
 .pane-head .pane-fileinfo-path {
-  color: var(--c-fg-4); font-size: var(--fs-xs); font-weight: var(--fw-normal);
+  color: var(--c-fg-3); font-size: var(--fs-xs); font-weight: var(--fw-normal);
   max-width: 100%;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   /* fileBreadcrumb() already keeps the useful tail to three directories. */
@@ -1697,7 +1697,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .pane-head .pane-fileinfo-meta,
 .pane-head .pane-fileinfo-mtime {
-  color: var(--c-fg-4); font-size: var(--fs-xs); opacity: 0.82;
+  color: var(--c-fg-3); font-size: var(--fs-xs);
   flex-shrink: 0; font-variant-numeric: tabular-nums;
   /* Never wrap. "上次修改 2026-06-05 15:28" folding one glyph per line is what
      turned a 12px strip into a 50px tower and broke the header. */
@@ -3165,7 +3165,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   content: ""; position: absolute; left: 0; top: 0.3em; bottom: 0.3em;
   width: 3px; background: var(--c-accent); border-radius: 2px; opacity: 0.6;
 }
-.markdown a { color: var(--c-accent-hover); text-decoration: underline; text-decoration-color: var(--c-accent-soft); }
+.markdown a { color: var(--c-accent-fg); text-decoration: underline; text-decoration-color: var(--c-accent-soft); }
 .markdown img { max-width: 100%; border-radius: var(--r-md); cursor: zoom-in; }
 /* Linked images keep the normal link cursor (click follows the link). */
 .markdown a img { cursor: pointer; }
@@ -4138,7 +4138,7 @@ pre.text {
 .activity-custom-group-actions button.danger:hover { color:var(--c-danger); }
 .activity-custom-group-actions button:disabled { opacity:.25; cursor:default; }
 .activity-custom-group-actions svg { width:12px; height:12px; }
-.activity-custom-group-empty { margin:0 4px 4px; padding:12px; border:1px dashed var(--c-border); border-radius:var(--r-sm); color:var(--c-fg-4); font-size:var(--fs-xs); text-align:center; }
+.activity-custom-group-empty { margin:0 4px 4px; padding:12px; border:1px dashed var(--c-border); border-radius:var(--r-sm); color:var(--c-fg-3); font-size:var(--fs-xs); text-align:center; }
 /* Group view mirrors the clearer TODO-board hierarchy: each custom group is a
    self-contained lane with a strong header, card-like sessions and a generous
    empty drop target. The ledger/status views keep their compact row styling. */
@@ -4720,7 +4720,7 @@ pre.text {
    width: fit-content + max-width: min(78%, 720px) 在这里和上面那条
    规则打架，最终用户看到 bubble 永远撑不到和 muse 对称的宽度。 */
 .msg.user .bubble {
-  background: var(--c-accent); color: white;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   border-bottom-right-radius: var(--r-sm);
 }
 .msg.user .bubble.is-scheduled-trigger {
@@ -4746,7 +4746,7 @@ pre.text {
    continuous blocks (asymmetric long-message widths). Just keep
    word-break so long unbroken strings still wrap. */
 .user-msg-text { word-break: break-word; }
-html[data-theme="light"] .msg.user .bubble:not(.is-scheduled-trigger) { color: white; }
+html[data-theme="light"] .msg.user .bubble:not(.is-scheduled-trigger) { color: var(--c-on-accent); }
 
 /* Compact-summary pill — shown above the message that contains the
    isCompactSummary content returned by SDK after /compact. Centered, dashed
@@ -5208,7 +5208,7 @@ html[data-theme="light"] .msg.user .bubble:not(.is-scheduled-trigger) { color: w
   padding: 1px 5px;
   border-radius: var(--r-sm);
 }
-.file-link:hover { color: var(--c-accent-hover); background: var(--c-accent-soft); }
+.file-link:hover { color: var(--c-accent-fg); background: var(--c-accent-soft); }
 .tool-arg.file-link {
   font-size: inherit;
   /* Allow long absolute paths to wrap rather than ellipsis-truncate —
@@ -5262,7 +5262,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 
 .bubble ul, .bubble ol { padding-left: 1.4em; margin: 0.4em 0; }
 .bubble li { margin: 2px 0; }
-.bubble a { color: var(--c-accent-hover); text-decoration: underline; }
+.bubble a { color: var(--c-accent-fg); text-decoration: underline; }
 /* Tables (GFM) — `marked` emits them but the styles previously only
    existed under .markdown (preview pane). Bubble didn't inherit, so
    tables rendered as a wall of plaintext. Mirror the preview rules. */
@@ -8666,7 +8666,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .settings-section:last-child { margin-bottom: 0; }
 .settings-section-title {
   font-size: var(--fs-xs); font-weight: var(--fw-semibold);
-  color: var(--c-accent); letter-spacing: 1px; text-transform: uppercase;
+  color: var(--c-accent-fg); letter-spacing: 1px; text-transform: uppercase;
   margin-bottom: var(--sp-3); padding-bottom: var(--sp-2);
   border-bottom: 1px solid var(--c-border);
   position: relative;
@@ -8699,7 +8699,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-fg-3); background: var(--c-bg-1);
   white-space: nowrap;
 }
-.settings-save-mode.live   { color: #2c8a4f; border-color: rgba(44,138,79,0.30); background: rgba(44,138,79,0.08); }
+.settings-save-mode.live   { color: var(--c-success); border-color: rgba(44,138,79,0.30); background: rgba(44,138,79,0.08); }
 .settings-save-mode.batch  { color: var(--c-fg-2); }
 .settings-save-mode.reload { color: #b25e1d; border-color: rgba(178,94,29,0.35); background: rgba(178,94,29,0.08); }
 /* Subdivider within a settings-section (e.g. "本设备" / "服务端开关"
@@ -12320,7 +12320,7 @@ html[data-theme="eyecare"] .tool-error-hint {
   font-size: 11px;
 }
 .memory-tabs button.active {
-  color: var(--c-accent);
+  color: var(--c-accent-fg);
   background: color-mix(in srgb, var(--c-accent) 12%, transparent);
 }
 .memory-filters { margin: 6px 0 10px; }
@@ -12549,3 +12549,9 @@ html[data-theme="eyecare"] .tool-error-hint {
 
 /* Expanded diagnostics must not inherit legacy negative hint margins. */
 .settings-modal .settings-advanced > .settings-hint { margin:10px 0 12px; }
+
+/* Keep vendor styles verbatim; these owned overrides improve light-theme code contrast. */
+html[data-theme="light"] .hljs-built_in,
+html[data-theme="light"] .hljs-symbol,
+html[data-theme="eyecare"] .hljs-built_in,
+html[data-theme="eyecare"] .hljs-symbol { color: #9a3e00; }

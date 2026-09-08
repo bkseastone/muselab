@@ -23,6 +23,8 @@ import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .config_paths import PROVIDER_OVERRIDES_PATH
+
 
 @dataclass(frozen=True)
 class Provider:
@@ -651,7 +653,7 @@ CATALOG: tuple[Provider, ...] = (
 # which is user-editable). Built-ins → "b:<prefix>"; user-created → "c:<slug>".
 # Overrides / deletions / restore all key off this id.
 # ===========================================================================
-OVERRIDES_PATH = Path(__file__).resolve().parent.parent / "provider_overrides.json"
+OVERRIDES_PATH = PROVIDER_OVERRIDES_PATH
 
 # Fields a stored override / custom provider may carry. supports_thinking,
 # supports_effort, and max_output_tokens are intentionally NOT user-editable in

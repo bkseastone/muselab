@@ -23,21 +23,42 @@ inside a workspace. Operate accordingly:
 
 - Path traversal or escaping symlinks outside the selected registered workspace in file APIs
 - Reading or overwriting credential-shaped files (`.env*`, SSH private keys, `*.pem`, `credentials.json`, etc.) — blocked even with a valid token
-- Same-origin XSS via uploaded `.html` / `.svg` / Markdown — `/api/files/raw` serves arbitrary types as `application/octet-stream` attachments, HTML/SVG are served with a strict CSP and sandbox, and rendered Markdown is run through DOMPurify before insertion
+- Same-origin script access from previewed `.html` / `.svg` / Markdown — raw HTML/SVG use an opaque-origin sandbox and scoped preview tickets, and Markdown passes through DOMPurify before insertion. If the sanitizer is unavailable, the app displays escaped plain text. Previewed scripts may still request external HTTPS resources; the sandbox is not a network-isolation boundary.
 - Token length below 16 characters or `MUSELAB_ROOT` pointing at system paths — refused at startup
 - Timing side-channel on token comparison — constant-time comparison via `hmac.compare_digest`
 - Default response headers: `X-Content-Type-Options: nosniff` (no MIME sniffing of file previews) · `Referrer-Policy: same-origin` (tokens in query strings do not leak via cross-origin `Referer`) · `X-Frame-Options: SAMEORIGIN` (external sites cannot iframe the UI)
-- `noindex, nofollow, noarchive` meta tags and `/robots.txt` — accidental public exposure will not result in crawling
+- `noindex, nofollow, noarchive` meta tags and `/robots.txt` discourage cooperating search crawlers. They do not enforce access control or prevent discovery of an exposed service.
 
 ## Reverse-proxy logging caveat
 
-The streaming chat endpoint uses Server-Sent Events (`EventSource`), which the
-browser spec forbids from sending custom headers. The auth token therefore
-travels as a query string parameter (`?token=…`) on that one endpoint only.
-muselab's own access log strips it before writing (`_TokenFilter` in
-`backend/main.py`), but a reverse proxy in front of muselab will record the
-raw URL by default. **If you put muselab behind nginx / Caddy / a CDN,
-configure access logs to strip or mask the `token` query parameter.**
+First-party browser requests use the following credentials:
+
+| Surface | Credential | Boundary |
+|---|---|---|
+| Normal API fetch | `X-Auth-Token` header | Full single-user service authority |
+| Chat SSE / multiplex stream | Header-authenticated mint, then a single-use stream ticket | Expiring stream/subscription parameters |
+| Terminal WebSocket | Single-use ticket in the WebSocket subprotocol | One terminal/workspace; 30-second admission window |
+| HTML, SVG, images, PDF and relative Markdown images | Preview ticket | One resolved file and registered workspace; reusable for browser range/conditional requests during its TTL |
+| File downloads and chat exports | Single-use resource ticket | Exact file/workspace or exact session export |
+
+Preview tickets default to 600 seconds and can be configured from 30 to 3600
+seconds with `MUSELAB_PREVIEW_TICKET_TTL_S`. They are held in process memory,
+not localStorage. They authorize that path during the TTL, including updates
+to the same file; they do not grant general API or other-file access.
+
+First-party file resource URLs do not contain the long-lived global token.
+Legacy query-token routes remain for older clients; the SSE compatibility
+fallback can also emit a query token when connected to an older server that
+lacks stream-ticket endpoints. A legacy `/api/files/raw?token=…`
+request redirects to a scoped ticket before serving the document, so even a
+script-capable SVG opened in a new tab cannot read the global token from its
+own URL. The **initial legacy request can still appear in a proxy log or
+browser history**; a redirect cannot erase logs already written.
+
+MuseLab's own access-log filter removes sensitive query values, but proxies
+and CDNs have independent logs. Redact both `token` and `ticket`, or omit
+query strings entirely. Treat unexpired resource URLs as limited bearer links.
+
 Examples:
 
 ```nginx
@@ -55,10 +76,22 @@ log {
     format filter {
         request>uri query {
             delete token
+            delete ticket
         }
     }
 }
 ```
+
+## Bundled frontend dependencies
+
+`frontend/vendor/manifest.json` records exact shipped frontend versions, file
+hashes, sources and license material. Run `python scripts/check-vendor.py` to
+check the inventory and `python scripts/check-vendor.py --audit` to check the
+listed npm versions against OSV. The scan prints reviewed version matches
+where the affected implementation is absent from the exact hash-bound bundle,
+and identifies upstream fragments whose npm version cannot be established.
+See `scripts/vendor/README.md` for those precise limits. Python `pip-audit` covers a different graph;
+neither check alone audits the OS image or proves absence of vulnerabilities.
 
 ## What muselab does NOT defend against
 

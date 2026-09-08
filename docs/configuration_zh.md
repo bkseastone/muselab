@@ -20,7 +20,9 @@ muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 | `MUSELAB_HOST` | uvicorn 监听接口 | `127.0.0.1` |
 | `MUSELAB_PORT` | 监听端口 | `8765` |
 | `MUSELAB_URL` | 可选远程客户端使用的公开 HTTPS origin | 本机 origin |
-| `MUSELAB_ENV_PATH` | 设置 API 读写的 `.env` 路径；测试或特殊部署使用 | `<repo>/.env` |
+| `MUSELAB_CONFIG_DIR` | 可写 `.env`、MCP 与 provider 配置目录；启动前通过进程环境设置 | `<repo>`；Docker 为 `/app/sessions/config` |
+| `MUSELAB_ENV_PATH` | 启动读取、设置 API 写入的显式 `.env` 路径；通过进程环境设置 | `$MUSELAB_CONFIG_DIR/.env` |
+| `MUSELAB_ENV_OVERRIDE` | 启动时配置文件是否覆盖已有进程变量 | `0`；Docker 为 `1`，保证网页配置在重建后生效 |
 | `MUSELAB_SESSIONS_DIR` | 持久化会话元数据目录 | `<repo>/sessions` |
 | `MUSELAB_MODEL` | 新会话默认模型；未设置时使用内置 Claude 默认值 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | 设置面板保存的默认模型，与 `MUSELAB_MODEL` 同步 | `claude-sonnet-4-6` |
@@ -33,6 +35,8 @@ muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 `MUSELAB_SESSIONS_DIR` 保存 muselab 的会话索引、sidecar、队列与重启恢复哨兵，
 不保存 CLI transcript 正文。原生安装脚本会把当前 checkout 的绝对
 `<repo>/sessions` 路径写入 `.env`；未设置时仍回退到仓库内默认目录，以兼容旧部署。
+Docker 额外设置 `XDG_STATE_HOME=/app/sessions/state`，将第三方 CLI 正文放入同一个持久挂载，
+可编辑配置位于 `config/` 子目录。替换旧容器前先阅读[旧状态迁移](docker-state-migration_zh.md)。
 
 ## 多工作区
 
@@ -63,7 +67,7 @@ Claude 可使用 `claude login` 或 `ANTHROPIC_API_KEY`。内置 Anthropic-compa
 
 MiniMax 国内与国际 key 不通用；Qwen 两个区域分组共用 key、使用不同 endpoint。模型与分组会随版本变化，设置面板和 `/api/chat/providers` 是当前事实来源。
 
-设置面板对内置 provider 的修改、自定义 provider 和删除状态保存在 `<repo>/provider_overrides.json`。MCP server 配置保存在 `<repo>/mcp.json`。自定义 provider key 使用 `MUSELAB_PROVIDER_<SLUG>_API_KEY`。
+设置面板对内置 provider 的修改、自定义 provider 和删除状态保存在 `$MUSELAB_CONFIG_DIR/provider_overrides.json`。MCP server 配置保存在 `$MUSELAB_CONFIG_DIR/mcp.json`，原生安装默认仍位于仓库内。自定义 provider key 使用 `MUSELAB_PROVIDER_<SLUG>_API_KEY`。
 
 ## 长期记忆
 

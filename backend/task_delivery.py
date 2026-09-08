@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from . import sessions as sess
+from . import sessions as sess, sdk_lifecycle
 from .private_storage import ensure_private_regular_file, write_private_bytes
 from .runtime_identity import inspect_workspace, task_diff
 
@@ -251,7 +251,10 @@ def observe_message(sid: str, turn_id: str, message: Any) -> None:
                 turn["message_id"] = message.uuid
         elif isinstance(message, ResultMessage):
             turn.update(
-                status="failed" if message.is_error else "completed",
+                status=sdk_lifecycle.terminal_status(
+                    getattr(message, "terminal_reason", None),
+                    is_error=bool(message.is_error),
+                ),
                 ended_at=time.time(),
                 terminal_reason=str(getattr(message, "terminal_reason", "") or ""),
             )

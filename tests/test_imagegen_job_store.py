@@ -64,7 +64,7 @@ def test_concurrent_save_update_and_cleanup_converge(tmp_path, store_tools):
     path = tmp_path / "imagegen" / "jobs.json"
     store = ImagegenJobStore(path, max_jobs=3)
     for index in range(1, 4):
-        store.put(_job(f"job-{index}", float(index)))
+        store.put(_job(f"job-{index}", float(index), status="succeeded"))
 
     barrier = threading.Barrier(3)
 
@@ -230,3 +230,116 @@ def test_writer_serialization_publishes_newest_concurrent_mutation(
         == "succeeded"
     )
     assert _read_jobs(path)["job-1"]["status"] == "succeeded"
+
+
+def test_201st_job_archives_history_and_keeps_old_result_accessible(tmp_path, store_tools):
+    ImagegenJobStore, _atomic_write_text = store_tools
+    path = tmp_path / "imagegen" / "jobs.json"
+    store = ImagegenJobStore(path, max_jobs=200)
+    result = path.parent / "files" / "job-0" / "image-1.png"
+    result.parent.mkdir(parents=True)
+    result.write_bytes(b"synthetic result")
+    first = _job("job-0", 0.0, status="succeeded")
+    first["images"] = [{"file": "image-1.png"}]
+    store.put(first)
+    for index in range(1, 201):
+        store.put(_job(f"job-{index}", float(index), status="succeeded"))
+    assert len(store.snapshot()) == 200
+    assert "job-0" not in _read_jobs(path)
+    assert store.get("job-0") == first
+    assert ImagegenJobStore(path).get("job-0") == first
+    assert result.read_bytes() == b"synthetic result"
+    archived = store._archive_path("job-0")
+    assert archived.stat().st_mode & 0o777 == 0o600
+    assert archived.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_active_jobs_are_never_removed_by_history_budget(tmp_path, store_tools):
+    ImagegenJobStore, _atomic_write_text = store_tools
+    store = ImagegenJobStore(tmp_path / "imagegen" / "jobs.json", max_jobs=2)
+    for index in range(4):
+        store.put(_job(f"job-{index}", float(index), status="running"))
+    store.cleanup()
+    assert len(store.snapshot()) == 4
+    assert len(_read_jobs(store.path)) == 4
+    assert not store.archive_dir.exists()
+    store.update("job-0", status="succeeded")
+    assert len(store.snapshot()) == 3
+    assert store.get("job-0")["status"] == "succeeded"
+
+
+def test_archive_failure_does_not_discard_hot_metadata(tmp_path, store_tools):
+    ImagegenJobStore, atomic_write_text = store_tools
+    path = tmp_path / "imagegen" / "jobs.json"
+    fail_archive = True
+
+    def writer(target, payload):
+        if fail_archive and target.parent.name == "jobs-archive":
+            raise OSError("injected archive failure")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, payload, mode=0o600)
+
+    store = ImagegenJobStore(path, max_jobs=1, writer=writer)
+    store.put(_job("old", 0., status="succeeded"))
+    with pytest.raises(OSError, match="injected archive failure"):
+        store.put(_job("new", 1., status="succeeded"))
+    assert store.get("old") is not None
+    assert "old" in _read_jobs(path)
+    assert "old" in store.snapshot()
+    fail_archive = False
+    store.flush()
+    assert list(store.snapshot()) == ["new"]
+    assert ImagegenJobStore(path).get("old")["status"] == "succeeded"
+
+
+def test_archived_job_update_is_durable_and_can_become_active(tmp_path, store_tools):
+    ImagegenJobStore, _atomic_write_text = store_tools
+    path = tmp_path / "imagegen" / "jobs.json"
+    store = ImagegenJobStore(path, max_jobs=1)
+    store.put(_job("old", 0., status="succeeded"))
+    store.put(_job("new", 1., status="succeeded"))
+    assert store.update("old", error="corrected")["error"] == "corrected"
+    assert ImagegenJobStore(path).get("old")["error"] == "corrected"
+    store.update("old", status="running")
+    assert "old" in store.snapshot()
+    assert store.get("old")["status"] == "running"
+    store.update("old", status="failed", error="cancelled")
+    assert ImagegenJobStore(path).get("old")["error"] == "cancelled"
+
+
+def test_cleanup_archives_every_displaced_row_before_trimming(tmp_path, store_tools):
+    ImagegenJobStore, _atomic_write_text = store_tools
+    path = tmp_path / "imagegen" / "jobs.json"
+    store = ImagegenJobStore(path, max_jobs=3)
+    for index in range(3):
+        store.put(_job(f"job-{index}", float(index), status="succeeded"))
+    store.max_jobs = 1
+    assert store.cleanup()
+    assert len(store.snapshot()) == 1
+    reopened = ImagegenJobStore(path, max_jobs=1)
+    assert all(reopened.get(f"job-{index}") is not None for index in range(3))
+
+
+def test_archived_image_remains_available_through_existing_api(client, auth, monkeypatch):
+    from backend import chat
+    from backend.imagegen_job_store import ImagegenJobStore
+
+    store = ImagegenJobStore(chat._IMAGEGEN_JOBS_PATH, max_jobs=1)
+    monkeypatch.setattr(chat, "_imagegen_job_store", store)
+    image_dir = chat._IMAGEGEN_FILES / "old"
+    image_dir.mkdir(parents=True)
+    (image_dir / "image-1.png").write_bytes(b"synthetic image bytes")
+    old = _job("old", 0., status="succeeded")
+    old["images"] = [{
+        "image_id": "old-image", "file": "image-1.png", "mime": "image/png",
+        "name": "image-1.png", "bytes": 21,
+    }]
+    store.put(old)
+    store.put(_job("new", 1., status="succeeded"))
+    response = client.get("/api/chat/image-generate/jobs/old", headers=auth)
+    assert response.status_code == 200
+    assert response.json()["job"]["id"] == "old"
+    image_url = response.json()["job"]["images"][0]["url"]
+    result = client.get(image_url, headers=auth)
+    assert result.status_code == 200
+    assert result.content == b"synthetic image bytes"

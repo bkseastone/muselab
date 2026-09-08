@@ -381,6 +381,9 @@ function portal() {
     connState: "ok",
     _connFails: 0,
     _connHeartbeat: null,
+    _healthAbort: null,
+    _healthGeneration: 0,
+    _healthLifecycleBound: false,
     _presenceTimer: null,
     _presenceVisibilityHandler: null,
     _presencePagehideHandler: null,
@@ -600,6 +603,9 @@ function portal() {
     // Path-bound, short-lived credentials for script-capable HTML iframes.
     // Kept in memory only; never persisted alongside the long-lived API token.
     _previewTickets: {},
+    _previewTicketExpires: {},
+    _previewTicketRequests: new Map(),
+    _previewTicketRetryAt: new Map(),
     _previewViewSaveTimer: null,
     _previewViewRestoreTimers: [],
     _previewRestoringPath: "",
@@ -1434,7 +1440,9 @@ function portal() {
         en: "Create an app in Baidu Qianfan console to get an API key (for ERNIE models). Note: IAM auth, not plain sk-xxx format.",
       },
       CODEX_GATEWAY_API_KEY: {
-        url: "docs/codex-gateway.md",
+        url: "https://github.com/hesorchen/muselab/blob/main/docs/codex-gateway.md",
+        urlZh: "https://github.com/hesorchen/muselab/blob/main/docs/codex-gateway_zh.md",
+        docs: true,
         zh: "连接你本机 127.0.0.1 上的 Codex Gateway。muselab 不保存 Codex OAuth 凭据，也不直接调用 OpenAI 原生接口。",
         en: "Connect your local Codex Gateway on 127.0.0.1. muselab does not store Codex OAuth credentials or call OpenAI-native APIs directly.",
       },
@@ -2632,9 +2640,23 @@ function portal() {
 
     // 10s heartbeat — pings /api/meta. If 2 consecutive fails, flag reconnecting;
     // when one comes back, flash "reconnected" then auto-clear.
+    _cancelHealthRequest() {
+      ++this._healthGeneration;
+      if (this._healthAbort) this._healthAbort.abort();
+      this._healthAbort = null;
+    },
     _startHeartbeat() {
+      this._cancelHealthRequest();
       if (this._connHeartbeat) clearInterval(this._connHeartbeat);
       this._connHeartbeat = setInterval(() => this._pingHealth(), 10_000);
+      if (!this._healthLifecycleBound) {
+        this._healthLifecycleBound = true;
+        window.addEventListener("pagehide", () => this._cancelHealthRequest());
+        window.addEventListener("pageshow", () => { void this._pingHealth(); });
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") this._cancelHealthRequest();
+        });
+      }
     },
 
     // Presence heartbeat — tells the backend "this device is at the
@@ -2723,9 +2745,19 @@ function portal() {
       // gap on return.
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") return;
+      if (this._healthAbort) return;
+      const controller = new AbortController();
+      const generation = this._healthGeneration;
+      this._healthAbort = controller;
       try {
-        const r = await fetch("/api/meta", { headers: this.hdr() });
-        if (!r.ok) throw new Error("status " + r.status);
+        let meta;
+        await this._fetchWithDeadline("/api/meta", {
+          headers: this.hdr(), signal: controller.signal,
+        }, this.REQUEST_DEADLINE_MS, async response => {
+          if (!response.ok) throw new Error("status " + response.status);
+          meta = await response.json();
+        });
+        if (generation !== this._healthGeneration || controller.signal.aborted) return;
         // Stale-JS detector. Mobile Safari frequently resumes a
         // backgrounded PWA tab without re-fetching HTML, so the page
         // keeps running last week's app.js against today's API. When
@@ -2736,7 +2768,6 @@ function portal() {
         // is mid-stream or the meta tag is missing (old HTML still
         // cached, no placeholder).
         try {
-          const meta = await r.clone().json();
           this.terminalEnabled = !!(meta && meta.terminal_enabled);
           const remoteVer = meta && meta.asset_version;
           if (remoteVer && !this._appVersionReloadFired) {
@@ -2778,11 +2809,14 @@ function portal() {
         // bell badge live without forcing the user to open the drawer.
         this.fetchSchedulerUnread();
       } catch (e) {
+        if (generation !== this._healthGeneration || controller.signal.aborted) return;
         this._connFails++;
         if (this._connFails >= 2) this.connState = "reconnecting";
         // Splash → if we never managed to ready up, force ready so user sees
         // the banner (otherwise they stare at splash with no feedback).
         if (!this.appReady) this._markReady();
+      } finally {
+        if (this._healthAbort === controller) this._healthAbort = null;
       }
     },
 
@@ -3058,16 +3092,38 @@ function portal() {
         m.setAttribute("content", themeColor);
       });
     },
+    _colorContrast(first, second) {
+      const luminance = hex => {
+        const rgb = this._hex2rgb(hex);
+        const linear = value => {
+          const v = value / 255;
+          return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+        };
+        return 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+      };
+      const a = luminance(first), b = luminance(second);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    },
     applyAccent() {
-      // 主色 + 派生色（hover / soft 半透明 / 文字色用浅化 mix 实现）
       const r = document.documentElement.style;
       const isLight = this.theme === "light" || this.theme === "eyecare";
-      r.setProperty("--c-accent", this.accent);
-      r.setProperty("--c-accent-hover", this._shade(this.accent, isLight ? -15 : 12));
-      r.setProperty("--c-accent-soft", this._withAlpha(this.accent, isLight ? 0.10 : 0.14));
-      r.setProperty("--c-accent-fg", isLight
-        ? this._shade(this.accent, -25)
-        : this._shade(this.accent, 25));
+      const accent = /^#[0-9a-f]{6}$/i.test(this.accent) ? this.accent : "#6093ff";
+      const surface = getComputedStyle(document.documentElement)
+        .getPropertyValue("--c-bg-3").trim() || (isLight ? "#e6e9ee" : "#232830");
+      let text = accent;
+      for (let mix = 5; mix <= 100 && this._colorContrast(text, surface) < 5; mix += 5) {
+        text = this._shade(accent, isLight ? -mix : mix);
+      }
+      const button = isLight ? text : accent;
+      const onAccent = this._colorContrast(button, "#ffffff") >= this._colorContrast(button, "#000000")
+        ? "#ffffff" : "#000000";
+      r.setProperty("--c-accent", accent);
+      r.setProperty("--c-accent-hover", this._shade(accent, isLight ? -15 : 12));
+      r.setProperty("--c-accent-soft", this._withAlpha(accent, isLight ? 0.10 : 0.14));
+      r.setProperty("--c-accent-fg", text);
+      r.setProperty("--c-btn-primary-bg", button);
+      r.setProperty("--c-btn-primary-hover", this._shade(button, isLight ? -10 : 8));
+      r.setProperty("--c-on-accent", onAccent);
     },
     setAccent(color) {
       this.accent = color;
@@ -3274,6 +3330,7 @@ function portal() {
       this.eyecareLevel = next;
       this._setLS("muselab_eyecare_level", String(next));
       this.applyTheme();
+      this.applyAccent();
       if (this._terminal) this._terminal.options.theme = this._terminalTheme();
     },
 
@@ -4843,6 +4900,12 @@ function portal() {
       tmp.innerHTML = html;
       let changed = false;
       for (const img of tmp.querySelectorAll("img[src]")) {
+        const resourcePath = img.getAttribute("data-muselab-resource-path");
+        if (resourcePath) {
+          img.setAttribute("src", this.rawUrl(resourcePath));
+          changed = true;
+          continue;
+        }
         let src = img.getAttribute("src") || "";
         // Skip scheme: (http/https/data/blob/…), protocol-relative //, root-
         // absolute / (covers /api/files/raw), and #anchors — only relatives left.
@@ -4857,6 +4920,7 @@ function portal() {
         }
         const resolved = segs.join("/");
         if (!resolved) continue;
+        img.setAttribute("data-muselab-resource-path", resolved);
         img.setAttribute("src", this.rawUrl(resolved));
         if (!img.getAttribute("loading")) img.setAttribute("loading", "lazy");
         changed = true;
@@ -4999,6 +5063,9 @@ function portal() {
     // their final rich render is cached only after a terminal/tool boundary.
     mdRender(text) {
       if (!text) return "";
+      // A dependency outage must fail closed without caching its fallback:
+      // restoring the sanitizer should immediately restore rich rendering.
+      if (!window.DOMPurify) return "<pre>" + this.escape(text) + "</pre>";
       const cache = this._mdCache || (this._mdCache = new Map());
       const hit = cache.get(text);
       if (hit !== undefined) {
@@ -5247,7 +5314,7 @@ function portal() {
       } catch (e) {
         raw = "<pre>" + this.escape(text) + "</pre>";
       }
-      if (!window.DOMPurify) return this._unmaskMath(raw, _mathStore);
+      if (!window.DOMPurify) return "<pre>" + this.escape(text) + "</pre>";
       let safe = window.DOMPurify.sanitize(raw, {
         USE_PROFILES: { html: true, mathMl: true },          // KaTeX may emit MathML
         FORBID_TAGS: ["style", "iframe", "form", "object", "embed"],
@@ -5804,10 +5871,15 @@ function portal() {
       try {
         // Authenticate independently of a possibly stale persisted workspace.
         // fetchSessionWorkspaces() below validates/falls back that directory.
-        const r = await fetch("/api/files/list?path=", {
+        const r = await this._fetchWithDeadline("/api/files/list?path=", {
           headers: { "X-Auth-Token": this.token },
         });
-        if (!r.ok) throw new Error("token 错误");
+        if (!r.ok) {
+          const error = new Error("login failed");
+          error.status = r.status;
+          error.retryAfter = r.headers.get("Retry-After");
+          throw error;
+        }
         this._setLS("muselab_token", this.token);
         this.authed = true;
         this.loadPrefs();
@@ -5841,7 +5913,21 @@ function portal() {
         // / stale-JS reload / presence reporting / bell badge refresh until a
         // manual refresh. Shared with _bootApp; safe to call once here.
         this._startLiveConnections();
-      } catch (e) { this.loginErr = e.message; }
+      } catch (e) {
+        const zh = this.lang === "zh";
+        if (e.status === 401 || e.status === 403) {
+          this.loginErr = zh ? "访问令牌无效，请检查后重试。" : "Invalid access token. Check it and try again.";
+        } else if (e.status === 429) {
+          const seconds = Number(e.retryAfter);
+          this.loginErr = Number.isFinite(seconds) && seconds > 0 && seconds <= 3600
+            ? (zh ? `请求过于频繁，请在 ${Math.ceil(seconds)} 秒后重试。` : `Too many requests. Try again in ${Math.ceil(seconds)} seconds.`)
+            : (zh ? "请求过于频繁，请稍后重试。" : "Too many requests. Please try again later.");
+        } else if (e.status >= 500) {
+          this.loginErr = zh ? "服务暂时不可用，请稍后重试。" : "The service is temporarily unavailable. Please try again later.";
+        } else {
+          this.loginErr = zh ? "暂时无法连接服务，请检查网络后重试。" : "Unable to connect. Check your network and try again.";
+        }
+      }
     },
 
     _restorePendingMobileTab() {
@@ -25300,7 +25386,8 @@ function portal() {
       // LRU bump
       this._previewCache.delete(path);
       this._previewCache.set(path, e);
-      return e;
+      return e.mode === "md"
+        ? { ...e, renderedMd: this._renderPreviewMd(e.rawText || "") } : e;
     },
     _previewCacheSet(path, entry) {
       if (!path || !entry) return;
@@ -27212,6 +27299,8 @@ function portal() {
       this.htmlPreviewFrames = [];
       this._htmlPreviewFrameClock = 0;
       this._previewTickets = {};
+      this._previewTicketExpires = {};
+      this._previewTicketRetryAt.clear();
       this._cancelPreviewViewRestore();
       this._previewAbort = null;
       this._csvAbort = null;
@@ -27372,42 +27461,70 @@ function portal() {
       this._previewTickets = next;
     },
     async _mintPreviewTicket(p, signal = undefined) {
-      const r = await fetch("/api/files/preview-ticket", {
-        method: "POST",
-        headers: { ...this.fileHdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ path: p }),
-        signal,
-      });
-      if (!r.ok) throw new Error(`preview ticket failed (${r.status})`);
-      const data = await r.json();
-      if (!data || !data.ticket) throw new Error("preview ticket missing");
       const key = this._previewTicketKey(p);
-      this._previewTickets = {
-        ...(this._previewTickets || {}),
-        [key]: data.ticket,
-      };
-      return data.ticket;
+      const pending = this._previewTicketRequests.get(key);
+      if (pending) return pending;
+      const workspace = this.fileWorkspacePath();
+      const request = (async () => {
+        let data;
+        await this._fetchWithDeadline("/api/files/preview-ticket", {
+          method: "POST",
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: p }),
+          signal,
+        }, this.REQUEST_DEADLINE_MS, async response => {
+          if (!response.ok) throw new Error(`preview ticket failed (${response.status})`);
+          data = await response.json();
+        });
+        if (!data || !data.ticket) throw new Error("preview ticket missing");
+        this._previewTicketExpires[key] = Date.now()
+          + Math.max(1, Number(data.expires_in) || 600) * 1000;
+        this._previewTickets = { ...this._previewTickets, [key]: data.ticket };
+        this._previewTicketRetryAt.delete(key);
+        // x-bind updates image/PDF URLs reactively. Markdown stores rendered
+        // HTML instead, so refresh its relative resources after a ticket arrives.
+        if (workspace === this.fileWorkspacePath()) {
+          if (this.previewMode === "md" && this.renderedMd) {
+            this.renderedMd = this._resolveMdImages(this.renderedMd);
+          }
+          if (this.editing && this.editorIsMd && this.livePreviewHtml) {
+            this.livePreviewHtml = this._resolveMdImages(this.livePreviewHtml);
+          }
+        }
+        return data.ticket;
+      })();
+      this._previewTicketRequests.set(key, request);
+      try {
+        return await request;
+      } catch (error) {
+        // A failed image request must not start an unbounded reactive retry loop.
+        this._previewTicketRetryAt.set(key, Date.now() + 10_000);
+        throw error;
+      } finally {
+        if (this._previewTicketRequests.get(key) === request) {
+          this._previewTicketRequests.delete(key);
+        }
+      }
     },
     rawUrl(p, opts = {}) {
-      const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
-      // Iframe/img/pdf/anchor requests cannot attach our custom workspace
-      // header, so carry the registered root in the query string too.
+      if (!p) return "about:blank";
+      const key = this._previewTicketKey(p);
+      const ticket = (this._previewTickets || {})[key] || "";
+      const expires = Number(this._previewTicketExpires[key] || 0);
+      // Resident HTML frames keep their loaded document. Other resources renew
+      // on the next render after expiry; all new requests remain scope-bound.
+      const stale = expires && expires <= Date.now() && !opts.preview;
+      if ((!ticket || stale) && this.token
+          && (this._previewTicketRetryAt.get(key) || 0) <= Date.now()) {
+        void this._mintPreviewTicket(p).catch(() => {});
+      }
+      if (!ticket) return "about:blank";
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      // preview=1 asks the backend to inject the click-to-zoom bridge into
-      // HTML (see files.py). Only the html preview iframe passes it; images /
-      // pdf / downloads stream untouched.
-      const pv = opts.preview ? "&preview=1" : "";
-      if (opts.preview) {
-        const ticket = (this._previewTickets || {})[
-          this._previewTicketKey(p)] || "";
-        if (!ticket) return "about:blank";
-        return "/api/files/raw?path=" + encodeURIComponent(p)
-                + "&ticket=" + encodeURIComponent(ticket)
-                + workspace + v + pv;
-      }
+      const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
       return "/api/files/raw?path=" + encodeURIComponent(p)
-              + "&token=" + encodeURIComponent(this.token) + workspace + v + pv;
+        + "&ticket=" + encodeURIComponent(ticket) + workspace + v
+        + (opts.preview ? "&preview=1" : "");
     },
     async reloadPreview() {
       // Manual "🗘 reload" button in preview header. Bumps previewVersion
