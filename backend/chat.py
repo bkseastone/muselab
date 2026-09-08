@@ -2863,6 +2863,7 @@ def _context_limit_details(
     sdk_max: int = 0,
     sdk_raw: int = 0,
     stored: int = 0,
+    stored_source: str = "",
     detected: int = 0,
     capability: dict | None = None,
 ) -> dict:
@@ -2893,6 +2894,10 @@ def _context_limit_details(
             "context_limit_source": override_source,
             "context_limit_is_estimate": False,
         }
+    # A configured budget cached in usage is not a measured SDK capacity.
+    # Removing an override must restore automatic resolution immediately.
+    if stored_source in ("settings_model", "settings_provider", "env_override"):
+        stored = 0
     if not endpoints.is_third_party(model):
         limit = (_positive_int(sdk_max) or _positive_int(stored)
                  or MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT))
@@ -9732,8 +9737,10 @@ async def session_usage(session_id: str, model: str = "") -> dict:
     capability = await _detect_gateway_context_capability(m)
     details = _context_limit_details(
         m,
-        sdk_max=_positive_int(sdk_window),
+        sdk_max=(_positive_int(sdk_window)
+                 or _positive_int(u.get("sdk_context_max_tokens"))),
         stored=stored,
+        stored_source=u.get("context_limit_source", ""),
         capability=capability,
     )
     limit = _positive_int(details.get("context_limit"))
@@ -10426,9 +10433,21 @@ def _create_context_recovery_session(
     result = lifecycle.get("forked")
     if result is not None:
         _JSONL_PATH_CACHE[child_sid] = result.path
-    if context_limit:
+    context_source = _context_limit_details(model).get("context_limit_source", "")
+    inherited_window = context_limit
+    if context_source in ("settings_model", "settings_provider", "env_override"):
+        # Recovery inherits real runtime evidence, never relabels a configured
+        # budget as SDK truth in the durable child metadata.
+        inherited_window = _positive_int(
+            (_session_usage.get(source_sid) or {}).get("sdk_context_max_tokens"))
+        if not inherited_window:
+            try:
+                inherited_window = _positive_int(sess.get_session_ctx_window(source_sid))
+            except Exception:
+                inherited_window = 0
+    if inherited_window:
         try:
-            sess.set_session_ctx_window(child_sid, context_limit)
+            sess.set_session_ctx_window(child_sid, inherited_window)
         except Exception:
             pass
     estimated_post_tokens = (
@@ -10449,6 +10468,8 @@ def _create_context_recovery_session(
             if context_limit else 0.0
         ),
         "context_limit": context_limit,
+        "context_limit_source": context_source,
+        "sdk_context_max_tokens": inherited_window,
         "context_used_source": "recovery_summary_estimate",
         "context_used_is_estimate": True,
         "context_is_estimate": True,
@@ -10930,6 +10951,7 @@ def _schedule_post_compact_refresh(
                     sdk_max=real_max,
                     sdk_raw=_positive_int(usage.get("rawMaxTokens")),
                     stored=_positive_int(sess_u.get("context_limit")),
+                    stored_source=sess_u.get("context_limit_source", ""),
                     capability=capability,
                 )
                 _apply_context_limit_details(sess_u, details)
@@ -17767,6 +17789,7 @@ async def _start_turn(
                 details = _context_limit_details(
                     model_to_use,
                     stored=_positive_int(sess_u.get("context_limit")),
+                    stored_source=sess_u.get("context_limit_source", ""),
                     capability=capability,
                 )
                 limit = _positive_int(details.get("context_limit"))
@@ -18462,6 +18485,7 @@ async def _start_turn(
                     sdk_max=sdk_max,
                     sdk_raw=sdk_raw,
                     stored=_positive_int(sess_u.get("context_limit")),
+                    stored_source=sess_u.get("context_limit_source", ""),
                     capability=capability,
                 )
                 _apply_context_limit_details(sess_u, details)

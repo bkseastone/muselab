@@ -83,3 +83,17 @@ def test_context_key_cannot_interpolate_environment_on_restart(client, auth, iso
                    json={"scope": "models", "key": unsafe, "tokens": 200000})
     assert r.status_code == 422
     assert not isolated.ENV_PATH.exists()
+
+
+@pytest.mark.parametrize("sdk_window,expected", [(0, 128000), (200000, 200000)])
+def test_reset_auto_does_not_reuse_cached_settings_budget(client, auth, isolated, sdk_window, expected):
+    from backend import chat
+    sid = "context-settings-reset-fixture"
+    chat._session_usage[sid] = {
+        "context_limit": 350000, "context_limit_source": "settings_provider",
+        "context_used": 10000, "sdk_context_max_tokens": sdk_window,
+    }
+    response = client.get(f"/api/chat/usage/{sid}?model=ducc:glm-5", headers=auth)
+    assert response.status_code == 200, response.text
+    assert response.json()["context_limit"] == expected
+    assert response.json()["context_limit_source"] != "settings_provider"
