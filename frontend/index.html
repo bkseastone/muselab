@@ -4771,7 +4771,8 @@
                 <template x-for="model in contextModels()" :key="model"><option :value="model" x-text="model"></option></template>
               </select></div>
             <div class="settings-row"><label for="context-tokens" x-text="lang==='zh'?'有效上下文（tokens）':'Effective context (tokens)'"></label>
-              <input id="context-tokens" class="settings-input" type="number" min="1024" max="10000000" step="1" placeholder="Auto" x-model="settings.contextDraft.tokens" :disabled="settings.contextSaving" /></div>
+              <input id="context-tokens" class="settings-input" type="number" min="1024" max="10000000" step="1" placeholder="Auto" aria-describedby="context-tokens-hint" x-model="settings.contextDraft.tokens" :disabled="settings.contextSaving" /></div>
+            <p id="context-tokens-hint" class="settings-hint" x-text="lang==='zh'?'单位：token。例如 200K 填 200000，300K 填 300000；留空使用 Auto。':'Unit: tokens. For example, enter 200000 for 200K or 300000 for 300K; leave blank for Auto.'"></p>
             <div class="settings-inline-error" role="alert" x-show="settings.contextError" x-text="settings.contextError"></div>
             <button class="btn-primary sm" @click="saveContextLimit()" :disabled="settings.contextSaving" x-text="lang==='zh'?'保存上下文预算':'Save context budget'"></button>
           </details>

@@ -2405,6 +2405,7 @@ MODEL_CONTEXT_LIMITS = {
     "gpt-5.5":                        272_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
+DUCC_DEFAULT_CONTEXT_LIMIT = 200_000
 CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT = 95
 _CONTEXT_CAPABILITY_CACHE_TTL = max(
     1.0, env_float("MUSELAB_CONTEXT_CATALOG_TTL_S", 300.0))
@@ -2894,13 +2895,18 @@ def _context_limit_details(
             "context_limit_source": override_source,
             "context_limit_is_estimate": False,
         }
+    # DUCC uses a 200K fallback budget, not a claim of measured capacity.
+    # Runtime evidence and explicit overrides retain their existing priority.
+    fallback = MODEL_CONTEXT_LIMITS.get(
+        model, DUCC_DEFAULT_CONTEXT_LIMIT
+        if endpoints.is_ducc_model(model) else DEFAULT_CONTEXT_LIMIT)
     # A configured budget cached in usage is not a measured SDK capacity.
     # Removing an override must restore automatic resolution immediately.
     if stored_source in ("settings_model", "settings_provider", "env_override"):
         stored = 0
     if not endpoints.is_third_party(model):
         limit = (_positive_int(sdk_max) or _positive_int(stored)
-                 or MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT))
+                 or fallback)
         raw = _positive_int(sdk_raw) or limit
         source = ("sdk" if _positive_int(sdk_max) else
                   "session_sdk" if _positive_int(stored) else "model_fallback")
@@ -2920,7 +2926,7 @@ def _context_limit_details(
         if _positive_int(detected):
             return _capability_from_model_item(
                 {"max_input_tokens": detected}, source="gateway_models_api") or {}
-        raw = MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+        raw = fallback
         pct = CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT
         return {
             "context_limit": max(1, raw * pct // 100),
@@ -2931,7 +2937,7 @@ def _context_limit_details(
             "context_limit_source": "model_fallback",
             "context_limit_is_estimate": True,
         }
-    hardcoded = MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+    hardcoded = fallback
     limit = _positive_int(sdk_max) or max(_positive_int(stored), hardcoded)
     source = "sdk" if _positive_int(sdk_max) else "model_fallback"
     return {
