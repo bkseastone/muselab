@@ -10458,6 +10458,26 @@ function portal() {
         if (!childSid || childSid === sourceSid) {
           return { sessionId: sourceSid, queuePending: false, rolledOver: false };
         }
+        // A session-list redirect can adopt this durable successor while the
+        // POST response is still in flight. Its source state is then retired.
+        // Replaying adoption would overwrite the child's canonical messages
+        // and remove its tab (the source's old tab index is already gone).
+        // Also respect a tab closed, switched, or rolled over again meanwhile.
+        if (this.tabState[sourceSid] !== sourceState) {
+          const adoptedSid = this._resolveSessionRedirectId(
+            sourceState._backgroundSuccessorSid || childSid);
+          if (this.tabState[adoptedSid]) {
+            await this._syncQueueFromServer(adoptedSid);
+          }
+          const adoptedState = this.tabState[adoptedSid];
+          return {
+            sessionId: adoptedSid,
+            queuePending: !!adoptedState && (
+              !!adoptedState._draining
+              || this.queuePendingItems(adoptedState).length > 0),
+            rolledOver: true,
+          };
+        }
         const pending = Number(
           payload.inherited_background_tasks_pending
           ?? payload.background_tasks_pending

@@ -1963,3 +1963,126 @@ def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
 # Note: drag-and-drop tab reorder and right-click context menu are harder
 # to drive reliably with Playwright's HTML5 drag emulation across browsers.
 # Left as manual smoke for now.
+
+
+@pytest.mark.parametrize("late_action", ["keep", "switch", "close"])
+def test_late_handoff_response_keeps_redirected_tab_and_completed_content(
+        page: Page, backend_url, auth_token, late_action):
+    """A list redirect can adopt the child before continue-detached responds."""
+    _login(page, backend_url, auth_token)
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0]._sessionsInitialized")
+    target_meta = page.evaluate(
+        "() => {const app=document.querySelector('#app')._x_dataStack[0];"
+        "return app.sessions.find(s=>s.id===app.currentId)}")
+    target = target_meta["id"]
+    source = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    other = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    other_meta = {**target_meta, "id": other, "name": "Other conversation"}
+    completed = "Completed reply survives the delayed handoff response"
+
+    def child_history(route):
+        route.fulfill(json={
+            **target_meta,
+            "messages": [{"role": "assistant", "text": completed,
+                          "uuid": "completed-child-reply"}],
+            "total": 1, "offset": 0, "has_more": False, "has_later": False,
+            "history_generation": "child-complete", "history_order": "normal",
+            "completion_state": {"stable": True, "active": False},
+        })
+
+    page.route(f"**/api/chat/sessions/{target}?*", child_history)
+    page.route(f"**/api/chat/sessions/{target}", child_history)
+
+    def other_history(route):
+        route.fulfill(json={
+            **other_meta, "messages": [{"role": "assistant",
+                "text": "Other session stays focused", "uuid": "other-reply"}],
+            "total": 1, "offset": 0, "has_more": False, "has_later": False,
+            "completion_state": {"stable": True, "active": False},
+        })
+
+    page.route(f"**/api/chat/sessions/{other}?*", other_history)
+    page.route(f"**/api/chat/sessions/{other}", other_history)
+
+    def redirected_list(route):
+        route.fulfill(json={
+            "sessions": [{**target_meta, "message_count": 1, "active": False}, other_meta],
+            "session_redirects": {source: target}, "total": 1, "returned": 1,
+        })
+
+    page.route("**/api/chat/sessions?*", redirected_list)
+    result = page.evaluate(
+        """async ([source, meta, completed, otherMeta, lateAction]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const target = meta.id;
+          app._setChatMuxUnsupported();
+          app._ensureInheritedTaskPoller = () => {};
+          app._syncQueueFromServer = async () => {};
+          const nativeFetch = window.fetch;
+          let release;
+          window.fetch = (url, opts) => String(url).endsWith('/continue-detached')
+            ? new Promise(resolve => { release = resolve; })
+            : nativeFetch(url, opts);
+          const st = app._blankTabState();
+          st._sid = source;
+          st._loaded = true;
+          st.messagesReady = true;
+          st.messages = [{role: 'assistant', text: 'Earlier streamed fragment'}];
+          app.tabState[source] = st;
+          delete app.tabState[target];
+          app.sessions = [{...meta, id: source}];
+          app.openTabIds = [source];
+          app.currentId = source;
+          app._activateTabState(source);
+          app._writeChatTabStore();
+          const handoff = app._handoffBackgroundSession(source, app.tabState[source]);
+          await Promise.resolve();
+          await app._pullSessionList(false);
+          const adopted = app.tabState[target];
+          adopted.messages = [{
+            role: 'assistant', text: completed, uuid: 'completed-child-reply'
+          }];
+          adopted._loaded = true;
+          adopted.messagesReady = true;
+          app._ensureNonEmptyMessageRange(adopted);
+          if (lateAction !== 'keep') {
+            await app.activateTab(otherMeta.id);
+            if (lateAction === 'close') await app.closeChatTab(target);
+          }
+          release(new Response(JSON.stringify({
+            ...meta, inherited_background_tasks_pending: 1
+          }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+          await handoff;
+          window.fetch = nativeFetch;
+          await new Promise(resolve => app.$nextTick(resolve));
+          return {
+            tabs: app.openTabIds.slice(),
+            current: app.currentId,
+            sameState: app.tabState[target] === adopted,
+            text: app.tabState[target]?.messages.map(m=>m.text||'').join('\\n') ?? null,
+            saved: JSON.parse(localStorage.getItem('muselab_chat_tabs_v1')).openTabIds
+          };
+        }""",
+        arg=[source, target_meta, completed, other_meta, late_action],
+    )
+    expected_tabs = ([target] if late_action == "keep"
+                     else [target, other] if late_action == "switch" else [other])
+    expected_current = target if late_action == "keep" else other
+    assert result == {
+        "tabs": expected_tabs, "current": expected_current,
+        "sameState": late_action != "close",
+        "text": None if late_action == "close" else completed,
+        "saved": expected_tabs,
+    }
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        """target => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          return app?._sessionsInitialized && app.currentId === target
+            && app.openTabIds.includes(target);
+        }""", arg=expected_current)
+    visible_text = completed if late_action == "keep" else "Other session stays focused"
+    expect(page.locator("p:visible").filter(has_text=visible_text)).to_be_visible()
+    assert page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].openTabIds") == expected_tabs
