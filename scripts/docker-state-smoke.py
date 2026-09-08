@@ -1,7 +1,9 @@
 """Run inside the disposable docker-smoke container, using synthetic state only."""
+import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 import urllib.error
 import urllib.request
 
@@ -15,6 +17,18 @@ def request(path, *, method="GET", payload=None, auth=True):
     data = None if payload is None else json.dumps(payload).encode()
     with urllib.request.urlopen(urllib.request.Request(BASE + path, data=data, method=method, headers=headers), timeout=10) as response:
         return json.load(response)
+
+
+# Docker executes this script through stdin; local regression tests use runpy.
+app_root = Path.cwd() if __file__ == "<stdin>" else Path(__file__).resolve().parents[1]
+for notice in ("LICENSE", "THIRD_PARTY_LICENSES.md"):
+    assert (app_root / notice).is_file(), f"Missing packaged notice: {notice}"
+vendor = app_root / "frontend" / "vendor"
+manifest = json.loads((vendor / "manifest.json").read_text(encoding="utf-8"))
+packages = (manifest["direct_packages"] + manifest["bundled_packages"]
+            + manifest.get("embedded_packages", []) + manifest.get("source_fragments", []))
+for notice in {name for package in packages for name in package["license_files"]}:
+    assert hashlib.sha256((vendor / notice).read_bytes()).hexdigest() == manifest["assets"][notice], notice
 
 
 if sys.argv[1] == "seed":
