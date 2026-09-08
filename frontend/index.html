@@ -4433,16 +4433,16 @@
           </div>
 
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '运行模式' : 'Mode'"></label>
-            <select class="settings-input" x-model="settings.memory.config.mode">
+            <label for="setting-settings-memory-config-mode" x-text="lang==='zh' ? '运行模式' : 'Mode'"></label>
+            <select id="setting-settings-memory-config-mode" class="settings-input" x-model="settings.memory.config.mode">
               <option value="off" x-text="lang==='zh' ? '关闭（无外部调用）' : 'Off (no external calls)'"></option>
               <option value="shadow" x-text="lang==='zh' ? '影子（只产候选，不召回）' : 'Shadow (candidates only)'"></option>
               <option value="active" x-text="lang==='zh' ? '启用' : 'Active'"></option>
             </select>
           </div>
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '抽取／反思模型' : 'Extraction / reflection model'"></label>
-            <select class="settings-input" x-model="settings.memory.config.generation_model">
+            <label for="setting-settings-memory-config-generation-model" x-text="lang==='zh' ? '抽取／反思模型' : 'Extraction / reflection model'"></label>
+            <select id="setting-settings-memory-config-generation-model" class="settings-input" x-model="settings.memory.config.generation_model">
               <option value="" x-text="lang==='zh' ? '请选择' : 'Select a model'"></option>
               <template x-for="m in availableModels" :key="'memory-'+m.model">
                 <option :value="m.model" x-text="m.group + ' · ' + m.label"></option>
@@ -4451,90 +4451,90 @@
           </div>
 
           <div class="memory-subtitle" x-text="lang==='zh' ? 'Embedding 服务（OpenAI 兼容）' : 'Embedding service (OpenAI-compatible)'"></div>
-          <div class="settings-row"><label>Base URL</label>
-            <input class="settings-input" x-model="settings.memory.config.embedding.base_url"
+          <div class="settings-row"><label for="setting-settings-memory-config-embedding-base-url">Base URL</label>
+            <input id="setting-settings-memory-config-embedding-base-url" class="settings-input" x-model="settings.memory.config.embedding.base_url"
                    placeholder="http://127.0.0.1:8080/v1" /></div>
-          <div class="settings-row"><label>Model</label>
-            <input class="settings-input" x-model="settings.memory.config.embedding.model"
+          <div class="settings-row"><label for="setting-settings-memory-config-embedding-model">Model</label>
+            <input id="setting-settings-memory-config-embedding-model" class="settings-input" x-model="settings.memory.config.embedding.model"
                    placeholder="BAAI/bge-m3" /></div>
-          <div class="settings-row"><label>API key</label>
-            <input class="settings-input" type="password"
+          <div class="settings-row"><label for="setting-settings-memory-config-embedding-api-key">API key</label>
+            <input id="setting-settings-memory-config-embedding-api-key" class="settings-input" type="password"
                    x-model="settings.memory.config.embedding.api_key"
                    :placeholder="settings.memory.config.embedding.has_api_key ? '•••••••• (unchanged)' : 'optional'" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '向量维度（可自动探测）' : 'Dimensions (auto-detect allowed)'"></label>
-            <input class="settings-input" type="number" min="1"
+          <div class="settings-row"><label for="setting-settings-memory-config-embedding-dimensions" x-text="lang==='zh' ? '向量维度（可自动探测）' : 'Dimensions (auto-detect allowed)'"></label>
+            <input id="setting-settings-memory-config-embedding-dimensions" class="settings-input" type="number" min="1"
                    x-model.number="settings.memory.config.embedding.dimensions"
                    placeholder="1024" /></div>
 
           <div class="memory-subtitle" x-text="lang==='zh' ? '向量数据库' : 'Vector database'"></div>
-          <div class="settings-row"><label>Provider</label>
-            <select class="settings-input" x-model="settings.memory.config.vector.provider">
+          <div class="settings-row"><label for="setting-settings-memory-config-vector-provider">Provider</label>
+            <select id="setting-settings-memory-config-vector-provider" class="settings-input" x-model="settings.memory.config.vector.provider">
               <option value="qdrant">Qdrant</option>
               <option value="pgvector">PostgreSQL + pgvector</option>
             </select></div>
-          <div class="settings-row"><label x-text="settings.memory.config.vector.provider === 'qdrant' ? 'URL' : 'DSN'"></label>
-            <input class="settings-input"
+          <div class="settings-row"><label for="setting-settings-memory-config-vector-url" x-text="settings.memory.config.vector.provider === 'qdrant' ? 'URL' : 'DSN'"></label>
+            <input id="setting-settings-memory-config-vector-url" class="settings-input"
                    :type="settings.memory.config.vector.provider === 'qdrant' ? 'url' : 'password'"
                    x-model="settings.memory.config.vector.url"
                    :placeholder="settings.memory.config.vector.provider === 'qdrant'
                      ? 'http://127.0.0.1:6333'
                      : (settings.memory.config.vector.has_url ? '•••••••• (unchanged)' : 'postgresql://user:password@host/db')" /></div>
           <div class="settings-row" x-show="settings.memory.config.vector.provider === 'qdrant'">
-            <label>API key</label>
-            <input class="settings-input" type="password"
+            <label for="setting-settings-memory-config-vector-api-key">API key</label>
+            <input id="setting-settings-memory-config-vector-api-key" class="settings-input" type="password"
                    x-model="settings.memory.config.vector.api_key"
                    :placeholder="settings.memory.config.vector.has_api_key ? '•••••••• (unchanged)' : 'optional'" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '集合／表名' : 'Collection / table'"></label>
-            <input class="settings-input" x-model="settings.memory.config.vector.collection" /></div>
+          <div class="settings-row"><label for="setting-settings-memory-config-vector-collection" x-text="lang==='zh' ? '集合／表名' : 'Collection / table'"></label>
+            <input id="setting-settings-memory-config-vector-collection" class="settings-input" x-model="settings.memory.config.vector.collection" /></div>
 
           <div class="memory-subtitle" x-text="lang==='zh' ? '检索与巩固' : 'Retrieval and consolidation'"></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '召回软截止（ms）' : 'Recall soft deadline (ms)'"></label>
-            <input class="settings-input" type="number" min="100" max="3000"
+          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-soft-timeout-ms" x-text="lang==='zh' ? '召回软截止（ms）' : 'Recall soft deadline (ms)'"></label>
+            <input id="setting-settings-memory-config-retrieval-soft-timeout-ms" class="settings-input" type="number" min="100" max="3000"
                    x-model.number="settings.memory.config.retrieval.soft_timeout_ms" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '最终召回条数' : 'Final recall limit'"></label>
-            <input class="settings-input" type="number" min="1" max="20"
+          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-final-limit" x-text="lang==='zh' ? '最终召回条数' : 'Final recall limit'"></label>
+            <input id="setting-settings-memory-config-retrieval-final-limit" class="settings-input" type="number" min="1" max="20"
                    x-model.number="settings.memory.config.retrieval.final_limit" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '向量候选数' : 'Dense candidates'"></label>
-            <input class="settings-input" type="number" min="1" max="100"
+          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-dense-candidates" x-text="lang==='zh' ? '向量候选数' : 'Dense candidates'"></label>
+            <input id="setting-settings-memory-config-retrieval-dense-candidates" class="settings-input" type="number" min="1" max="100"
                    x-model.number="settings.memory.config.retrieval.dense_candidates" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '关键词候选数' : 'Lexical candidates'"></label>
-            <input class="settings-input" type="number" min="1" max="100"
+          <div class="settings-row"><label for="setting-settings-memory-config-retrieval-lexical-candidates" x-text="lang==='zh' ? '关键词候选数' : 'Lexical candidates'"></label>
+            <input id="setting-settings-memory-config-retrieval-lexical-candidates" class="settings-input" type="number" min="1" max="100"
                    x-model.number="settings.memory.config.retrieval.lexical_candidates" /></div>
-          <div class="settings-row"><label>Reranker</label><label class="switch">
-            <input type="checkbox" x-model="settings.memory.config.rerank.enabled" />
+          <div class="settings-row"><label for="setting-settings-memory-config-rerank-enabled">Reranker</label><label class="switch">
+            <input id="setting-settings-memory-config-rerank-enabled" type="checkbox" x-model="settings.memory.config.rerank.enabled" />
             <span class="switch-slider"></span></label></div>
           <div x-show="settings.memory.config.rerank.enabled">
-            <div class="settings-row"><label>Rerank Base URL</label>
-              <input class="settings-input" x-model="settings.memory.config.rerank.base_url"
+            <div class="settings-row"><label for="setting-settings-memory-config-rerank-base-url">Rerank Base URL</label>
+              <input id="setting-settings-memory-config-rerank-base-url" class="settings-input" x-model="settings.memory.config.rerank.base_url"
                      placeholder="http://127.0.0.1:8081/v1" /></div>
-            <div class="settings-row"><label>Rerank Model</label>
-              <input class="settings-input" x-model="settings.memory.config.rerank.model"
+            <div class="settings-row"><label for="setting-settings-memory-config-rerank-model">Rerank Model</label>
+              <input id="setting-settings-memory-config-rerank-model" class="settings-input" x-model="settings.memory.config.rerank.model"
                      placeholder="Qwen3-Reranker" /></div>
-            <div class="settings-row"><label>Rerank API key</label>
-              <input class="settings-input" type="password"
+            <div class="settings-row"><label for="setting-settings-memory-config-rerank-api-key">Rerank API key</label>
+              <input id="setting-settings-memory-config-rerank-api-key" class="settings-input" type="password"
                      x-model="settings.memory.config.rerank.api_key"
                      :placeholder="settings.memory.config.rerank.has_api_key ? '•••••••• (unchanged)' : 'optional'" /></div>
           </div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '每个 Episode 轮数' : 'Turns per episode'"></label>
-            <input class="settings-input" type="number" min="2" max="50"
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-episode-turns" x-text="lang==='zh' ? '每个 Episode 轮数' : 'Turns per episode'"></label>
+            <input id="setting-settings-memory-config-consolidation-episode-turns" class="settings-input" type="number" min="2" max="50"
                    x-model.number="settings.memory.config.consolidation.episode_turns" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? 'Episode 空闲关闭（分钟）' : 'Episode idle close (minutes)'"></label>
-            <input class="settings-input" type="number" min="2" max="10080"
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-episode-idle-minutes" x-text="lang==='zh' ? 'Episode 空闲关闭（分钟）' : 'Episode idle close (minutes)'"></label>
+            <input id="setting-settings-memory-config-consolidation-episode-idle-minutes" class="settings-input" type="number" min="2" max="10080"
                    x-model.number="settings.memory.config.consolidation.episode_idle_minutes" /></div>
-          <div class="settings-row"><label>Dreamer</label><label class="switch">
-            <input type="checkbox" x-model="settings.memory.config.consolidation.dreamer_enabled" />
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-dreamer-enabled">Dreamer</label><label class="switch">
+            <input id="setting-settings-memory-config-consolidation-dreamer-enabled" type="checkbox" x-model="settings.memory.config.consolidation.dreamer_enabled" />
             <span class="switch-slider"></span></label></div>
-          <div class="settings-row"><label>Verifier</label><label class="switch">
-            <input type="checkbox" x-model="settings.memory.config.consolidation.verifier_enabled" />
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-verifier-enabled">Verifier</label><label class="switch">
+            <input id="setting-settings-memory-config-consolidation-verifier-enabled" type="checkbox" x-model="settings.memory.config.consolidation.verifier_enabled" />
             <span class="switch-slider"></span></label></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '生成 Skill 候选' : 'Generate skill candidates'"></label><label class="switch">
-            <input type="checkbox" x-model="settings.memory.config.consolidation.skill_learning_enabled" />
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-skill-learning-enabled" x-text="lang==='zh' ? '生成 Skill 候选' : 'Generate skill candidates'"></label><label class="switch">
+            <input id="setting-settings-memory-config-consolidation-skill-learning-enabled" type="checkbox" x-model="settings.memory.config.consolidation.skill_learning_enabled" />
             <span class="switch-slider"></span></label></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? '反思最少独立 Episodes' : 'Minimum independent Episodes'"></label>
-            <input class="settings-input" type="number" min="2" max="20"
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-min-reflection-episodes" x-text="lang==='zh' ? '反思最少独立 Episodes' : 'Minimum independent Episodes'"></label>
+            <input id="setting-settings-memory-config-consolidation-min-reflection-episodes" class="settings-input" type="number" min="2" max="20"
                    x-model.number="settings.memory.config.consolidation.min_reflection_episodes" /></div>
-          <div class="settings-row"><label x-text="lang==='zh' ? 'Skill 最少成功 Episodes' : 'Minimum successful Skill Episodes'"></label>
-            <input class="settings-input" type="number" min="2" max="20"
+          <div class="settings-row"><label for="setting-settings-memory-config-consolidation-min-skill-success-episodes" x-text="lang==='zh' ? 'Skill 最少成功 Episodes' : 'Minimum successful Skill Episodes'"></label>
+            <input id="setting-settings-memory-config-consolidation-min-skill-success-episodes" class="settings-input" type="number" min="2" max="20"
                    x-model.number="settings.memory.config.consolidation.min_skill_success_episodes" /></div>
           <div class="settings-hint warn"
                x-text="lang==='zh'
@@ -4612,6 +4612,7 @@
                    @input.debounce.400ms="refreshMemoryCenter()"
                    :placeholder="lang==='zh' ? '搜索记忆…' : 'Search memories…'" />
             <select class="settings-input" x-model="settings.memory.itemStatus"
+                    :aria-label="lang==='zh' ? '记忆状态' : 'Memory status'"
                     @change="refreshMemoryCenter()">
               <option value="" x-text="lang==='zh' ? '全部状态' : 'All states'"></option>
               <option value="active" x-text="lang==='zh'?'有效':'Active'"></option><option value="pending_review" x-text="lang==='zh'?'待确认':'Pending review'"></option>
@@ -4833,6 +4834,7 @@
                     <input x-show="!p.configured || editing"
                            type="password" class="settings-input"
                            :placeholder="editing ? t('set.key_edit_placeholder') : t('set.placeholder_key')"
+                           :aria-label="localizeProviderDisplay(p.display) + ' API key'"
                            x-model="settings.draftKeys[p.env_key]" />
                     <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
                     <button x-show="!p.configured || editing" class="btn-primary sm"
@@ -4852,9 +4854,9 @@
                   <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
                     <span x-text="PROVIDER_HELP[p.env_key]?.[lang]"></span>
                     <a x-show="PROVIDER_HELP[p.env_key]?.url"
-                       :href="PROVIDER_HELP[p.env_key]?.url"
+                       :href="(lang==='zh' && PROVIDER_HELP[p.env_key]?.urlZh) || PROVIDER_HELP[p.env_key]?.url"
                        target="_blank" rel="noopener"
-                       x-text="PROVIDER_HELP[p.env_key]?.url?.startsWith('docs/')
+                       x-text="PROVIDER_HELP[p.env_key]?.docs
                          ? (lang==='zh' ? '打开文档 ↗' : 'Open docs ↗')
                          : (lang==='zh' ? '打开控制台 ↗' : 'Open console ↗')"></a>
                   </div>
@@ -4910,6 +4912,7 @@
                   <div class="settings-input-wrap">
                     <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
                       <input type="checkbox" :checked="!p.disabled"
+                             :aria-label="(lang==='zh' ? '显示模型：' : 'Show models: ') + localizeProviderDisplay(p.display)"
                              @change="toggleProvider(p.id, !$event.target.checked)" />
                       <span class="switch-slider"></span>
                     </label>
@@ -5450,16 +5453,16 @@
             <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
           </div>
           <div class="settings-row">
-            <label x-text="t('set.label.default_model')"></label>
-            <select x-model="settings.draftDefaults.model" class="settings-input">
+            <label for="setting-settings-draftdefaults-model" x-text="t('set.label.default_model')"></label>
+            <select id="setting-settings-draftdefaults-model" x-model="settings.draftDefaults.model" class="settings-input">
               <template x-for="m in availableModels" :key="m.model">
                 <option :value="m.model" x-text="m.group + ' · ' + m.label"></option>
               </template>
             </select>
           </div>
           <div class="settings-row">
-            <label x-text="t('set.label.default_permission')"></label>
-            <select x-model="settings.draftDefaults.permission" class="settings-input">
+            <label for="setting-settings-draftdefaults-permission" x-text="t('set.label.default_permission')"></label>
+            <select id="setting-settings-draftdefaults-permission" x-model="settings.draftDefaults.permission" class="settings-input">
               <option value="bypassPermissions" x-text="lang==='zh' ? 'bypass（无提示）' : 'bypass (no prompts)'"></option>
               <option value="acceptEdits">acceptEdits</option>
               <option value="default">default</option>
@@ -5469,8 +5472,8 @@
             </select>
           </div>
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '回复进行中发送' : 'Send while busy'"></label>
-            <select x-model="settings.draftDefaults.busy_send_mode" class="settings-input">
+            <label for="setting-settings-draftdefaults-busy-send-mode" x-text="lang==='zh' ? '回复进行中发送' : 'Send while busy'"></label>
+            <select id="setting-settings-draftdefaults-busy-send-mode" x-model="settings.draftDefaults.busy_send_mode" class="settings-input">
               <option value="adjust"
                       x-text="lang==='zh' ? '尽快调整当前任务' : 'Adjust the current task soon'"></option>
               <option value="queue"
@@ -5503,9 +5506,9 @@
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
           </div>
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '任务完成时通知我' : 'Notify me when tasks finish'"></label>
+            <label for="setting-notifyenabled" x-text="lang==='zh' ? '任务完成时通知我' : 'Notify me when tasks finish'"></label>
             <label class="switch">
-              <input type="checkbox" x-model="notifyEnabled"
+              <input id="setting-notifyenabled" type="checkbox" x-model="notifyEnabled"
                      @change="onNotifyToggle($event)" />
               <span class="switch-slider"></span>
             </label>

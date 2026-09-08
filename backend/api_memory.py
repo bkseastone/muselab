@@ -15,6 +15,7 @@ from .memory_config import (
     save_config,
 )
 from .memory_engine import classify_memory_failure, engine
+from .memory_store import SnapshotValidationError
 
 router = APIRouter(
     prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_token)])
@@ -439,6 +440,8 @@ async def import_memory(body: MemoryImport) -> dict:
         try:
             counts = await engine._store_call(
                 lambda store: store.import_snapshot(snapshot, cfg.owner_id))
+        except SnapshotValidationError as exc:
+            raise HTTPException(422, exc.detail) from None
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, _failure_detail(exc)) from None
         queued = (

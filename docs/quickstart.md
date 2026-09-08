@@ -37,21 +37,27 @@ wsl --install            # installs WSL2 + Ubuntu default
 # Reboot when prompted, then create your WSL Linux user
 ```
 
-WSL2 doesn't enable systemd by default, which muselab's service
-registration needs. Inside the WSL terminal:
+Current new Ubuntu WSL installations usually enable systemd. First check
+whether the user manager is reachable:
 
 ```bash
-sudo tee /etc/wsl.conf >/dev/null <<'EOF'
-[boot]
-systemd=true
-EOF
+systemctl --user show-environment >/dev/null
 ```
 
-Back in Windows PowerShell, apply the change:
+If unavailable, check the user session first. Only edit the configuration if
+systemd is disabled; preserve the existing sections:
 
-```powershell
-wsl --shutdown
+```bash
+if [ -f /etc/wsl.conf ]; then
+  sudo cp -p /etc/wsl.conf "/etc/wsl.conf.muselab-backup-$(date +%Y%m%dT%H%M%S)"
+fi
+sudoedit /etc/wsl.conf
 ```
+
+Set `systemd=true` in the existing `[boot]` section, or add that section when
+absent. Do not replace the whole file. After a change, run `wsl --shutdown`
+from Windows PowerShell and reopen WSL. See [Microsoft's systemd guide](https://learn.microsoft.com/en-us/windows/wsl/systemd).
+
 
 Reopen the WSL terminal and run the one-line install below.
 
@@ -138,20 +144,23 @@ Per-OS detail (verify / restart / tail logs / expose to LAN / uninstall):
 
 ### Pre-built image from GHCR (multi-arch amd64 + arm64)
 
+On Linux, check `id -u` / `id -g` before starting. If either differs from 1000, build the matching image described under mount permissions below first. The login token is saved in the private `~/.config/muselab/docker.env`; open it locally when signing in and do not share it.
+
 ```bash
+mkdir -p "$HOME/muselab-workspace" "$HOME/muselab-sessions" "$HOME/.claude" "$HOME/.config/muselab"
+if [ ! -f "$HOME/.config/muselab/docker.env" ]; then
+  (umask 077; set -C; printf 'MUSELAB_TOKEN=%s\n' "$(openssl rand -hex 32)" > "$HOME/.config/muselab/docker.env")
+fi
 docker run -d --name muselab \
   -p 127.0.0.1:8765:8765 \
-  -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-workspace:/data \
-  -e MUSELAB_ROOT=/data \
-  -v $HOME/muselab-sessions:/app/sessions \
-  -e MUSELAB_SESSIONS_DIR=/app/sessions \
-  -v $HOME/.claude:/home/muse/.claude \
+  --env-file "$HOME/.config/muselab/docker.env" \
+  -v "$HOME/muselab-workspace:/data" \
+  -v "$HOME/muselab-sessions:/app/sessions" \
+  -v "$HOME/.claude:/home/muse/.claude" \
   ghcr.io/hesorchen/muselab:latest
 ```
 
-The separate `/app/sessions` mount preserves chat indexes, annotations, and
-queues when the container is replaced.
+The `/app/sessions` mount preserves indexes, annotations, queues, UI configuration under `config/`, and third-party transcripts under `state/muselab/vendor-cli/`. Saved UI values override matching bootstrap env-file values. Before replacing an older container, complete the [state migration](docker-state-migration.md).
 
 > **Bind address.** The example above pins the port to `127.0.0.1` so the
 > service is only reachable from the host. Plain `-p 8765:8765` binds

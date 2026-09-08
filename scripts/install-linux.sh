@@ -10,6 +10,8 @@ cd "$REPO"
 # with install-macos.sh. Keep in lockstep with Dockerfile.
 # shellcheck source=scripts/versions.env
 . "$REPO/scripts/versions.env"
+# shellcheck source=scripts/installer-safety.sh
+. "$REPO/scripts/installer-safety.sh"
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
@@ -35,8 +37,13 @@ ask() {
 # Detect that case and reattach stdin to the controlling terminal. The
 # `[[ ! -t 0 ]]` guard makes this a no-op when the script is run directly
 # (e.g. `bash scripts/install-linux.sh`), so no behavior change there.
-if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]] && [[ -c /dev/tty ]]; then
-  exec </dev/tty
+if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]]; then
+  if ( : </dev/tty ) 2>/dev/null; then
+    exec </dev/tty
+  else
+    err "Interactive install requires a terminal; use MUSELAB_NONINTERACTIVE=1 for unattended installation."
+    exit 1
+  fi
 fi
 
 bold "muselab — Linux installer"
@@ -100,18 +107,18 @@ command -v claude >/dev/null 2>&1 && ok "claude CLI: $(command -v claude)"
 
 # uvx ships with uv → almost always present once uv is installed
 if command -v uvx >/dev/null 2>&1; then
-  ok "uvx present — uv-based MCP servers (fetch, git, time, …) available"
+  ok "uvx present — optional uv-based MCP connectors can be configured"
 else
-  warn "uvx not found — uv-based MCP presets (fetch, git, time) won't run"
+  warn "uvx not found — optional uv-based MCP connectors require it"
   warn "  install: comes with uv (already required); make sure uv is on PATH"
 fi
 
 # Auto-install Node LTS + claude CLI when missing. Both are user-scoped
 # (fnm goes into ~/.local/share/fnm, npm -g into ~/.npm-global after the
-# fnm switch) so no sudo. Skipping these used to leave the install in a
-# "technically working but Muse can't do anything" state — claude 401s and
-# the default memory / sequential-thinking / filesystem MCP presets all
-# silent-fail. With this block, the one-line install really is end-to-end.
+# fnm switch) so no sudo. The standalone CLI supports subscription login;
+# Node also supports optional npm-based MCP connectors configured by the user.
+# The Agent SDK supplies its own agent-loop CLI; API-key use does not require
+# installing the standalone CLI.
 NEED_CLAUDE_LOGIN=0
 INSTALL_NODE=0
 INSTALL_CLAUDE=0
@@ -123,9 +130,8 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
   bold "Optional auto-install / 可选自动安装"
   (( INSTALL_NODE   )) && echo "  - Node LTS (via fnm — user-scoped, no sudo, ~30s)"
   (( INSTALL_CLAUDE )) && echo "  - Anthropic claude CLI (npm install -g, ~10s)"
-  echo "  Why: powers the default MCP presets (memory / sequential-thinking /"
-  echo "  filesystem) + lets you reuse a Claude Pro / Max subscription."
-  echo "  原因：默认 MCP 预设和复用 Claude Pro/Max 订阅都需要它们。"
+  echo "  Why: enables standalone CLI subscription login and optional npm-based MCP connectors."
+  echo "  原因：支持独立 CLI 的订阅登录，以及按需配置的 npm MCP 连接器。"
   REPLY="$(ask 'Install now / 现在装? [Y/n]:' 'Y')"
   if [[ "$REPLY" =~ ^[Yy] ]]; then
     if (( INSTALL_NODE )); then
@@ -168,7 +174,7 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
       warn "skipped claude CLI install — no npm (Node install failed?)"
     fi
   else
-    warn "Skipped. Without Node+claude CLI: Anthropic models 401, default MCP presets disabled."
+    warn "Skipped. Subscription login requires the standalone CLI; optional npm MCP connectors require Node."
     warn "  To install later:  curl -fsSL https://fnm.vercel.app/install | bash && fnm install --lts"
     warn "                     npm install -g @anthropic-ai/claude-code && claude login"
   fi
@@ -245,24 +251,22 @@ else
   # Check port free; if held by an existing muselab systemd service, offer
   # one-click cleanup instead of making the user run commands by hand.
   if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
-    HOLDER_PID="$(ss -tlnpH "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
-    HOLDER_NAME=""
-    if [[ -n "$HOLDER_PID" ]]; then
-      HOLDER_NAME="$(ps -p "$HOLDER_PID" -o comm= 2>/dev/null | tr -d ' ')"
-    fi
-    HAS_OLD_UNIT=""
-    if systemctl --user is-enabled muselab.service >/dev/null 2>&1; then HAS_OLD_UNIT=1; fi
-
-    if [[ "$HOLDER_NAME" =~ ^(python|uv)$ ]] && [[ -n "$HAS_OLD_UNIT" ]]; then
+    HOLDER_PIDS="$(ss -tlnpH "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | sort -u || true)"
+    HOLDER_PID="$(printf '%s\n' "$HOLDER_PIDS" | head -1)"
+    HOLDER_NAME="$(ps -p "$HOLDER_PID" -o comm= 2>/dev/null || true)"
+    if muselab_port_is_owned linux "$REPO" "$HOLDER_PIDS"; then
       warn "Port $PORT is held by an existing muselab install (PID $HOLDER_PID, $HOLDER_NAME)"
       warn "  端口被已有的 muselab 占着 — 可以一键清理后继续"
       REPLY="$(ask 'Clean it up and continue / 清理后继续? [Y/n]:' 'Y')"
       if [[ "$REPLY" =~ ^[Yy] ]]; then
+        if ! muselab_port_is_owned linux "$REPO" "$HOLDER_PIDS"; then
+          err "Port ownership changed; no service was stopped. Re-run to inspect the conflict."
+          exit 1
+        fi
         systemctl --user stop muselab.service 2>/dev/null || true
-        systemctl --user disable muselab.service 2>/dev/null || true
         sleep 2
         if ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
-          err "Cleanup didn't free port — process may not be ours. Kill manually then re-run."
+          err "Port is still occupied. Inspect its owner or choose another port."
           exit 1
         fi
         ok "cleaned up — port $PORT now free"
@@ -350,9 +354,9 @@ else
   bold "4/5  Installing systemd --user service / 注册 systemd 用户服务"
   UNIT_DIR="$HOME/.config/systemd/user"
   mkdir -p "$UNIT_DIR"
-  sed -e "s|{{REPO_PATH}}|$REPO|g" \
-      -e "s|{{UV_PATH}}|$UV|g" \
-      scripts/templates/muselab.service.tmpl > "$UNIT_DIR/muselab.service"
+  "$UV" run --frozen python scripts/render-service.py systemd \
+    scripts/templates/muselab.service.tmpl "$UNIT_DIR/muselab.service" \
+    --set "REPO_PATH=$REPO" --set "UV_PATH=$UV" --set "ENV_PATH=$REPO/.env"
   ok "unit file: $UNIT_DIR/muselab.service"
 
   systemctl --user daemon-reload

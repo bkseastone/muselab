@@ -56,6 +56,8 @@ migrations. [Data and backup](data-and-backup.md) describes the persistent state
 
 ## Docker: choose the installation source
 
+**First upgrade to the persistent configuration layout: migrate before replacing the container.** Older images wrote UI settings and third-party transcripts outside mounted directories. Follow the [migration guide](docker-state-migration.md) to stop the exact old container, export and migrate that state before the commands below. The migration tool never stops, removes or recreates containers.
+
 For the source-build `docker-compose.yml`:
 
 ```bash
@@ -75,6 +77,4 @@ docker compose -f docker-compose.image.yml up -d
 
 Use the same Compose file, project directory and data mounts throughout an
 installation. Record the previous image tag/digest before replacing it; rollback
-uses that image with the same mounts. The workspace, Claude state and sessions
-remain in host bind mounts. Compose reads `.env`; it is not itself bind-mounted
-into the container. Check [Quick start](quickstart.md) for UID/GID compatibility.
+uses that image with the same mounts. In the new layout, workspace files, Claude state, sessions, UI settings and third-party transcripts live in host mounts. Compose `.env` supplies bootstrap values; UI edits persist in `sessions/config/.env` and take precedence on restart. Rolling back to an older-layout image also requires restoring the preserved backup to its old paths; changing only the image is insufficient. Check [Quick start](quickstart.md) for UID/GID compatibility.

@@ -3026,15 +3026,13 @@ def test_html_preview_uses_path_bound_ticket_not_api_token():
         'else if (["png", "jpg"', open_start)]
     raw_start = app.index("rawUrl(p, opts = {})")
     raw = app[raw_start:app.index("async reloadPreview()", raw_start)]
-    preview_branch = raw[raw.index("if (opts.preview)"):
-                         raw.index('return "/api/files/raw?path="', raw.index(
-                             'return "/api/files/raw?path="') + 1)]
+
 
     assert open_branch.index("_mintPreviewTicket") < open_branch.index(
         'this.previewMode = "html"')
-    assert '"&ticket="' in preview_branch
-    assert '"&token="' not in preview_branch
-    assert 'if (!ticket) return "about:blank"' in preview_branch
+    assert '"&ticket="' in raw
+    assert '"&token="' not in raw
+    assert 'if (!ticket) return "about:blank"' in raw
 
 
 def test_turn_finalization_repairs_whole_pane_and_cache_bytes():

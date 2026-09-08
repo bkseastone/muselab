@@ -106,3 +106,7 @@ CLI JSONL 始终是权威来源；索引缺失、损坏、旧 JSON 格式或版�
 7. 运行 `bash scripts/doctor.sh` 做基础自检。
 
 备份中包含 token、API key、OAuth 凭据、Push 私钥，终端 Profile 还可能包含用户写入的命令。应加密保存，切勿提交到 Git 或共享盘。
+
+## Docker 的持久配置布局
+
+容器的 `/app/sessions` 挂载还包括 `config/.env`、`config/mcp.json`、`config/provider_overrides.json` 与 `state/muselab/vendor-cli/`。全量备份应包含整个挂载目录，此外还要备份工作区与 Claude 状态挂载。不要把 `config/` 当作可重建缓存。网页保存值会覆盖初始 env-file 同名值；需要重置时先备份，再明确编辑持久文件。旧镜像升级前按[迁移指南](docker-state-migration_zh.md)导出未挂载状态。

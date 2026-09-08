@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -80,6 +81,75 @@ _SNAPSHOT_TABLES: tuple[
 )
 _SNAPSHOT_OWNER_TABLES = {"evidence", "episodes", "memories", "artifacts", "audit"}
 _SNAPSHOT_LIST_DEFAULTS = {"entities", "tags", "source_episode_ids"}
+
+
+class SnapshotValidationError(ValueError):
+    """Public import diagnostics contain locations/codes, never row contents."""
+
+    def __init__(self, table: str, row: int, field: str, reason: str):
+        self.detail = {
+            "category": "invalid_snapshot", "table": table,
+            "row": row, "field": field, "reason": reason,
+        }
+        super().__init__(f"invalid snapshot: {table}[{row}].{field}: {reason}")
+
+
+_SNAPSHOT_NULLABLE = {"source_ref", "ended_at", "valid_from", "valid_to"}
+_SNAPSHOT_NUMBERS = {
+    "created_at", "updated_at", "started_at", "ended_at",
+    "valid_from", "valid_to", "confidence",
+}
+_SNAPSHOT_INTEGERS = {"position", "turn_count", "version"}
+_SNAPSHOT_PRIMARY_KEYS = {
+    "episode_evidence": ("episode_id", "evidence_id"),
+    "memory_sources": ("memory_id", "source_type", "source_id", "relation"),
+}
+_SNAPSHOT_MEMORY_ENUMS = {
+    "kind": {"fact", "preference", "decision", "state", "episode", "reflection"},
+    "status": {"active", "pending_review", "superseded", "deleted"},
+    "authority": {"confirmed", "inferred", "legacy_import"},
+}
+
+
+def _validate_snapshot_row(table: str, index: int, row: dict,
+                           columns: tuple[str, ...], json_columns: tuple[str, ...]) -> None:
+    for column in columns:
+        key = column[:-5] if column.endswith("_json") else column
+        value = row.get(key)
+        reason = ""
+        if key not in row:
+            reason = "missing_field"
+        elif value is None and key in _SNAPSHOT_NULLABLE:
+            continue
+        elif column in json_columns:
+            expected = list if key in _SNAPSHOT_LIST_DEFAULTS else dict
+            if not isinstance(value, expected):
+                reason = "invalid_json_type"
+            else:
+                try:
+                    json.dumps(value, allow_nan=False)
+                except (TypeError, ValueError):
+                    reason = "invalid_json_value"
+        elif key in _SNAPSHOT_INTEGERS:
+            minimum = 1 if key == "version" else 0
+            if type(value) is not int or not minimum <= value <= 2**63 - 1:
+                reason = "invalid_integer"
+        elif key in _SNAPSHOT_NUMBERS:
+            try:
+                valid = type(value) in {int, float} and math.isfinite(value)
+            except OverflowError:
+                valid = False
+            if not valid or (key == "confidence" and not 0 <= value <= 1):
+                reason = "invalid_number"
+        elif not isinstance(value, str) or len(value) > 1_000_000:
+            reason = "invalid_text"
+        elif key in {"id", "episode_id", "evidence_id", "memory_id"} and not value:
+            reason = "empty_identifier"
+        elif table == "memories" and key in _SNAPSHOT_MEMORY_ENUMS:
+            if value not in _SNAPSHOT_MEMORY_ENUMS[key]:
+                reason = "unsupported_value"
+        if reason:
+            raise SnapshotValidationError(table, index, key, reason)
 
 
 def _is_cjk(char: str) -> bool:
@@ -253,6 +323,8 @@ class MemoryStore:
         );
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status
           ON memories(owner_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memories_owner_status_id
+          ON memories(owner_id, status, id);
         CREATE TABLE IF NOT EXISTS memory_sources (
           memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
           source_type TEXT NOT NULL, source_id TEXT NOT NULL, relation TEXT NOT NULL,
@@ -802,7 +874,7 @@ class MemoryStore:
             try:
                 for memory_id in memory_ids:
                     row = conn.execute(
-                        "SELECT attributes_json FROM memories WHERE id=?",
+                        "SELECT attributes_json FROM memories WHERE id=? AND status='active'",
                         (memory_id,),
                     ).fetchone()
                     if row is None:
@@ -924,6 +996,8 @@ class MemoryStore:
                       confidence: float | None = None, authority: str | None = None,
                       attributes: dict | None = None, tags: list | None = None) -> dict | None:
         fields: dict[str, Any] = {"updated_at": _now()}
+        if status in {"deleted", "superseded"}:
+            fields["embedding_state"] = "pending"
         for key, value in (("content", content), ("status", status), ("kind", kind),
                            ("confidence", confidence), ("authority", authority)):
             if value is not None:
@@ -1116,6 +1190,25 @@ class MemoryStore:
                 (job_id, kind, _json(payload), run_after or now, owner_id, now, now),
             )
         return job_id
+
+    def enqueue_reindex_batches(self, owner_id: str, *, batch_size: int = 256) -> int:
+        """Atomically queue the complete active set without an unbounded payload."""
+        total, cursor, now = 0, "", _now()
+        with self._write_tx() as conn:
+            while True:
+                ids = [row["id"] for row in conn.execute(
+                    "SELECT id FROM memories WHERE owner_id=? AND status='active' "
+                    "AND id>? ORDER BY id LIMIT ?", (owner_id, cursor, batch_size))]
+                if not ids:
+                    break
+                conn.execute(
+                    "INSERT INTO jobs(id,kind,payload_json,run_after,owner_id,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (_id("job"), "reindex_memories", _json({"memory_ids": ids}),
+                     now, owner_id, now, now))
+                total += len(ids)
+                cursor = ids[-1]
+        return total
 
     def claim_job(self) -> dict | None:
         with self._lock, self._connect() as conn:
@@ -1504,16 +1597,18 @@ class MemoryStore:
         if not isinstance(values, list) or len(values) > 100_000:
             raise ValueError(f"invalid {table} rows")
         placeholders = ",".join("?" for _ in columns)
+        primary_key = _SNAPSHOT_PRIMARY_KEYS.get(table, ("id",))
         sql = (
-            f"INSERT OR IGNORE INTO {table}"
-            f"({','.join(columns)}) VALUES ({placeholders})"
+            f"INSERT INTO {table}({','.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(primary_key)}) DO NOTHING"
         )
         inserted = 0
         memory_ids: list[str] = []
-        for value in values:
+        for index, value in enumerate(values, start=1):
             if not isinstance(value, dict):
-                raise ValueError(f"invalid {table} row")
+                raise SnapshotValidationError(table, index, "row", "invalid_row")
             row = dict(value)
+            _validate_snapshot_row(table, index, row, columns, json_columns)
             if table in _SNAPSHOT_OWNER_TABLES:
                 row["owner_id"] = owner_id
             if table == "memories":
@@ -1539,7 +1634,11 @@ class MemoryStore:
                 MemoryStore._snapshot_column_value(row, column, json_columns)
                 for column in columns
             ]
-            cursor = conn.execute(sql, tuple(args))
+            try:
+                cursor = conn.execute(sql, tuple(args))
+            except sqlite3.IntegrityError:
+                raise SnapshotValidationError(
+                    table, index, "row", "reference_or_unique_conflict") from None
             inserted += max(0, int(cursor.rowcount))
         return inserted, memory_ids
 

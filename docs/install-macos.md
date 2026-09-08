@@ -7,6 +7,7 @@ no `sudo`, autostarts on login, restarts on crash.
 
 ## Prerequisites
 
+- Xcode Command Line Tools for the Swift status-bar helper: `xcode-select --install`. The installer checks the compiler before changing configuration.
 - macOS 12 (Monterey) or newer (Apple Silicon or Intel)
 - `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/)):
   ```bash
@@ -80,9 +81,9 @@ grep MUSELAB_TOKEN .env               # paste at login
 Yes — `RunAtLoad=true` in the plist. macOS launches the agent at login. No
 extra setup needed (unlike Linux's `loginctl enable-linger`).
 
-If you want it to start **before** you log in (rare; e.g. headless Mac mini),
-move from `LaunchAgents` to `LaunchDaemons` and run as root — out of scope for
-this installer; ping me if you need it.
+Starting before login requires a separately configured LaunchDaemon and a
+dedicated non-root service account, outside this user-level installer. Do not
+run the workspace and terminal service as root for this purpose.
 
 ## Common commands
 

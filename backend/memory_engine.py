@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeVar
@@ -53,6 +53,7 @@ _MEMORY_KINDS = {"fact", "preference", "decision", "state", "episode", "reflecti
 # `deleted` are terminal outcomes of a governance action and are deliberately
 # not creatable.
 _MEMORY_STATUSES = {"active", "pending_review"}
+_REINDEX_BATCH_SIZE = 256
 
 
 def _unwrap_schema_response(value: object, expected_key: str) -> dict:
@@ -283,6 +284,7 @@ class MemoryEngine:
         self._wake = asyncio.Event()
         self._recall_trace: dict[str, dict] = {}
         self._generation_lock = asyncio.Lock()
+        self._vector_mutation_lock = asyncio.Lock()
         self._last_idle_sweep = 0.0
 
     @property
@@ -1211,61 +1213,88 @@ class MemoryEngine:
     async def _index_memory(self, memory_id: str) -> None:
         await self._index_memories([memory_id])
 
+    @staticmethod
+    async def _join_vector_write(operation: Awaitable[_T]) -> _T:
+        """Keep the mutation fence until an already-started write finishes.
+
+        In particular, cancelling pgvector's to_thread awaiter cannot leave its
+        worker writing after a later forget has acquired the fence.
+        """
+        task = asyncio.ensure_future(operation)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
+            raise
+
     async def _index_memories(self, memory_ids: list[str]) -> None:
         cfg = self.config()
-        items = await self._store_call(lambda store: [
-            item for item in store.memories_by_ids(memory_ids)
-            if item.get("status") == "active"
-        ])
-        if not items:
-            return
-        provider = EmbeddingProvider(cfg.embedding)
-        vectors = await provider.embed([item["content"] for item in items])
-        target = vector_store(cfg.vector)
-        dimensions = len(vectors[0])
-        await target.ensure(dimensions)
-        await target.upsert_many([
-            (
-                item["id"],
-                vector,
-                {
-                    # Owner comes from the ROW, not from the live config. A job
-                    # queued before an owner change would otherwise index the
-                    # old owner's memory under the new owner_id, making it
-                    # recallable by the wrong profile — the registry row is the
-                    # source of truth.
-                    "owner_id": item["owner_id"],
-                    "status": item["status"],
-                    "kind": item["kind"],
-                    "authority": item["authority"],
-                    "confidence": item["confidence"],
-                    "updated_at": item["updated_at"],
-                },
-            )
-            for item, vector in zip(items, vectors, strict=True)
-        ])
-        await self._store_call(lambda store: store.mark_memories_indexed(
-            [item["id"] for item in items],
-            model=cfg.embedding.model,
-            dimensions=dimensions,
-        ))
+        # Old durable jobs may contain larger batches. Bound embedding memory
+        # and the duration for which governance waits on the vector write fence.
+        for start in range(0, len(memory_ids), _REINDEX_BATCH_SIZE):
+            ids = memory_ids[start:start + _REINDEX_BATCH_SIZE]
+            items = await self._store_call(lambda store: [
+                item for item in store.memories_by_ids(ids)
+                if item.get("status") == "active"
+            ])
+            if not items:
+                continue
+            vectors = await EmbeddingProvider(cfg.embedding).embed(
+                [item["content"] for item in items])
+            if len(vectors) != len(items):
+                raise ValueError("embedding provider returned an invalid response")
+            async with self._vector_mutation_lock:
+                # Embedding runs outside the fence. A forget/correct that won
+                # meanwhile must not be undone by this older content snapshot.
+                current = await self._store_call(
+                    lambda store: store.memories_by_ids([item["id"] for item in items]))
+                by_id = {item["id"]: item for item in current}
+                valid = [
+                    (by_id[item["id"]], vector)
+                    for item, vector in zip(items, vectors, strict=True)
+                    if item["id"] in by_id
+                    and by_id[item["id"]].get("status") == "active"
+                    and by_id[item["id"]]["content"] == item["content"]
+                ]
+                if not valid:
+                    continue
+                target = vector_store(cfg.vector)
+                dimensions = len(valid[0][1])
+                await self._join_vector_write(target.ensure(dimensions))
+                await self._join_vector_write(target.upsert_many([
+                    (item["id"], vector, {
+                        "owner_id": item["owner_id"],
+                        "status": item["status"],
+                        "kind": item["kind"],
+                        "authority": item["authority"],
+                        "confidence": item["confidence"],
+                        "updated_at": item["updated_at"],
+                    }) for item, vector in valid
+                ]))
+                await self._store_call(lambda store: store.mark_memories_indexed(
+                    [item["id"] for item, _vector in valid],
+                    model=cfg.embedding.model, dimensions=dimensions,
+                ))
 
     async def _unindex_memory(self, memory_id: str) -> None:
-        """Durable retry for a vector delete that failed inline.
-
-        Raising on failure is what makes it retry — finish_job backs off and
-        requeues, so the point is eventually removed instead of lingering in
-        the index after the user deleted the memory.
-        """
+        """Retry retirement under the same fence as index/governance writes."""
         cfg = self.config()
-        await vector_store(cfg.vector).delete(memory_id)
-        def mark_pending(store: MemoryStore) -> None:
-            with store._lock, store._connect() as conn:
-                conn.execute(
-                    "UPDATE memories SET embedding_state='pending' WHERE id=?",
-                    (memory_id,))
-
-        await self._store_call(mark_pending)
+        async with self._vector_mutation_lock:
+            await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
+            def mark_pending(store: MemoryStore) -> None:
+                with store._lock, store._connect() as conn:
+                    conn.execute(
+                        "UPDATE memories SET embedding_state='pending' WHERE id=?",
+                        (memory_id,))
+            await self._store_call(mark_pending)
 
     async def recall(self, query: str, session_id: str) -> list[dict]:
         cfg = self.config()
@@ -1468,6 +1497,16 @@ class MemoryEngine:
 
     async def correct_memory(self, memory_id: str, content: str,
                              *, kind: str | None = None) -> dict:
+        async with self._vector_mutation_lock:
+            return await self._join_vector_write(
+                self._correct_memory(memory_id, content, kind=kind))
+
+    async def forget_memory(self, memory_id: str) -> bool:
+        async with self._vector_mutation_lock:
+            return await self._join_vector_write(self._forget_memory(memory_id))
+
+    async def _correct_memory(self, memory_id: str, content: str,
+                             *, kind: str | None = None) -> dict:
         cfg = self.config()
         memory = await self._store_call(
             lambda store: store.supersede_memory(
@@ -1475,7 +1514,7 @@ class MemoryEngine:
         if cfg.enabled:
             queue_unindex = False
             try:
-                await vector_store(cfg.vector).delete(memory_id)
+                await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
             except Exception as exc:
                 _, failure = classify_memory_failure(exc)
                 log.warning(
@@ -1497,7 +1536,7 @@ class MemoryEngine:
             self._wake.set()
         return memory
 
-    async def forget_memory(self, memory_id: str) -> bool:
+    async def _forget_memory(self, memory_id: str) -> bool:
         cfg = self.config()
         deleted = await self._store_call(
             lambda store: store.delete_memory(memory_id, cfg.owner_id))
@@ -1509,7 +1548,7 @@ class MemoryEngine:
             # registry, so it wouldn't surface, but the content stayed on disk
             # after the user asked for deletion). Queue a durable retry.
             try:
-                await vector_store(cfg.vector).delete(memory_id)
+                await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
             except Exception as exc:
                 _, failure = classify_memory_failure(exc)
                 log.warning(
@@ -1564,19 +1603,11 @@ class MemoryEngine:
 
     async def reindex_all(self) -> int:
         cfg = self.config()
-
-        def enqueue_reindex(store: MemoryStore) -> int:
-            rows = store.list_memories(
-                cfg.owner_id, limit=10_000, status="active")
-            if rows:
-                store.enqueue(
-                    "reindex_memories",
-                    {"memory_ids": [row["id"] for row in rows]},
-                    owner_id=cfg.owner_id,
-                )
-            return len(rows)
-
-        queued = await self._store_call(enqueue_reindex)
+        # A single Registry transaction enumerates every active ID by a stable
+        # cursor and commits bounded durable jobs together. No updated_at-based
+        # pagination: finishing an index job updates that column.
+        queued = await self._store_call(lambda store: store.enqueue_reindex_batches(
+            cfg.owner_id, batch_size=_REINDEX_BATCH_SIZE))
         self._wake.set()
         return queued
 

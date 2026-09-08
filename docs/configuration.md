@@ -20,7 +20,9 @@ Restart after editing `.env` manually. Provider keys, default model, default per
 | `MUSELAB_HOST` | uvicorn bind interface | `127.0.0.1` |
 | `MUSELAB_PORT` | Listen port | `8765` |
 | `MUSELAB_URL` | Optional public HTTPS origin for remote clients | Local origin |
-| `MUSELAB_ENV_PATH` | `.env` file read and written by the Settings API; useful for tests or special deployments | `<repo>/.env` |
+| `MUSELAB_CONFIG_DIR` | Directory for mutable `.env`, MCP and provider configuration; set in the process environment before startup | `<repo>`; Docker `/app/sessions/config` |
+| `MUSELAB_ENV_PATH` | Explicit `.env` path, read at startup and written by Settings; set in the process environment | `$MUSELAB_CONFIG_DIR/.env` |
+| `MUSELAB_ENV_OVERRIDE` | Whether the selected file overrides existing process values on startup | `0`; Docker `1` so saved UI values survive recreation |
 | `MUSELAB_SESSIONS_DIR` | Durable session metadata directory | `<repo>/sessions` |
 | `MUSELAB_MODEL` | Default model for new sessions; the built-in Claude default is effective when unset | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | Settings-managed default, synchronized with `MUSELAB_MODEL` | `claude-sonnet-4-6` |
@@ -33,7 +35,10 @@ Restart after editing `.env` manually. Provider keys, default model, default per
 `MUSELAB_SESSIONS_DIR` stores muselab's session index, sidecars, queues, and
 restart-recovery sentinels, not the CLI transcript itself. Native installers
 write the checkout's absolute `<repo>/sessions` path into `.env`; an unset
-value retains the repo-local default for compatibility.
+value retains the repo-local default for compatibility. Docker additionally
+sets `XDG_STATE_HOME=/app/sessions/state`, placing third-party CLI transcripts
+under the same persistent mount. Its `config/` child stores editable settings.
+See [legacy Docker migration](docker-state-migration.md) before replacing an older container.
 
 ## Multiple workspaces
 
@@ -64,7 +69,7 @@ Claude can use `claude login` or `ANTHROPIC_API_KEY`. Built-in Anthropic-compati
 
 MiniMax China and international keys are not interchangeable. The two Qwen regions share a key but use different endpoints. Models and groups change over time; Settings and `/api/chat/providers` are the current source of truth.
 
-Built-in edits, custom providers, and deletion state are stored in `<repo>/provider_overrides.json`. MCP server configuration is stored in `<repo>/mcp.json`. Custom-provider keys use `MUSELAB_PROVIDER_<SLUG>_API_KEY`.
+Built-in edits, custom providers, and deletion state are stored in `$MUSELAB_CONFIG_DIR/provider_overrides.json`. MCP server configuration is stored in `$MUSELAB_CONFIG_DIR/mcp.json` (both remain repo-local on native installs by default). Custom-provider keys use `MUSELAB_PROVIDER_<SLUG>_API_KEY`.
 
 ## Long-term memory
 

@@ -28,6 +28,12 @@ services:
       # Never inherit a native-install host path from .env. Container session
       # state is persisted by the /app/sessions bind mount below.
       MUSELAB_SESSIONS_DIR: /app/sessions
+      # Keep mutable settings and third-party canonical transcripts in the
+      # same durable volume. File values override bootstrap env_file values.
+      MUSELAB_CONFIG_DIR: /app/sessions/config
+      MUSELAB_ENV_PATH: /app/sessions/config/.env
+      MUSELAB_ENV_OVERRIDE: "1"
+      XDG_STATE_HOME: /app/sessions/state
     volumes:
       # The default workspace exposed for browsing / editing.
       # Set the legacy-compatible ARCHIVE_DIR in .env (defaults to ./data).
@@ -50,7 +56,7 @@ services:
       # That keeps the rest of ~/.claude (settings, other secrets) off the
       # container. See SECURITY.md.
       - ${CLAUDE_HOME:-${HOME}/.claude}:/home/muse/.claude
-      # Persist chat sessions across container recreations.
+      # Persist sessions, UI configuration and third-party transcripts.
       - ./sessions:/app/sessions
     # Resource ceilings mirror the systemd unit (see
     # ~/.config/systemd/user/muselab.service): both deployment paths get the

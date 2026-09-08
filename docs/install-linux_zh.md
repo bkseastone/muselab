@@ -130,11 +130,20 @@ ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
 保持终端不关。然后在笔记本浏览器访问 `http://localhost:8765` 就能命中 VPS 上的
 muselab。不开防火墙、不暴露认证、零额外组件。
 
-### B. Tailscale / WireGuard（适合「常驻」远程）
+### B. Tailscale（适合常驻远程）
 
-把 VPS 和笔记本加入同一个 Tailscale 网络，访问
-`http://<vps-tailscale-ip>:8765`。tunnel 端到端加密，由 Tailscale 提供认证，
-所以绑定 127.0.0.1 没问题。
+把服务器和笔记本加入同一 tailnet 后，仍需转发本地监听。
+在运行 MuseLab 的主机执行：
+
+```bash
+tailscale serve --bg http://127.0.0.1:8765
+tailscale serve status
+```
+
+按提示启用 tailnet HTTPS，再从另一设备打开命令输出的 HTTPS 地址，使用
+MuseLab 令牌登录。Serve 将请求代理到 loopback；仅加入 Tailscale 或 WireGuard
+不会让 `127.0.0.1` 的服务自动在 VPN IP 上监听。
+参见 [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)。
 
 ### C. 绑定到 LAN（仅在你完全信任网络时） — 见下文
 

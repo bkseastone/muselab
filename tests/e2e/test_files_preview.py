@@ -1849,8 +1849,14 @@ def test_virtual_file_tree_supports_keyboard_navigation_and_mobile_handoff(
           const app = document.querySelector('#app')._x_dataStack[0];
           app.setMobileTab('files');
           await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(requestAnimationFrame);
+          // A narrower viewport remounts a smaller virtual window. The
+          // target must be scrolled into that window before DOM focus.
+          app._positionFileTreePath('README.md', 'center');
+          await new Promise(resolve => app.$nextTick(resolve));
         }"""
     )
+    expect(readme).to_be_visible()
     readme.focus()
     page.keyboard.press("Enter")
     page.wait_for_function(

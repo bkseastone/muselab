@@ -35,7 +35,7 @@ FROM python:3.12-slim
 # real terminal and lets terminal teardown find every job in a PTY session.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git procps && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     # claude-code pin — keep in lockstep with CLAUDE_CLI_VERSION in
     # scripts/versions.env and the CLI bundled by claude-agent-sdk (the native
@@ -57,14 +57,19 @@ COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     MUSELAB_PORT=8765 \
-    MUSELAB_ROOT=/data
+    MUSELAB_ROOT=/data \
+    MUSELAB_SESSIONS_DIR=/app/sessions \
+    MUSELAB_CONFIG_DIR=/app/sessions/config \
+    MUSELAB_ENV_PATH=/app/sessions/config/.env \
+    MUSELAB_ENV_OVERRIDE=1 \
+    XDG_STATE_HOME=/app/sessions/state
 
 # App code
 COPY backend ./backend
 COPY frontend ./frontend
 COPY skills ./skills
 COPY scripts/templates ./scripts/templates
-COPY pyproject.toml ./
+COPY pyproject.toml LICENSE THIRD_PARTY_LICENSES.md ./
 
 # Source builds can match a Linux bind-mount owner's UID/GID without
 # broadening permissions on credentials. Published images default to 1000.
@@ -73,7 +78,7 @@ ARG MUSE_GID=1000
 RUN test "$MUSE_UID" -gt 0 && test "$MUSE_GID" -gt 0 && \
     groupadd -g "$MUSE_GID" muse && \
     useradd -u "$MUSE_UID" -g "$MUSE_GID" -m -s /bin/bash muse && \
-    mkdir -p /app/sessions /data && \
+    mkdir -p /app/sessions/config /app/sessions/state /data && \
     chown -R muse:muse /app /data
 
 USER muse

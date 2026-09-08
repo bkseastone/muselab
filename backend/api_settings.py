@@ -21,6 +21,7 @@ from claude_agent_sdk.types import PermissionMode
 from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
+from .config_paths import ENV_PATH, MCP_CONFIG_PATH
 from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
 # by main.py for the CLI version probe at /api/meta. Both modules import
@@ -28,7 +29,6 @@ from .hook_settings import router as hook_settings_router
 # existing call sites in this file continue to work unchanged.
 from .settings import locate_executable as _locate_executable
 
-MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -36,17 +36,8 @@ router.include_router(hook_settings_router)
 _SERVICE_STARTED = time.monotonic()
 _SERVICE_INSTANCE_ID = uuid.uuid4().hex
 
-# Path to the .env file we read/write at runtime. Defaults to the repo
-# root's `.env`. The MUSELAB_ENV_PATH override is critical for test
-# isolation — without it, tests/test_regressions.py calling
-# PUT /api/settings would clobber the developer's real .env (every CI
-# run silently overwrote the DEEPSEEK_API_KEY with "sk-test-key-12345"
-# until 2026-05-24 when this guard was added). Production setups
-# never need to set the env var; it's a test-only escape hatch.
-ENV_PATH = Path(os.environ.get(
-    "MUSELAB_ENV_PATH",
-    str(Path(__file__).resolve().parent.parent / ".env"),
-))
+# Runtime config paths are shared with startup loading and the SDK MCP view.
+# Explicit overrides also keep API tests away from a developer's real files.
 
 # Providers exposed in the settings UI. Derived from the EFFECTIVE catalog
 # (endpoints.catalog() = built-ins + user overrides + custom providers) so a
@@ -149,6 +140,7 @@ def _write_env(updates: dict[str, str]) -> None:
         for k, v in updates.items()
     }
     with _ENV_WRITE_LOCK:
+        ENV_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lines: list[str] = []
         if ENV_PATH.exists():
             lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
@@ -753,6 +745,7 @@ def _load_mcp_merged() -> dict[str, dict]:
 
 
 def _save_mcp(cfg: dict) -> None:
+    MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix="mcp.", suffix=".json",
                                 dir=str(MCP_CONFIG_PATH.parent))
     try:

@@ -5,6 +5,8 @@ import warnings
 from pathlib import Path
 from dotenv import load_dotenv
 
+from .config_paths import ENV_PATH, MCP_CONFIG_PATH as MCP_CONFIG_PATH
+
 
 def env_int(name: str, default: int, *, min_value: int | None = None) -> int:
     """Read ``name`` from env as an int, falling back to ``default`` on
@@ -182,7 +184,10 @@ def atomic_write_text(
             except OSError:
                 pass
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+# The same file is read at startup and written by the settings API. Docker
+# opts into file-over-environment precedence so UI edits survive recreation
+# even when Compose still supplies the original bootstrap values.
+load_dotenv(ENV_PATH, override=os.environ.get("MUSELAB_ENV_OVERRIDE") == "1")
 
 # 不再主动 pop ANTHROPIC_API_KEY —— claude CLI 的优先级已经正确：
 # 若 ~/.claude/.credentials.json 存在则用 OAuth（Pro 配额，免费），
@@ -277,7 +282,7 @@ MODEL = _env("MUSELAB_MODEL", "PORTAL_MODEL", "claude-sonnet-4-6")
 # Stored as {"mcpServers": {name: {command, args, env, disabled}}}.
 # Always set the path so the UI can create it on first write; chat.py guards
 # the read with a try/except, so it's safe if the file doesn't exist yet.
-MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
+
 
 # Optional non-Claude providers. Base URLs default to each vendor's
 # Anthropic-compatible endpoint (NOT the OpenAI-compatible one — Claude

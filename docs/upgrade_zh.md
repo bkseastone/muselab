@@ -48,6 +48,8 @@ launchctl kickstart -k gui/$UID/com.muselab
 
 ## Docker：按安装来源升级
 
+**首次升级到持久配置布局：先迁移，再替换容器。** 旧镜像把网页配置和第三方会话正文放在未挂载路径，直接 recreate 会丢失它们。先按[迁移指南](docker-state-migration_zh.md)停止准确的旧容器、导出并迁移；确认完成后再执行以下命令。迁移工具不会停止、删除或重建任何容器。
+
 使用源码构建的 `docker-compose.yml`：
 
 ```bash
@@ -66,6 +68,4 @@ docker compose -f docker-compose.image.yml up -d
 ```
 
 同一安装应始终使用相同的 Compose 文件、项目目录和数据挂载。替换前记录旧
-镜像 tag／digest；回退时使用旧镜像和同一组挂载。工作区、Claude 状态和会话
-保留在宿主机 bind mount 中。Compose 会读取 `.env`，但并未将该文件本身挂入
-容器。UID／GID 兼容方式见[快速开始](quickstart_zh.md)。
+镜像 tag／digest；回退时使用旧镜像和同一组挂载。新布局的工作区、Claude 状态、会话、网页配置与第三方正文保留在宿主机挂载中。Compose 的 `.env` 是初始环境，网页修改写入 `sessions/config/.env` 并在重启时优先读取。回退到旧布局镜像时，必须保留迁移备份并按旧路径恢复，不能只切换镜像。UID／GID 兼容方式见[快速开始](quickstart_zh.md)。

@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
 from .capability_tickets import tickets
@@ -31,6 +31,7 @@ from .private_storage import (
     private_path_kind,
 )
 from .settings import ROOT, atomic_write_text, env_int
+from .spreadsheet_safety import validate_xlsx_archive
 from .workspaces import (
     registry as workspace_registry,
     resolve_workspace_root as _workspace_root,
@@ -2772,11 +2773,12 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
     except ImportError:
         raise HTTPException(status_code=500,
                             detail="openpyxl not installed — run `uv sync`")
+    validate_xlsx_archive(target)
     try:
         wb = openpyxl.load_workbook(target, read_only=True, data_only=True)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=422,
-                            detail=f"failed to parse xlsx: {type(e).__name__}: {e}")
+                            detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
     try:
         sheets: list[dict] = []
         sheet_names = wb.sheetnames
@@ -2785,8 +2787,12 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
             ws = wb[sheet_name]
             rows: list[list[str]] = []
             rows_truncated = False
-            cols_truncated = False
-            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+            cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
+            for r_idx, row in enumerate(ws.iter_rows(
+                max_row=min(ws.max_row or XLSX_MAX_ROWS + 1, XLSX_MAX_ROWS + 1),
+                max_col=min(ws.max_column or XLSX_MAX_COLS, XLSX_MAX_COLS),
+                values_only=True,
+            )):
                 if r_idx >= XLSX_MAX_ROWS:
                     rows_truncated = True
                     break
@@ -2950,6 +2956,11 @@ def csv_preview(
                     if cached_total is not None and len(rows) >= limit:
                         break
             total_rows = cached_total if cached_total is not None else row_idx
+    except _csv.Error:
+        raise HTTPException(
+            status_code=422,
+            detail="CSV could not be parsed or a field exceeds the parser size limit",
+        ) from None
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"failed to read: {e}")
 
@@ -3233,6 +3244,7 @@ def _inject_preview_html_bridge(target: Path) -> str | None:
 def raw_file(
     path: str = Query(...),
     preview: bool = Query(False),
+    ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
 ):
     """Stream a raw file using a path-bound preview ticket or legacy token.
@@ -3242,6 +3254,19 @@ def raw_file(
     target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
+    # A legacy token URL must never become the executing document's URL:
+    # even an opaque sandbox can read location.search and issue HTTPS images.
+    # Redirect all legacy resource requests to an exact-file short-lived ticket.
+    if not _preview_ticket_ok(ticket, path, root):
+        from urllib.parse import urlencode
+        issued = mint_preview_ticket(PreviewTicketReq(path=path), root=root)
+        query = {"path": path, "workspace": str(root), "ticket": issued["ticket"]}
+        if preview:
+            query["preview"] = "1"
+        return RedirectResponse(
+            "/api/files/raw?" + urlencode(query), status_code=303,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
     suffix = target.suffix.lower()
     # `no-cache` (NOT no-store) — let browsers cache but force a conditional
     # GET (If-None-Match / If-Modified-Since) every time. FileResponse still
@@ -3271,7 +3296,8 @@ def raw_file(
         # opaque origin even when the file is opened TOP-LEVEL (URL pasted into
         # the address bar): scripts still run, but cannot act as our origin —
         # /api/* fetches become cross-origin (CORS-blocked), cookies/storage
-        # are unavailable, so the query token can't be replayed against the API.
+        # are unavailable. Resource tickets limit what its own URL authorizes;
+        # the sandbox alone cannot protect a credential in location.search.
         # Previously only the frontend iframe's sandbox attribute provided this
         # isolation, which a top-level open silently bypassed.
         sandbox_headers = {

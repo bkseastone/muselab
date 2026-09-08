@@ -33,20 +33,24 @@ wsl --install            # 装 WSL2 + 默认 Ubuntu
 # 按提示重启 + 创建 Linux 用户名 / 密码
 ```
 
-WSL2 默认不开 systemd，muselab 的服务注册需要它。在 WSL 终端里：
+当前新安装的 Ubuntu WSL 通常已启用 systemd。先检查用户管理器是否可达：
 
 ```bash
-sudo tee /etc/wsl.conf >/dev/null <<'EOF'
-[boot]
-systemd=true
-EOF
+systemctl --user show-environment >/dev/null
 ```
 
-回到 Windows 端 PowerShell，让 `wsl.conf` 生效：
+若不可达，先检查用户会话；只有 systemd 未启用时才修改配置。保留已有内容：
 
-```powershell
-wsl --shutdown
+```bash
+if [ -f /etc/wsl.conf ]; then
+  sudo cp -p /etc/wsl.conf "/etc/wsl.conf.muselab-backup-$(date +%Y%m%dT%H%M%S)"
+fi
+sudoedit /etc/wsl.conf
 ```
+
+在已有 `[boot]` 节中设置 `systemd=true`，没有该节再添加；不要覆盖其他节。
+修改后从 Windows PowerShell 执行 `wsl --shutdown`，再打开 WSL。
+参见 [Microsoft systemd 文档](https://learn.microsoft.com/en-us/windows/wsl/systemd)。
 
 再次打开 WSL 终端，从下面的一行命令安装。
 
@@ -127,19 +131,23 @@ bash scripts/doctor.sh        # Linux / macOS / WSL2
 
 ### GHCR 预构建镜像（多架构 amd64 + arm64）
 
+Linux 用户请先用 `id -u`／`id -g` 检查 UID／GID；若不是 1000，先按下方“挂载权限”构建匹配镜像，再执行启动命令。登录令牌保存在私有的 `~/.config/muselab/docker.env`，可在本机打开查看；不要公开该文件。
+
 ```bash
+mkdir -p "$HOME/muselab-workspace" "$HOME/muselab-sessions" "$HOME/.claude" "$HOME/.config/muselab"
+if [ ! -f "$HOME/.config/muselab/docker.env" ]; then
+  (umask 077; set -C; printf 'MUSELAB_TOKEN=%s\n' "$(openssl rand -hex 32)" > "$HOME/.config/muselab/docker.env")
+fi
 docker run -d --name muselab \
   -p 127.0.0.1:8765:8765 \
-  -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-workspace:/data \
-  -e MUSELAB_ROOT=/data \
-  -v $HOME/muselab-sessions:/app/sessions \
-  -e MUSELAB_SESSIONS_DIR=/app/sessions \
-  -v $HOME/.claude:/home/muse/.claude \
+  --env-file "$HOME/.config/muselab/docker.env" \
+  -v "$HOME/muselab-workspace:/data" \
+  -v "$HOME/muselab-sessions:/app/sessions" \
+  -v "$HOME/.claude:/home/muse/.claude" \
   ghcr.io/hesorchen/muselab:latest
 ```
 
-单独挂载 `/app/sessions`，可以在替换容器时保留会话索引、注解和队列。
+挂载 `/app/sessions` 可保留会话索引、注解、队列、`config/` 中的网页配置，以及 `state/muselab/vendor-cli/` 中的第三方会话正文。网页保存的配置覆盖 Compose／env-file 的初始同名值。旧镜像用户须在替换容器前完成[旧状态迁移](docker-state-migration_zh.md)。
 
 > **绑定地址说明：** 上面示例显式绑定 `127.0.0.1`，服务只在本机可达。直接写 `-p 8765:8765` 会绑到 `0.0.0.0`（所有网卡）——在公网 VPS 上等于把服务挂到互联网上，只靠 token 一道防线。若需 LAN 内访问（如手机连本机），改成 `-p 0.0.0.0:8765:8765`，并务必在前面加防火墙或反向代理。仓库自带的 `docker-compose.yml` 默认绑 `127.0.0.1`，要放开在 `.env` 设 `MUSELAB_BIND=0.0.0.0`。
 
