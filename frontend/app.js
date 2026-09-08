@@ -1255,6 +1255,11 @@ function portal() {
     settings: {
       show: false,
       providers: [],
+      contextGroups: [],
+      contextLimits: { providers: {}, models: {} },
+      contextDraft: { provider: "ducc", model: "", tokens: "" },
+      contextSaving: false,
+      contextError: "",
       draftKeys: {},
       draftDefaults: { model: "", permission: "", busy_send_mode: "adjust" },
       // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
@@ -16805,6 +16810,8 @@ function portal() {
         : (this.lang === "zh" ? "分类用量：SDK" : "Categories: SDK");
       const limitSource = {
         gateway_catalog: this.lang === "zh" ? "网关模型目录" : "gateway catalog",
+        settings_model: this.lang === "zh" ? "模型设置" : "model setting",
+        settings_provider: this.lang === "zh" ? "Provider 设置" : "provider setting",
         env_override: this.lang === "zh" ? "环境配置" : "environment override",
         sdk: "SDK",
         session_sdk: this.lang === "zh" ? "会话 SDK" : "session SDK",
@@ -16856,6 +16863,8 @@ function portal() {
         : (this.lang === "zh" ? "用量" : "usage"));
       const limitSource = {
         gateway_catalog: this.lang === "zh" ? "网关目录" : "gateway catalog",
+        settings_model: this.lang === "zh" ? "模型设置" : "model setting",
+        settings_provider: this.lang === "zh" ? "Provider 设置" : "provider setting",
         env_override: this.lang === "zh" ? "配置覆盖" : "config override",
         sdk: "SDK",
         session_sdk: this.lang === "zh" ? "会话 SDK" : "session SDK",
@@ -20662,6 +20671,10 @@ function portal() {
       const d = await this._settingsRead("/api/settings", controller);
       if (generation !== this._settingsOpenGeneration) return;
       this.settings.providers = d.providers;
+      this.settings.contextGroups = d.context_groups || [];
+      this.settings.contextLimits = d.context_limits || { providers: {}, models: {} };
+      this.settings.contextError = "";
+      this.contextDraftChanged();
       this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
       // Reset provider-editor drafts each open so a stale half-edit from a
       // previous session doesn't reappear. Seed one (closed) draft per
@@ -21224,18 +21237,73 @@ function portal() {
       }
     },
 
+    contextModels() {
+      return (this.settings.contextGroups.find(p => p.id === this.settings.contextDraft.provider)?.models || []);
+    },
+
+    contextDraftChanged() {
+      const draft = this.settings.contextDraft;
+      const scope = draft.model ? "models" : "providers";
+      draft.tokens = this.settings.contextLimits[scope]?.[draft.model || draft.provider] ?? "";
+      this._settingsDraftGuard?.capture(["context"]);
+    },
+
+    async saveContextLimit() {
+      const draft = { ...this.settings.contextDraft };
+      const tokens = draft.tokens === "" || draft.tokens == null ? null : Number(draft.tokens);
+      if (tokens !== null && (!Number.isInteger(tokens) || tokens < 1024 || tokens > 10000000)) {
+        this.settings.contextError = this.lang === "zh" ? "请输入 1024～10000000 的整数，或留空恢复自动。" : "Enter an integer from 1024 to 10000000, or leave blank for automatic.";
+        return;
+      }
+      this.settings.contextSaving = true;
+      this.settings.contextError = "";
+      try {
+        const r = await fetch("/api/settings/context-limits", {
+          method: "PUT", headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ scope: draft.model ? "models" : "providers", key: draft.model || draft.provider, tokens }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(this._memoryErrorDetail(data, r.status));
+        this.settings.contextLimits = data.context_limits;
+        this._settingsDraftGuard?.accept("context", draft);
+        this.toast(this.lang === "zh" ? "上下文预算已保存" : "Context budget saved", "success");
+      } catch (e) { this.settings.contextError = e.message || String(e); }
+      finally { this.settings.contextSaving = false; }
+    },
+
+    async refreshMemoryDiagnostics() {
+      const mem = this.settings.memory;
+      if (mem.statusLoading) return;
+      mem.statusLoading = true;
+      mem.statusError = "";
+      try { mem.status = await this._settingsRead("/api/memory/status"); }
+      catch (e) { mem.statusError = this._settingsReadError(e); }
+      finally { mem.statusLoading = false; }
+    },
+
+    memoryJobState(job) {
+      const labels = this.lang === "zh"
+        ? { queued: job.attempts > 0 ? "等待重试" : "排队", running: "运行中", done: "成功", failed: "失败" }
+        : { queued: job.attempts > 0 ? "Retry pending" : "Queued", running: "Running", done: "Succeeded", failed: "Failed" };
+      return labels[job.status] || job.status;
+    },
+
     async memoryRunAction(action) {
       const mem = this.settings.memory;
+      if (mem.actionRunning) return;
       mem.actionRunning = true;
       try {
         const r = await fetch(`/api/memory/${action}`, {
           method: "POST", headers: this.hdr(),
         });
         if (!r.ok) throw new Error(await r.text());
-        this.toast(action === "dream"
+        const result = await r.json();
+        this.toast(action === "reindex" && result.queued === 0
+          ? (this.lang === "zh" ? "已有相同重建任务，或没有需要索引的记忆" : "Reindex already pending, or no memories to index")
+          : action === "dream"
           ? (this.lang === "zh" ? "跨会话反思任务已排队" : "Dream job queued")
           : (this.lang === "zh" ? "重建索引任务已排队" : "Reindex jobs queued"), "success");
-        await this.refreshMemoryCenter();
+        await Promise.allSettled([this.refreshMemoryCenter(), this.refreshMemoryDiagnostics()]);
       } catch (e) {
         this.toast(e.message || String(e), "error");
       } finally {
@@ -22155,6 +22223,10 @@ function portal() {
       if (!r.ok) return;
       const d = await r.json();
       this.settings.providers = d.providers;
+      this.settings.contextGroups = d.context_groups || [];
+      this.settings.contextLimits = d.context_limits || { providers: {}, models: {} };
+      this.settings.contextError = "";
+      this.contextDraftChanged();
       for (const p of d.providers) {
         if (!(p.env_key in this.settings.draftKeys)) this.settings.draftKeys[p.env_key] = "";
         // Seed a draft for any provider that doesn't have one yet (e.g. a

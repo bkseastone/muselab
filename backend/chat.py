@@ -2874,7 +2874,11 @@ def _context_limit_details(
     200K model guess. `max_context_window` remains metadata, never the default.
     """
     model = _canonical_context_model(model)
+    from .context_limits import settings_override
     override = _context_limit_env_override(model)
+    override_source = "env_override"
+    if not override:
+        override, override_source = settings_override(model)
     if override:
         cap = capability or {}
         return {
@@ -2886,7 +2890,7 @@ def _context_limit_details(
                 override, _positive_int(cap.get("context_max_limit"))),
             "context_effective_percent": 100,
             "catalog_auto_compact_threshold": 0,
-            "context_limit_source": "env_override",
+            "context_limit_source": override_source,
             "context_limit_is_estimate": False,
         }
     if not endpoints.is_third_party(model):

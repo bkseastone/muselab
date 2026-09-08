@@ -56,3 +56,45 @@ def test_env_extends_ignored_subtrees(app_module, monkeypatch):
         monkeypatch.delenv("MUSELAB_IGNORED_SUBTREES", raising=False)
         monkeypatch.delenv("MUSELAB_IGNORED_SUBTREE_PREFIXES", raising=False)
         importlib.reload(ws)
+
+
+def test_reconcile_and_native_events_prune_configured_trees(app_module, tmp_path, monkeypatch):
+    from backend import workspace_store as ws
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for name in ("bulk", "snap.20260908", "notes"):
+        (root / name).mkdir()
+        (root / name / "a.txt").write_text("original")
+    store = ws.WorkspaceStore(root)
+    store.reconcile("test", root, "test", primary=True)
+
+    def paths():
+        return {row["path"] for row in store.bootstrap("test")["entries"]}
+
+    assert "bulk/a.txt" in paths()
+    monkeypatch.setattr(ws, "_IGNORED_SUBTREES", ws._IGNORED_SUBTREES | {"bulk"})
+    monkeypatch.setattr(ws, "_IGNORED_SUBTREE_PREFIXES", frozenset({"snap."}))
+    store.reconcile("test", root, "test", primary=True)
+    assert "bulk/a.txt" not in paths()
+    assert "snap.20260908/a.txt" not in paths()
+    assert "notes/a.txt" in paths()
+    watched = store.watch_directories("test", root)
+    assert root / "notes" in watched
+    assert root / "bulk" not in watched
+    assert root / "snap.20260908" not in watched
+    for name in ("bulk", "snap.20260908", "notes"):
+        (root / name / "new.txt").write_text("new")
+    store.apply_changes("test", root, [
+        {"type": "added", "path": f"{name}/new.txt"}
+        for name in ("bulk", "snap.20260908", "notes")
+    ])
+    assert "notes/new.txt" in paths()
+    assert "bulk/new.txt" not in paths()
+    assert "snap.20260908/new.txt" not in paths()
+    # Removing an override restores discoverability without touching files.
+    monkeypatch.setattr(ws, "_IGNORED_SUBTREES", ws._IGNORED_SUBTREES - {"bulk"})
+    monkeypatch.setattr(ws, "_IGNORED_SUBTREE_PREFIXES", frozenset())
+    store.reconcile("test", root, "test", primary=True)
+    assert {"bulk/new.txt", "snap.20260908/new.txt"} <= paths()
+    store.close()

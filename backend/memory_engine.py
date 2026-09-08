@@ -1580,8 +1580,14 @@ class MemoryEngine:
             **registry,
         }
 
+    def _maintenance_revision(self) -> str:
+        # Persist only a digest, never URLs, credentials or configuration.
+        return hashlib.sha256(self.config().model_dump_json().encode()).hexdigest()
+
     async def trigger_dream(self) -> str:
         cfg = self.config()
+
+        revision = self._maintenance_revision()
 
         def enqueue_dream(store: MemoryStore) -> str:
             newly_closed = store.close_idle_episodes(
@@ -1592,10 +1598,10 @@ class MemoryEngine:
                     owner_id=cfg.owner_id)
             episodes = store.list_episodes(
                 cfg.owner_id, limit=20, status="closed")
-            ids = [item["id"] for item in episodes]
+            ids = sorted(item["id"] for item in episodes)
             return store.enqueue(
                 "cross_episode_dream", {"episode_ids": ids},
-                owner_id=cfg.owner_id)
+                owner_id=cfg.owner_id, deduplicate=True, revision=revision)
 
         job_id = await self._store_call(enqueue_dream)
         self._wake.set()
@@ -1607,7 +1613,8 @@ class MemoryEngine:
         # cursor and commits bounded durable jobs together. No updated_at-based
         # pagination: finishing an index job updates that column.
         queued = await self._store_call(lambda store: store.enqueue_reindex_batches(
-            cfg.owner_id, batch_size=_REINDEX_BATCH_SIZE))
+            cfg.owner_id, batch_size=_REINDEX_BATCH_SIZE,
+            revision=self._maintenance_revision()))
         self._wake.set()
         return queued
 

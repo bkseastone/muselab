@@ -14,6 +14,7 @@ const signature = (value, name) => JSON.stringify(clean(name === "keys"
 export function createSettingsDraftGuard(app) {
   const baseline = new Map();
   const values = () => ({
+    context: app.settings.contextDraft,
     defaults: app.settings.draftDefaults,
     keys: app.settings.draftKeys,
     newProvider: app.settings.providerNew,
@@ -37,7 +38,7 @@ export function createSettingsDraftGuard(app) {
         && signature(current[key], key) !== signature(baseline.get(key), key));
     },
     discard() {
-      const simple = {defaults: "draftDefaults", keys: "draftKeys", newProvider: "providerNew", mcp: "mcpDraft"};
+      const simple = {context: "contextDraft", defaults: "draftDefaults", keys: "draftKeys", newProvider: "providerNew", mcp: "mcpDraft"};
       for (const [key, value] of baseline) {
         if (simple[key]) app.settings[simple[key]] = clone(value);
         else if (key === "memory") app.settings.memory.config = clone(value);
@@ -47,7 +48,7 @@ export function createSettingsDraftGuard(app) {
       app._syncBeforeUnloadGuard();
     },
   };
-  for (const path of ["draftDefaults", "draftKeys", "providerDrafts", "providerNew", "mcpDraft", "hooks.draft", "memory.config"])
+  for (const path of ["contextDraft", "draftDefaults", "draftKeys", "providerDrafts", "providerNew", "mcpDraft", "hooks.draft", "memory.config"])
     app.$watch(`settings.${path}`, () => app._syncBeforeUnloadGuard());
   return guard;
 }

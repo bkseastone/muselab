@@ -173,3 +173,17 @@ The browser stores the runtime language preference. Backend template selection c
 ## Exposing the service
 
 `MUSELAB_HOST` and Docker's `MUSELAB_BIND` default to localhost. When setting either to `0.0.0.0`, use an HTTPS reverse proxy, firewall, and dedicated unprivileged service user. A leaked token has a much larger impact when real terminals are enabled than it would on a read-only notes site.
+
+## Additional index exclusions
+
+`MUSELAB_IGNORED_SUBTREES` adds comma-separated exact directory names to the built-in index exclusions. `MUSELAB_IGNORED_SUBTREE_PREFIXES` adds comma-separated directory-name prefixes. Matching is case-sensitive at every depth; whitespace and empty entries are ignored. For example, `MUSELAB_IGNORED_SUBTREES=bulk,generated` and `MUSELAB_IGNORED_SUBTREE_PREFIXES=snapshot.,backup.` keep their descendants out of recursive indexing and native watches. The directory itself may remain visible as an opaque entry.
+
+Restart after changing these variables. The next complete reconciliation removes previously indexed descendants; removing an exclusion restores them on reconciliation. This never deletes source files and does not guarantee that the SQLite file shrinks: database compaction is a separate maintenance operation. Avoid broad prefixes that also match working documents.
+
+## Context budgets in Settings
+
+Settings → Providers → Context window budget accepts an effective token budget per provider (including DUCC) or per model. A model override wins over its provider default. Leave the field blank and save to remove that override. Changes are saved in `MUSELAB_CONTEXT_LIMITS` as JSON in the configured `.env` and apply to subsequent budget calculations without restarting. Existing explicit environment overrides take precedence; otherwise the runtime/catalog and model fallback remain automatic.
+
+These budgets control MuseLab usage display and preflight/compaction decisions, not the upstream model's physical capacity. A higher value cannot unlock a larger model window. DUCC is a separate CLI route: its reported SDK window wins in automatic mode, with a 128000-token fallback for unmapped prefixed IDs. It must not inherit the capacity of a similarly named direct API model. The meter identifies settings overrides separately from SDK, catalog and estimated fallback sources.
+
+Memory maintenance reuses an active reindex operation for the same owner, semantic memory snapshot and configuration revision, including after a process restart. Dream submissions reuse a queued/running job for the same episode set and revision. New content or configuration is a distinct request. After all batches reach a terminal state, a new explicit submission may run again. The diagnostics panel shows recent owner-scoped jobs, retry attempts, safe failure categories, pending index count and latest reindex batch progress; refresh it to read current status. It never displays job payloads or raw exception text.
