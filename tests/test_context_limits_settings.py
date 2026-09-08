@@ -27,7 +27,7 @@ def test_provider_model_precedence_and_durable_auto_reset(client, auth, isolated
         assert r.status_code == 200, r.text
 
     model = "ducc:glm-5"
-    assert _context_limit_details(model)["context_limit"] == 128000
+    assert _context_limit_details(model)["context_limit"] == 200000
     assert _context_limit_details(model, sdk_max=200000)["context_limit"] == 200000
     put("providers", "ducc", 500000)
     assert _context_limit_details(model, sdk_max=200000)["context_limit"] == 500000
@@ -85,7 +85,7 @@ def test_context_key_cannot_interpolate_environment_on_restart(client, auth, iso
     assert not isolated.ENV_PATH.exists()
 
 
-@pytest.mark.parametrize("sdk_window,expected", [(0, 128000), (200000, 200000)])
+@pytest.mark.parametrize("sdk_window,expected", [(0, 200000), (128000, 128000), (300000, 300000)])
 def test_reset_auto_does_not_reuse_cached_settings_budget(client, auth, isolated, sdk_window, expected):
     from backend import chat
     sid = "context-settings-reset-fixture"
@@ -97,3 +97,20 @@ def test_reset_auto_does_not_reuse_cached_settings_budget(client, auth, isolated
     assert response.status_code == 200, response.text
     assert response.json()["context_limit"] == expected
     assert response.json()["context_limit_source"] != "settings_provider"
+
+
+@pytest.mark.parametrize("model", ["ducc:glm-5", "ducc:future-model"])
+def test_ducc_auto_default_preserves_runtime_evidence(isolated, model):
+    from backend.chat import _context_limit_details
+
+    automatic = _context_limit_details(model)
+    assert automatic["context_limit"] == 200000
+    assert automatic["context_limit_is_estimate"] is True
+    for measured in (128000, 300000):
+        live = _context_limit_details(model, sdk_max=measured)
+        assert live["context_limit"] == measured
+        assert live["context_limit_source"] == "sdk"
+        restored = _context_limit_details(
+            model, stored=measured, stored_source="session_sdk")
+        assert restored["context_limit"] == measured
+    assert _context_limit_details("unknown-model")["context_limit"] == 128000
