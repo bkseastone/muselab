@@ -21,6 +21,7 @@ from claude_agent_sdk.types import PermissionMode
 from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
+from . import context_limits
 from .config_paths import ENV_PATH, MCP_CONFIG_PATH
 from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
@@ -120,7 +121,7 @@ class SettingsIn(BaseModel):
 # is atomic, but two concurrent writers (e.g. two browser tabs saving
 # different settings) would each read the same baseline and the second
 # replace would silently drop the first writer's keys.
-_ENV_WRITE_LOCK = threading.Lock()
+_ENV_WRITE_LOCK = threading.RLock()
 
 
 def _write_env(updates: dict[str, str]) -> None:
@@ -269,6 +270,8 @@ def get_settings() -> dict:
         })
     return {
         "providers": providers,
+        "context_limits": context_limits.configured_limits(),
+        "context_groups": context_limits.provider_groups(),
         "defaults": {
             # Model: prefer MUSELAB_DEFAULT_MODEL, fall back to MUSELAB_MODEL,
             # then to the canonical default. The two-key dance exists because
@@ -423,6 +426,32 @@ def put_settings(req: SettingsIn) -> dict:
 
 # ====== Provider catalog management ======
 #
+class ContextLimitIn(BaseModel):
+    scope: Literal["providers", "models"]
+    key: str = Field(min_length=1, max_length=256,
+                     pattern=r"^[A-Za-z0-9][A-Za-z0-9._:+-]*$")
+    tokens: int | None = Field(default=None, strict=True, ge=1024, le=10_000_000)
+
+
+@router.put("/context-limits", dependencies=[Depends(require_token)])
+def put_context_limit(req: ContextLimitIn) -> dict:
+    groups = context_limits.provider_groups()
+    allowed = ({item["id"] for item in groups} if req.scope == "providers"
+               else {model for item in groups for model in item["models"]})
+    with _ENV_WRITE_LOCK:
+        limits = context_limits.configured_limits()
+        if req.key not in allowed and not (
+            req.tokens is None and req.key in limits[req.scope]
+        ):
+            raise HTTPException(422, "unknown provider or model")
+        if req.tokens is None:
+            limits[req.scope].pop(req.key, None)
+        else:
+            limits[req.scope][req.key] = req.tokens
+        _write_env({context_limits.ENV_KEY: json.dumps(limits, separators=(",", ":"))})
+    return {"ok": True, "context_limits": limits}
+
+
 # The effective provider list = built-in defaults + user overrides, all owned
 # by endpoints.py (persisted in provider_overrides.json). These routes are the
 # write side of the Settings provider editor: create / edit / delete / restore.

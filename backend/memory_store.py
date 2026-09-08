@@ -408,6 +408,11 @@ class MemoryStore:
         if "owner_id" not in columns:
             conn.execute(
                 "ALTER TABLE jobs ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+        if "operation_key" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN operation_key TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_operation "
+                     "ON jobs(owner_id, operation_key, status)")
 
     def _migrate_fts(self, conn: sqlite3.Connection) -> None:
         """Reindex memory_fts when the tokenization scheme changes.
@@ -1173,7 +1178,8 @@ class MemoryStore:
         return self.artifact(artifact_id)
 
     def enqueue(self, kind: str, payload: dict, *, run_after: float | None = None,
-                owner_id: str = "") -> str:
+                owner_id: str = "", deduplicate: bool = False,
+                revision: str = "") -> str:
         """Queue a background job.
 
         `owner_id` is stamped at ENQUEUE time on purpose: the worker used to
@@ -1182,19 +1188,49 @@ class MemoryStore:
         switch) wrote its results into the wrong owner's registry.
         """
         job_id, now = _id("job"), _now()
-        with self._lock, self._connect() as conn:
+        operation_key = (hashlib.sha256(_json(
+            [kind, owner_id, revision, payload]).encode()).hexdigest()
+            if deduplicate else "")
+        with self._write_tx() as conn:
+            if operation_key:
+                existing = conn.execute(
+                    "SELECT id FROM jobs WHERE owner_id=? AND operation_key=? "
+                    "AND status IN ('queued','running') LIMIT 1",
+                    (owner_id, operation_key)).fetchone()
+                if existing:
+                    return existing["id"]
             conn.execute(
                 """INSERT INTO jobs
-                   (id,kind,payload_json,run_after,owner_id,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (job_id, kind, _json(payload), run_after or now, owner_id, now, now),
+                   (id,kind,payload_json,run_after,owner_id,created_at,updated_at,operation_key)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (job_id, kind, _json(payload), run_after or now, owner_id, now, now,
+                 operation_key),
             )
         return job_id
 
-    def enqueue_reindex_batches(self, owner_id: str, *, batch_size: int = 256) -> int:
-        """Atomically queue the complete active set without an unbounded payload."""
+    def enqueue_reindex_batches(self, owner_id: str, *, batch_size: int = 256,
+                                revision: str = "") -> int:
+        """Queue one durable operation for a semantic snapshot, in bounded batches.
+
+        The key excludes index timestamps: completed batches must not make a
+        repeated click enqueue the same operation again. New content or a new
+        provider revision is distinct and must never be silently dropped.
+        """
+        if not 1 <= batch_size <= 256:
+            raise ValueError("batch_size must be between 1 and 256")
         total, cursor, now = 0, "", _now()
         with self._write_tx() as conn:
+            digest = hashlib.sha256(_json([owner_id, revision]).encode())
+            for row in conn.execute(
+                "SELECT id,content FROM memories WHERE owner_id=? AND status='active' "
+                "ORDER BY id", (owner_id,)):
+                digest.update(_json([row["id"], row["content"]]).encode())
+            operation_key = digest.hexdigest()
+            if conn.execute(
+                "SELECT 1 FROM jobs WHERE owner_id=? AND kind='reindex_memories' "
+                "AND operation_key=? AND status IN ('queued','running') LIMIT 1",
+                (owner_id, operation_key)).fetchone():
+                return 0
             while True:
                 ids = [row["id"] for row in conn.execute(
                     "SELECT id FROM memories WHERE owner_id=? AND status='active' "
@@ -1202,10 +1238,10 @@ class MemoryStore:
                 if not ids:
                     break
                 conn.execute(
-                    "INSERT INTO jobs(id,kind,payload_json,run_after,owner_id,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO jobs(id,kind,payload_json,run_after,owner_id,created_at,"
+                    "updated_at,operation_key) VALUES (?,?,?,?,?,?,?,?)",
                     (_id("job"), "reindex_memories", _json({"memory_ids": ids}),
-                     now, owner_id, now, now))
+                     now, owner_id, now, now, operation_key))
                 total += len(ids)
                 cursor = ids[-1]
         return total
@@ -1475,15 +1511,65 @@ class MemoryStore:
                     f"SELECT count(*) AS n FROM {table} WHERE {where}",
                     (owner_id,) if "?" in where else (),
                 ).fetchone()["n"])
-            queued = conn.execute(
-                "SELECT count(*) AS n FROM jobs WHERE status IN ('queued','running')"
-            ).fetchone()["n"]
+            counts = {row["status"]: row["n"] for row in conn.execute(
+                "SELECT status,count(*) AS n FROM jobs WHERE owner_id=? GROUP BY status",
+                (owner_id,))}
+            recent = []
+            kinds = {"consolidate_episode", "reconcile_transcript", "cross_episode_dream",
+                     "reindex_memory", "reindex_memories", "unindex_memory"}
+            categories = {"generation_failure", "timeout", "transport", "authentication",
+                          "transient_http", "http_error", "unknown_job", "owner_mismatch",
+                          "permission", "file_not_found", "missing_key", "invalid_type",
+                          "invalid_value", "malformed_response", "transient_provider"}
+            reasons = {"timeout", "invalid_json", "non_object_json", "empty_result",
+                       "empty_response", "api_error", "interrupted", "max_turns"}
+            for row in conn.execute(
+                "SELECT id,kind,status,attempts,run_after,updated_at,last_error "
+                "FROM jobs WHERE owner_id=? ORDER BY updated_at DESC,id DESC LIMIT 20",
+                (owner_id,)):
+                try:
+                    failure = json.loads(row["last_error"] or "{}")
+                except (ValueError, TypeError):
+                    failure = {}
+                if not isinstance(failure, dict):
+                    failure = {}
+                # Old registries may contain raw exception text or arbitrary
+                # JSON. Only allowlisted categories cross the status API.
+                recent.append({
+                    key: row[key] for key in
+                    ("id", "status", "attempts", "run_after", "updated_at")
+                } | {
+                    "kind": row["kind"] if row["kind"] in kinds else "unknown_job",
+                    "category": (failure.get("category")
+                                 if isinstance(failure.get("category"), str) and failure.get("category") in categories else
+                                 "unclassified" if row["last_error"] else ""),
+                    "reason": failure.get("reason") if isinstance(failure.get("reason"), str) and failure.get("reason") in reasons else "",
+                })
+            last_success = conn.execute(
+                "SELECT MAX(updated_at) FROM jobs WHERE owner_id=? AND status='done'",
+                (owner_id,)).fetchone()[0]
+            last_op = conn.execute(
+                "SELECT operation_key,created_at FROM jobs WHERE owner_id=? "
+                "AND kind='reindex_memories' AND operation_key!='' "
+                "ORDER BY created_at DESC LIMIT 1", (owner_id,)).fetchone()
+            progress = None
+            if last_op:
+                progress = dict(conn.execute(
+                    "SELECT count(*) AS total_batches, "
+                    "SUM(status='done') AS done_batches, SUM(status='failed') AS failed_batches, "
+                    "SUM(status IN ('queued','running')) AS pending_batches "
+                    "FROM jobs WHERE owner_id=? AND operation_key=? AND created_at=?",
+                    (owner_id, last_op["operation_key"], last_op["created_at"])).fetchone())
             return {
                 "memories": count("memories", "owner_id=? AND status='active'"),
                 "episodes": count("episodes"),
                 "pending_artifacts": count(
                     "artifacts", "owner_id=? AND status='pending_review'"),
-                "queued_jobs": int(queued),
+                "pending_index": count(
+                    "memories", "owner_id=? AND status='active' AND embedding_state!='ready'"),
+                "queued_jobs": counts.get("queued", 0) + counts.get("running", 0),
+                "job_counts": counts, "recent_jobs": recent,
+                "last_success_at": last_success, "reindex_progress": progress,
             }
 
     def export_snapshot(self, owner_id: str) -> dict:

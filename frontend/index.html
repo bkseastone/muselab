@@ -4432,6 +4432,24 @@
               <span x-text="lang==='zh' ? '后台任务' : 'background jobs'"></span></div>
           </div>
 
+          <details class="settings-advanced" data-testid="memory-diagnostics">
+            <summary x-text="lang==='zh'?'任务进度与诊断':'Job progress & diagnostics'"></summary>
+            <button class="btn-ghost sm" @click="refreshMemoryDiagnostics()" :disabled="settings.memory.statusLoading"
+                    x-text="lang==='zh'?'刷新状态':'Refresh status'"></button>
+            <p class="settings-hint" x-text="(lang==='zh'?'待索引：':'Pending index: ') + (settings.memory.status?.pending_index || 0)"></p>
+            <p class="settings-hint" x-text="(lang==='zh'?'最近成功：':'Last success: ') + (settings.memory.status?.last_success_at ? new Date(settings.memory.status.last_success_at * 1000).toLocaleString() : '—')"></p>
+            <p class="settings-hint" x-show="settings.memory.status?.reindex_progress"
+               x-text="(lang==='zh'?'最近重建批次（成功／总数）：':'Latest reindex batches (done / total): ') + (settings.memory.status?.reindex_progress?.done_batches || 0) + ' / ' + (settings.memory.status?.reindex_progress?.total_batches || 0) + (lang==='zh'?'；失败：':'; failed: ') + (settings.memory.status?.reindex_progress?.failed_batches || 0)"></p>
+            <template x-for="job in (settings.memory.status?.recent_jobs || [])" :key="job.id">
+              <article class="memory-card">
+                <div x-text="job.kind + ' · ' + memoryJobState(job)"></div>
+                <div class="settings-hint" x-text="(lang==='zh'?'尝试次数：':'Attempts: ') + job.attempts + (job.category ? ' · ' + job.category : '') + (job.reason ? ' / ' + job.reason : '')"></div>
+                <time x-text="new Date(job.updated_at * 1000).toLocaleString()"></time>
+              </article>
+            </template>
+            <p class="settings-hint" x-show="!(settings.memory.status?.recent_jobs || []).length" x-text="lang==='zh'?'暂无任务记录':'No job history'"></p>
+          </details>
+
           <div class="settings-row">
             <label for="setting-settings-memory-config-mode" x-text="lang==='zh' ? '运行模式' : 'Mode'"></label>
             <select id="setting-settings-memory-config-mode" class="settings-input" x-model="settings.memory.config.mode">
@@ -4740,6 +4758,23 @@
 
         <div class="settings-section" data-page="provider"
              x-show="settings.activePage === 'provider'">
+          <details class="settings-advanced" data-testid="context-limits-settings">
+            <summary x-text="lang==='zh'?'上下文窗口预算':'Context window budget'"></summary>
+            <p class="settings-hint" x-text="lang==='zh'?'单模型设置优先于 Provider 默认值；留空恢复自动。部署环境变量优先。此设置影响用量显示与 MuseLab 压缩判断，不会扩大模型或 CLI 实际支持的窗口。':'Model overrides take precedence over provider defaults; leave blank for automatic. Deployment environment overrides take priority. This changes usage display and MuseLab compaction decisions, not model or CLI capacity.'"></p>
+            <div class="settings-row"><label for="context-provider">Provider</label>
+              <select id="context-provider" class="settings-input" x-model="settings.contextDraft.provider" @change="settings.contextDraft.model=''; contextDraftChanged()" :disabled="settings.contextSaving">
+                <template x-for="group in settings.contextGroups" :key="group.id"><option :value="group.id" x-text="group.display"></option></template>
+              </select></div>
+            <div class="settings-row"><label for="context-model" x-text="lang==='zh'?'模型':'Model'"></label>
+              <select id="context-model" class="settings-input" x-model="settings.contextDraft.model" @change="contextDraftChanged()" :disabled="settings.contextSaving">
+                <option value="" x-text="lang==='zh'?'Provider 默认值':'Provider default'"></option>
+                <template x-for="model in contextModels()" :key="model"><option :value="model" x-text="model"></option></template>
+              </select></div>
+            <div class="settings-row"><label for="context-tokens" x-text="lang==='zh'?'有效上下文（tokens）':'Effective context (tokens)'"></label>
+              <input id="context-tokens" class="settings-input" type="number" min="1024" max="10000000" step="1" placeholder="Auto" x-model="settings.contextDraft.tokens" :disabled="settings.contextSaving" /></div>
+            <div class="settings-inline-error" role="alert" x-show="settings.contextError" x-text="settings.contextError"></div>
+            <button class="btn-primary sm" @click="saveContextLimit()" :disabled="settings.contextSaving" x-text="lang==='zh'?'保存上下文预算':'Save context budget'"></button>
+          </details>
           <div class="settings-section-title">
             <span x-text="t('set.sec.provider')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
