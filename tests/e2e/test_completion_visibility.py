@@ -425,3 +425,164 @@ def test_removed_anchor_recovery_settles_real_scheduler(page, backend_url, auth_
     expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text(FINAL)
     assert sum('?tail=' in url for url in reads) == 1
     _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_completed_tool_viewport_keeps_final_scroll_reachable(page, backend_url, auth_token, width):
+    """A successful history install must expose the completed suffix to scrolling."""
+    page.set_viewport_size({"width": width, "height": 900})
+    errors, history, _ = _prepare(page, backend_url, auth_token)
+    history["messages"].insert(1, {
+        "role": "thinking", "text": "Checking system status", "uuid": "fixture-tool-tail",
+    })
+    history.update(total=3, message_count=3)
+    result = _app_eval(page, """
+        const st = app.tabState[arg];
+        st.messages = [st.messages[0], {
+          role:'thinking', text:'Checking system status', uuid:'fixture-tool-tail',
+          _k:arg + ':uuid:fixture-tool-tail',
+        }];
+        Object.assign(st.messageRange, {visibleStart:0, visibleEnd:2, total:2});
+        st.atBottom = false;
+        st._userScrollAt = Date.now();
+        const loaded = await app._runCompletedTurnSync(arg, st, {
+          expectedText:'', expectedAssistantUuid:'fixture-final',
+          completedTurnId:'fixture-turn', followTail:false,
+        });
+        return {loaded, final:st.messages.at(-1).text,
+          exposed:st.messageRange.visibleEnd === st.messages.length,
+          following:st.atBottom};
+    """, SID)
+    assert result == {"loaded": True, "final": FINAL, "exposed": True, "following": False}
+    expect(page.locator(f'.msg-pane[data-tid="{SID}"]')).to_contain_text(FINAL)
+    _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("gesture", ["wheel", "touch", "pointer"])
+def test_nested_tool_scroll_does_not_freeze_live_tail(page, backend_url, auth_token, gesture):
+    errors, _, _ = _prepare(page, backend_url, auth_token)
+    result = _app_eval(page, """
+        const st = app.tabState[arg.sid];
+        const body = app._chatBodyElement();
+        const nested = document.createElement('div');
+        nested.style.cssText = 'height:100px;overflow:auto;width:100px';
+        nested.innerHTML = '<div style="height:1000px">tool output</div>';
+        body.appendChild(nested);
+        nested.scrollTop = 300;
+        st.atBottom = true;
+        st._userScrollAt = 0;
+        if (arg.gesture === 'wheel') {
+          nested.dispatchEvent(new WheelEvent('wheel', {bubbles:true, deltaY:-50}));
+        } else if (arg.gesture === 'pointer') {
+          const rect = nested.getBoundingClientRect();
+          nested.dispatchEvent(new PointerEvent('pointerdown', {
+            bubbles:true, clientX:rect.right-2, clientY:rect.top+10,
+          }));
+        } else {
+          const event = type => {
+            const ev = new Event(type, {bubbles:true});
+            Object.defineProperty(ev, 'touches', {value:[{clientY:type === 'touchstart' ? 100 : 130}]});
+            nested.dispatchEvent(ev);
+          };
+          event('touchstart'); event('touchmove');
+        }
+        const following = st.atBottom;
+        nested.remove();
+        return following;
+    """, {"sid": SID, "gesture": gesture})
+    assert result is True
+    _assert_no_browser_errors(page, errors)
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+@pytest.mark.parametrize("reading", [False, True])
+def test_long_tool_stream_done_exposes_final_without_reload(
+    page, backend_url, auth_token, width, reading,
+):
+    from tests.e2e.test_chat_render_perf import _install_fake_event_source
+
+    page.set_viewport_size({"width": width, "height": 900})
+    _install_fake_event_source(page)
+    page.route("**/api/chat/stream/start", lambda route: route.fulfill(
+        status=200, json={"ticket": "long-completion-ticket"},
+    ))
+    errors, history, reads = _prepare(page, backend_url, auth_token)
+    history["messages"] = [{"role": "user", "text": "FIXTURE_PROMPT",
+                            "uuid": "fixture-user", "_turnRoot": True}]
+    for i in range(70):
+        history["messages"].extend([
+            {"role": "thinking", "text": f"Inspect fixture {i}", "uuid": f"think-{i}"},
+            {"role": "tool_use", "id": f"tool-{i}", "name": "Bash",
+             "input": {"command": "true"}, "summary": "fixture check", "uuid": f"use-{i}"},
+            {"role": "tool_result", "tool_use_id": f"tool-{i}", "tool_name": "Bash",
+             "text": f"fixture output {i}", "preview": f"fixture output {i}",
+             "uuid": f"result-{i}"},
+        ])
+    history["messages"].append({"role": "assistant", "text": FINAL, "uuid": "fixture-final"})
+    history.update(total=len(history["messages"]), message_count=len(history["messages"]))
+    _app_eval(page, """
+        const st = app.tabState[arg];
+        app._requestSessionSync = window.realVisibilityRequest;
+        app._pullSessionList = async () => false;
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.availableModels = [{model:'e2e-model', label:'E2E', group:'e2e'}];
+        app.model = 'e2e-model';
+        app.defaultModel = 'e2e-model';
+        st.permission = 'bypassPermissions';
+        st.messages = [];
+        Object.assign(st.messageRange, {visibleStart:0, visibleEnd:0, total:0});
+        st.atBottom = true;
+        app.input = 'FIXTURE_PROMPT';
+        app.send();
+    """, SID)
+    page.wait_for_function("window.__fakeChatStreams().length === 1")
+    page.evaluate("""async () => {
+        let seq = 0;
+        const emit = (kind, data) => window.__emitSse(kind, {
+          ...data, turn_id:'fixture-turn', event_seq:++seq,
+        });
+        for (let i = 0; i < 70; i++) {
+          emit('thinking', {text:'Inspect fixture ' + i});
+          emit('tool_use', {id:'tool-' + i, name:'Bash', input:{command:'true'},
+            summary:'fixture check'});
+          emit('tool_result', {id:'tool-' + i, tool_use_id:'tool-' + i, tool_name:'Bash',
+            text:'fixture output ' + i, preview:'fixture output ' + i});
+          if (i % 10 === 0) await new Promise(requestAnimationFrame);
+        }
+        window.completionSequence = seq;
+    }""")
+    page.wait_for_timeout(250)
+    if reading:
+        body = page.locator(".chat-body")
+        box = body.bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.wheel(0, -300)
+        page.wait_for_function("""sid => !document.querySelector('#app')
+            ._x_dataStack[0].tabState[sid].atBottom""", arg=SID)
+    # Omit the final text delta: the real done listener/scheduler must recover it.
+    page.evaluate("""() => window.__emitSse('done', {
+        turn_id:'fixture-turn', event_seq:++window.completionSequence,
+        assistant_uuid:'fixture-final', completed_at_ms:Date.now(),
+        duration_ms:1000, model:'e2e-model',
+    })""")
+    page.wait_for_function("""sid => {
+        const st = document.querySelector('#app')._x_dataStack[0].tabState[sid];
+        return !st.streaming && !st._pendingCompletedTurnSync
+          && st.messages.at(-1)?.text === 'CANONICAL_FINAL_COMPLETE';
+    }""", arg=SID)
+    result = _app_eval(page, """
+        const st = app.tabState[arg];
+        return {reachable:st.messageRange.visibleEnd === st.messages.length,
+          following:st.atBottom, mounted:app._paneElement(arg).querySelectorAll('.msg').length};
+    """, SID)
+    assert result["reachable"] is True
+    assert result["following"] is (not reading)
+    assert result["mounted"] < len(history["messages"])
+    # Ordinary scrolling can reach the answer; no refresh or jump-to-latest API.
+    for _ in range(5):
+        page.locator(".chat-body").evaluate("el => el.scrollTop = el.scrollHeight")
+        page.wait_for_timeout(100)
+    expect(page.locator(".msg-pane p").filter(has_text=FINAL)).to_be_visible()
+    assert reads
+    _assert_no_browser_errors(page, errors)
