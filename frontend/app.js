@@ -18848,6 +18848,16 @@ function portal() {
           st.atBottom = false;
           return false;
         }
+        // Preserving the reader's position must not preserve an obsolete END
+        // boundary. A final answer can be present in the accepted repository
+        // but excluded from the scrollable range forever after a tool row.
+        // Expose the settled suffix while retaining the start/viewport anchor;
+        // physical virtualization still bounds mounted rows, and only explicit
+        // tail-follow may move the reader to the final answer.
+        if (quietRangeResolved && completion?.stable === true
+            && !completion.active && !s.has_later && !full && !preserveFullOrder) {
+          quietRangeResolved.end = all.length;
+        }
         const installStarted = perfNow();
         // Cold loads start from an empty coordinate and reveal the newest rows in
         // small batches. Quiet reconciliation uses stable identities so inserts or
@@ -32309,6 +32319,18 @@ function portal() {
         movesTowardHistory = Number(ev.clientX) >= rect.right - 20;
       }
       if (!movesTowardHistory) return;
+      // Tool output/code panels have their own scroll containers. Their
+      // bubbling gestures do not mean the reader left the conversation tail.
+      // At an inner boundary allow normal scroll chaining to claim the outer
+      // viewport, unless the panel explicitly contains that chain.
+      for (let node = ev?.target instanceof Element ? ev.target : null;
+        node && node !== el; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (!/(auto|scroll|overlay)/.test(style.overflowY)
+            || node.scrollHeight <= node.clientHeight + 1) continue;
+        if (ev.type === "pointerdown" || node.scrollTop > 0
+            || /^(contain|none)$/.test(style.overscrollBehaviorY)) return;
+      }
       if (this.previewQuote.show && this.previewQuote.source === "chat"
           && this.previewQuote.mode !== "ask") {
         // Hide the contextual actions while the transcript moves, but preserve
