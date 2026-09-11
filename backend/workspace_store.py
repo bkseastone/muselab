@@ -337,6 +337,14 @@ def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
         connection.close()
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 class WorkspaceStore:
     """Serialize per-workspace mutations into contiguous SQLite transactions."""
 
@@ -694,7 +702,9 @@ class WorkspaceStore:
         scan_report: dict[str, Any] = report if report is not None else {}
         # Filesystem walking may happen in a separate process. The workspace lock
         # serializes only durable application and native watcher transactions.
+        lock_started = time.monotonic()
         with self._workspace_lock(workspace_id):
+            scan_report["store_lock_wait_ms"] = round((time.monotonic() - lock_started) * 1000)
             if snapshot is None:
                 snapshot = scan_workspace(
                     root,
@@ -719,7 +729,10 @@ class WorkspaceStore:
             with self._connect() as db:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
+                transaction_started = time.monotonic()
                 db.execute("BEGIN IMMEDIATE")
+                scan_report["transaction_wait_ms"] = round((time.monotonic() - transaction_started) * 1000)
+                apply_started = time.monotonic()
                 state = db.execute(
                     """
                     SELECT initialized, current_seq, path
@@ -857,7 +870,10 @@ class WorkspaceStore:
                 self._prune(db, workspace_id, seq)
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
+                scan_report["transaction_apply_ms"] = round((time.monotonic() - apply_started) * 1000)
+                commit_started = time.monotonic()
                 db.commit()
+                scan_report["commit_ms"] = round((time.monotonic() - commit_started) * 1000)
                 if return_payload:
                     return {
                         "cursor": seq,
@@ -1377,6 +1393,7 @@ class WorkspaceStore:
             self.path,
             timeout=30,
             isolation_level=None,
+            factory=_ClosingConnection,
         )
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")

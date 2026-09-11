@@ -276,13 +276,14 @@ def test_failsoft_500_bad_json_and_large_response(monkeypatch, fake_httpx):
     assert _run(mc.search_context("q", "s")) == ""
 
 
-def test_memory_and_complete_block_are_hard_capped(monkeypatch, fake_httpx):
+def test_memory_content_is_complete_with_requested_count(monkeypatch, fake_httpx):
     mc = _load(monkeypatch)
     mems = [{"memory": "内容" * 250} for _ in range(20)]
     fake_httpx.script = lambda url, payload: _FakeResp({"results": mems})
     out = _run(mc.search_context("q", "s"))
-    assert 0 < len(out) <= mc._MAX_BLOCK_CHARS
-    assert "…" in out
+    facts = json.loads(next(line for line in out.splitlines() if line.startswith('{"facts":')))["facts"]
+    assert facts == ["内容" * 250] * mc._SEARCH_LIMIT
+    assert "…" not in out
     # The client enforces the requested count even if the daemon ignores limit.
     assert len(mc._extract_text({"results": mems})) <= mc._SEARCH_LIMIT
 

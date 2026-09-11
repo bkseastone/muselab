@@ -546,6 +546,8 @@ def _classify_sdk_result_error(message: Any) -> tuple[bool, str, int | None]:
 
 generation_job_ref: ContextVar[str] = ContextVar("memory_generation_job_ref", default="")
 
+_generation_phases: ContextVar[dict | None] = ContextVar("memory_generation_phases", default=None)
+
 
 class GenerationError(RuntimeError):
     """Sanitized generation failure carrying only retry/log metadata."""
@@ -618,16 +620,20 @@ class GenerationProvider:
         started = time.perf_counter()
         route_kind, outcome, reason, cause_kind = "unresolved", "error", "unknown", "none"
         response_chars = 0
+        phases = {"phase": "routing"}
+        phase_token = _generation_phases.set(phases)
         try:
             async with asyncio.timeout(timeout):
                 route = self._route()
                 if route is None:
                     route_kind = "ducc" if configured_model.startswith("ducc:") else "sdk"
+                    phases["phase"] = "awaiting_sdk_event"
                     result = await self._complete_with_sdk(system, prompt)
                     response_chars, outcome = len(result), "done"
                     return result
                 route_kind = "http"
                 url, key, model = route
+                phases["phase"] = "http_response"
                 payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
                            "system": system,
                            "messages": [{"role": "user", "content": prompt}]}
@@ -684,6 +690,8 @@ class GenerationProvider:
                         category="malformed_response", reason="empty_output",
                     )
                 result = "".join(text_blocks)
+                phases["phase"] = "complete"
+                phases["response_ms"] = round((time.perf_counter() - started) * 1000)
                 response_chars, outcome = len(result), "done"
                 return result
         except asyncio.CancelledError:
@@ -732,7 +740,9 @@ class GenerationProvider:
                 model_ref=hashlib.sha256(configured_model.encode()).hexdigest()[:12],
                 timeout_seconds=timeout, response_chars=response_chars,
                 duration_ms=round((time.perf_counter() - started) * 1000),
+                **phases,
             )
+            _generation_phases.reset(phase_token)
 
     async def _complete_with_sdk(self, system: str, prompt: str) -> str:
         from claude_agent_sdk import ClaudeAgentOptions, query
@@ -778,6 +788,9 @@ class GenerationProvider:
             include_partial_messages=False,
             **options_kwargs,
         )
+        phases = _generation_phases.get()
+        sdk_started = time.perf_counter()
+        result_at = None
         parts: list[str] = []
         final_text = ""
         completed = False
@@ -788,14 +801,23 @@ class GenerationProvider:
         from contextlib import aclosing
         async with aclosing(query(prompt=prompt, options=options)) as messages:
             async for message in messages:
+                if phases is not None and phases["phase"] == "awaiting_sdk_event":
+                    phases["first_event_ms"] = round((time.perf_counter() - sdk_started) * 1000)
+                    phases["phase"] = "awaiting_sdk_result"
                 if completed:
                     continue
                 if isinstance(message, AssistantMessage):
                     for block in message.content or []:
                         if isinstance(block, TextBlock):
+                            if phases is not None and "first_output_ms" not in phases:
+                                phases["first_output_ms"] = round((time.perf_counter() - sdk_started) * 1000)
                             parts.append(block.text or "")
                 elif isinstance(message, ResultMessage):
                     completed = True
+                    result_at = time.perf_counter()
+                    if phases is not None:
+                        phases["result_ms"] = round((result_at - sdk_started) * 1000)
+                        phases["phase"] = "sdk_cleanup"
                     if message.is_error:
                         retryable, category, status = _classify_sdk_result_error(message)
                         provider, model = self.metadata()
@@ -804,6 +826,9 @@ class GenerationProvider:
                             api_error_status=status, category=category, reason="sdk_result_error")
                     elif isinstance(message.result, str):
                         final_text = message.result
+        if phases is not None and result_at is not None:
+            phases["cleanup_ms"] = round((time.perf_counter() - result_at) * 1000)
+            phases["phase"] = "complete"
         if terminal_error is not None:
             raise terminal_error
         if not completed:
@@ -819,28 +844,34 @@ class GenerationProvider:
         return text
 
     async def complete_json(self, system: str, prompt: str) -> dict:
-        text = (await self.complete(system, prompt)).strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        try:
+        # A syntactically valid array/string is still the wrong schema. Make
+        # one bounded format-repair attempt instead of losing the job at once.
+        instruction = "\nReturn exactly one JSON object. No arrays, quoted JSON, Markdown or prose."
+        for attempt in range(2):
+            text = (await self.complete(system + instruction, prompt)).strip()
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            reason = "invalid_json"
             try:
-                value = json.loads(text)
+                try:
+                    value = json.loads(text)
+                except json.JSONDecodeError:
+                    start, end = text.find("{"), text.rfind("}")
+                    if start < 0 or end <= start:
+                        raise
+                    value = json.loads(text[start:end + 1])
+                if isinstance(value, dict):
+                    return value
+                reason = "non_object_json"
             except json.JSONDecodeError:
-                start, end = text.find("{"), text.rfind("}")
-                if start < 0 or end <= start:
-                    raise
-                value = json.loads(text[start:end + 1])
-        except json.JSONDecodeError as exc:
-            provider, model = self.metadata()
-            raise GenerationError(
-                retryable=False, provider=provider, model=model,
-                category="malformed_response", reason="invalid_json") from exc
-        if not isinstance(value, dict):
-            provider, model = self.metadata()
-            raise GenerationError(
-                retryable=False, provider=provider, model=model,
-                category="malformed_response", reason="non_object_json")
-        return value
+                pass
+            from .observability import perf_event
+            perf_event("memory.generation_format", job_ref=generation_job_ref.get(),
+                       reason=reason, attempt=attempt + 1, retrying=attempt == 0)
+            instruction += "\nThe prior response had the wrong format. Follow the requested object schema strictly."
+        provider, model = self.metadata()
+        raise GenerationError(retryable=False, provider=provider, model=model,
+                              category="malformed_response", reason=reason)
 
     async def probe(self) -> dict:
         value = await self.complete_json(

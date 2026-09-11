@@ -1410,7 +1410,7 @@ def test_prepared_recall_injects_configured_limit_and_reports_actual_count(
     cfg.retrieval.max_context_chars = max_chars
     cfg.retrieval.soft_timeout_ms = 0
     memories = [instance.store.create_memory(
-        "default", "fact", f"Synthetic project {index} uses workspace fixture-{index}.",
+        "default", "fact", f"Synthetic project {index} uses workspace fixture-{index}." + " Long complete fact." * 100,
         authority="confirmed", confidence=1.0,
     ) for index in range(20)]
 
@@ -1433,18 +1433,16 @@ def test_prepared_recall_injects_configured_limit_and_reports_actual_count(
         facts = json.loads(next(line for line in block.splitlines()
                                 if line.startswith('{"facts":')))['facts']
         trace = client.pop_recall_trace(sid)
-        assert len(block) <= max_chars
-        if max_chars == 3000:
-            assert len(facts) == final_limit
-        else:
-            assert 0 < len(facts) < final_limit
+        assert len(facts) == final_limit
+        assert all(len(fact) > 400 for fact in facts)
         assert trace["matched_count"] == final_limit
         assert trace["count"] == len(trace["items"]) == len(facts)
         assert trace["injected"] is True
         rendering = next(fields for event, fields in events if event == "memory.recall_context")
         assert rendering["count"] == len(facts)
         assert rendering["final_limit"] == final_limit
-        assert rendering["context_limited"] is (max_chars == 500)
+        assert rendering["context_limited"] is False
+        assert rendering["max_context_chars"] == 0
         assert "Synthetic project" not in str(events)
         expected_ids = {row["id"] for row in memories if row["content"] in facts}
         assert {row["id"] for row in trace["items"]} == expected_ids

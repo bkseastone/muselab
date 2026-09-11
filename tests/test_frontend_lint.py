@@ -3367,9 +3367,9 @@ def test_history_store_normalizes_canonical_blocks_without_count_eviction():
     assert "sessionKeys.add(storeKey)" in store
     assert "this._messagesById.get(storeKey)" in store
     assert "this._messagesById.set(storeKey, created)" in store
-    assert "Object.assign(existing, m" in store
+    assert "this._sameCanonicalValue(existing[key], value)" in store
     assert "const mountedKey = existing._k || renderKey" in store
-    assert "Object.assign(existing, m, { _k: mountedKey })" in store
+    assert "...m, ...(loadedBody || {}), _k: mountedKey" in store
     assert 'existing.body_state === "loaded"' in store
     assert 'm.body_state === "unloaded"' in store
     assert "this._sessionWindows.set(sid, retained)" in store

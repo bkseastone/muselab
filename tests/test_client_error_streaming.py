@@ -144,3 +144,18 @@ def test_client_error_rejects_unknown_schema_without_logging_payload(
     assert response.status_code == 422
     assert response.json() == {"ok": False, "error": "invalid_payload"}
     assert private not in caplog.text
+
+
+def test_client_error_accepts_only_opaque_fingerprints_and_bounded_frame(client, caplog):
+    from backend import main
+    main._CLIENT_ERR_BUCKETS.clear()
+    payload = {'kind': 'error', 'name': 'TypeError', 'reason_fp': 'a' * 24,
+               'trace_fp': 'private raw stack must never be recorded',
+               'app_line': 120, 'app_column': 4, 'asset_revision': 'abc123def456'}
+    with caplog.at_level(logging.ERROR, logger='muselab.client'):
+        response = client.post('/api/log/client-error', json=payload)
+    assert response.status_code == 200
+    assert '"reason_fp":"' + 'a' * 24 + '"' in caplog.text
+    assert '"app_line":120' in caplog.text
+    assert '"asset_revision":"abc123def456"' in caplog.text
+    assert 'private raw stack' not in caplog.text and '"trace_fp"' not in caplog.text

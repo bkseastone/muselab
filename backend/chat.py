@@ -5,7 +5,6 @@ import base64
 from collections import deque
 from contextlib import contextmanager, suppress
 import hashlib
-import heapq
 import inspect
 import json
 import asyncio
@@ -4327,6 +4326,8 @@ async def _disconnect_background_task_owner(
 
 async def shutdown_runtime() -> None:
     """Boundedly stop every in-process chat task, stream, and SDK client."""
+    from . import chat_search
+    chat_search.shutdown()
     global _queue_runtime_closing
     _queue_runtime_closing = True
 
@@ -5683,105 +5684,42 @@ def _make_snippet(text: str, idx: int, qlen: int, *,
 
 
 @router.get("/search", dependencies=[Depends(require_token)])
-def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200),
-                         limit: int = Query(default=30, ge=1, le=100)) -> dict:
-    """Cross-session full-text search. Scans CLI JSONL files for user /
-    assistant text matching `q` (case-insensitive substring). Returns
-    hits sorted by timestamp desc. Each hit:
-        {sid, name, uuid, role, snippet, ts}
-    Implementation: line-by-line JSON parse of every JSONL under the
-    project's CLI directory. For ~200 sessions of typical size (< 1MB
-    each) this runs in <500ms — switch to SQLite FTS5 if it grows."""
+async def search_sessions_api(request: Request,
+                              q: str = Query(default="", min_length=0, max_length=200),
+                              limit: int = Query(default=30, ge=1, le=100)) -> dict:
+    """Search complete canonical text using a private incremental index."""
+    from . import chat_search
+    from .files import INTERNAL_DIR_NAME
     query = q.strip()
     if not query:
         return {"hits": [], "total": 0}
-    qlower = query.lower()
-    # Walk every registered workspace's CLI project directory across both the
-    # default and vendor-isolated roots.  Include historical child-cwd folders
-    # too (encoded-workspace + "-") just like the cost dashboard does.
-    encoded_roots = tuple(
-        _cli_encode_cwd(str(root)) for root in workspace_registry.paths())
-    proj_dirs: list[Path] = []
-    seen_dirs: set[Path] = set()
-    for projects_root in _cli_project_roots():
-        try:
-            candidates = projects_root.iterdir()
-        except OSError:
-            continue
-        for candidate in candidates:
-            name = candidate.name
-            if not candidate.is_dir() or not any(
-                name == encoded or name.startswith(encoded + "-")
-                for encoded in encoded_roots
-            ):
-                continue
-            if candidate not in seen_dirs:
-                seen_dirs.add(candidate)
-                proj_dirs.append(candidate)
-    if not proj_dirs:
-        return {"hits": [], "total": 0}
 
-    name_map = {s["id"]: s.get("name", "") for s in sess.list_sessions()}
+    def work(cancel, metrics):
+        encoded_roots = tuple(_cli_encode_cwd(str(root)) for root in workspace_registry.paths())
+        paths: set[Path] = set()
+        for projects_root in _cli_project_roots():
+            for candidate in projects_root.iterdir():
+                if cancel.is_set():
+                    raise chat_search.SearchCancelled
+                if any(
+                    candidate.name == encoded or candidate.name.startswith(encoded + "-")
+                    for encoded in encoded_roots
+                ) and candidate.is_dir():
+                    paths.update(candidate.glob("*.jsonl"))
+        names = {row["id"]: row.get("name", "") for row in sess.list_sessions()}
+        metrics["source_files"] = len(paths)
+        index = chat_search.SearchIndex(ROOT / INTERNAL_DIR_NAME / "chat-search-v1.sqlite3")
+        return index.search(sorted(paths), query, limit, names, cancel,
+                            _extract_searchable_text, _strip_cli_slash_wrapper,
+                            _make_snippet, metrics)
 
-    hits: list[dict] = []
-    PER_SESSION_CAP = 5   # avoid one chatty session swamping results
-    # Iterate JSONLs across both roots. A given sid only lives in one root
-    # at a time (vendor vs Claude is mutually exclusive per session), so
-    # PER_SESSION_CAP keyed by stem still applies cleanly.
-    jsonl_paths = [p for d in proj_dirs for p in d.glob("*.jsonl")]
-    for jsonl in jsonl_paths:
-        sid = jsonl.stem
-        session_hits: list[tuple[str, int, dict]] = []
-        try:
-            # utf-8-sig strips a leading BOM so JSONL writers that emit
-            # U+FEFF at the start (some CLI versions did, briefly) don't
-            # poison the "fast reject" qlower-in-line check at the start
-            # of every line — `"﻿{...}".lower()` would mismatch a
-            # qlower hitting the literal first chars.
-            with jsonl.open("r", encoding="utf-8-sig") as f:
-                for ordinal, line in enumerate(f):
-                    # Escaped JSON text must be decoded before matching. A raw
-                    # substring rejection is only sound for unescaped lines.
-                    if "\\" not in line and qlower not in line.lower():
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant"):
-                        continue
-                    msg = entry.get("message") or {}
-                    if not isinstance(msg, dict):
-                        continue
-                    text = _extract_searchable_text(msg.get("content"))
-                    if not text:
-                        continue
-                    # CLI's slash-command wrapper round-trips as user
-                    # text — strip before matching so e.g. searching
-                    # "compact" doesn't surface every /compact invocation.
-                    text = _strip_cli_slash_wrapper(text) or text
-                    pos = text.lower().find(qlower)
-                    if pos < 0:
-                        continue
-                    hit = {
-                        "sid": sid,
-                        "name": name_map.get(sid, ""),
-                        "uuid": entry.get("uuid", ""),
-                        "role": entry.get("type"),
-                        "snippet": _make_snippet(text, pos, len(query)),
-                        "ts": str(entry.get("timestamp") or ""),
-                    }
-                    candidate = (hit["ts"], ordinal, hit)
-                    if len(session_hits) < PER_SESSION_CAP:
-                        heapq.heappush(session_hits, candidate)
-                    else:
-                        heapq.heappushpop(session_hits, candidate)
-            hits.extend(hit for _ts, _ordinal, hit in session_hits)
-        except OSError:
-            continue
-
-    hits.sort(key=lambda h: h["ts"], reverse=True)
-    return {"hits": hits[:limit], "total": len(hits)}
+    try:
+        return await chat_search.run_search(request, work)
+    except chat_search.SearchCancelled:
+        raise HTTPException(499, "Search cancelled") from None
+    except (OSError, sqlite3.Error):
+        # Never present a partially indexed result as a complete search.
+        raise HTTPException(503, "Search temporarily unavailable; retry") from None
 
 
 # CLI wraps slash commands as pseudo-user messages with these tags so it can
@@ -9538,13 +9476,24 @@ def _persist_session_usage_summary(
 
 
 def _load_session_usage_summary(sid: str) -> tuple[dict, str] | None:
-    source = _usage_source_signature(_find_session_jsonl(sid))
+    started = time.perf_counter()
+    path = _find_session_jsonl(sid)
+    discovered = time.perf_counter()
+    source = _usage_source_signature(path)
+    signed = time.perf_counter()
     if source is None:
         return None
     try:
         summary = sess.get_session_usage_summary(sid)
     except Exception:
         return None
+    finally:
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        if duration_ms >= 250:
+            obs.perf_event("chat.usage_read", duration_ms=duration_ms,
+                           discovery_ms=round((discovered - started) * 1000),
+                           signature_ms=round((signed - discovered) * 1000),
+                           summary_ms=round((time.perf_counter() - signed) * 1000))
     if not isinstance(summary, dict):
         return None
     normalized = summary.get("normalized")
@@ -11049,7 +10998,8 @@ async def _native_compact_session_locked(sid: str) -> dict:
     context_limit = _positive_int(
         (_session_usage.get(sid) or {}).get("context_limit"))
     post_compact_usage: dict | None = None
-    tail_path, tail_offset = _compact_tail_cursor(sid)
+    tail_path, tail_offset = await asyncio.to_thread(_compact_tail_cursor, sid)
+    after_total = 0
     tail_outcome: dict[str, bool] = {
         "boundary": False,
         "summary": False,
@@ -11139,6 +11089,19 @@ async def _native_compact_session_locked(sid: str) -> dict:
                   else int(e.info.get("api_error_status") or 500))
         if status < 400 or status > 599:
             status = 500
+        if not _sessions_with_inflight_tasks.get(sid) and not _session_has_live_watcher(sid):
+            # A failed maintenance command must not leave its SDK stream cached
+            # for the next user query. Active background owners retain theirs.
+            await disconnect_client(sid)
+        obs.perf_event(
+            "chat.compact", status="error", error_kind=classified["kind"],
+            source=("verification" if verified_no_shrink else "sdk"),
+            status_code=status,
+            reason_fp=hashlib.sha256(str(e).encode()).hexdigest()[:24],
+            before_count=before_total, after_count=after_total,
+            boundary=bool(tail_outcome.get("boundary")),
+            summary=bool(tail_outcome.get("summary")),
+        )
         obs.diagnostic_line(
             f"[chat] native /compact rejected sid={sid[:8]} "
             f"kind={classified['kind']}\n")

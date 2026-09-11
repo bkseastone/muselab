@@ -369,6 +369,8 @@ class MemoryStore:
         );
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status
           ON memories(owner_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memories_owner_updated
+          ON memories(owner_id, updated_at DESC, id ASC);
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status_id
           ON memories(owner_id, status, id);
         CREATE TABLE IF NOT EXISTS memory_sources (
@@ -832,8 +834,12 @@ class MemoryStore:
             clauses.append("m.kind=?")
             params.append(kind)
         where = " AND ".join(clauses)
+        # Date/relevance ordering does not use recall stats. Joining the whole
+        # registry before LIMIT forced unrelated stats lookups on every page.
         join = (" LEFT JOIN memory_recall_stats s"
-                " ON s.owner_id=m.owner_id AND s.memory_id=m.id")
+                " ON s.owner_id=m.owner_id AND s.memory_id=m.id") if sort in {
+                    "recall_count", "last_recalled_at", "helpful_count", "unhelpful_count"
+                } else ""
         # BM25's lower value is more relevant. "desc" means best first in UI.
         order = ("ASC" if direction == "desc" else "DESC") \
             if query and sort == "relevance" else direction.upper()

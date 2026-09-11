@@ -1569,6 +1569,12 @@ class FileWatchManager:
             "scan_ms": 0,
             "stale_scans": 0,
             "replay_ms": 0,
+            "manager_lock_wait_ms": 0,
+            "store_apply_ms": 0,
+            "store_lock_wait_ms": 0,
+            "transaction_wait_ms": 0,
+            "transaction_apply_ms": 0,
+            "commit_ms": 0,
             "scanned_files": 0,
             "snapshot_files": 0,
             "changes": 0,
@@ -1625,6 +1631,12 @@ class FileWatchManager:
                 scan_ms=metrics["scan_ms"],
                 stale_scans=metrics["stale_scans"],
                 replay_ms=metrics["replay_ms"],
+                manager_lock_wait_ms=metrics["manager_lock_wait_ms"],
+                store_apply_ms=metrics["store_apply_ms"],
+                store_lock_wait_ms=metrics["store_lock_wait_ms"],
+                transaction_wait_ms=metrics["transaction_wait_ms"],
+                transaction_apply_ms=metrics["transaction_apply_ms"],
+                commit_ms=metrics["commit_ms"],
                 scanned_files=metrics["scanned_files"],
                 snapshot_files=metrics["snapshot_files"],
                 changes=metrics["changes"],
@@ -1743,13 +1755,18 @@ class FileWatchManager:
                     ) + elapsed_ms(mutation_lock_started)
                     apply_started = monotonic()
                     try:
-                        # Lifecycle/watch changes own the manager lock; native
-                        # batches own mutation_lock. Hold both through the store's
-                        # atomic cursor/root check and payload construction.
+                        # Only state validation belongs under the global lock.
+                        # Per-workspace mutation_lock still serializes writers;
+                        # deletion sets reconcile_cancel and awaits this task.
+                        manager_wait_started = monotonic()
                         async with self._lock:
-                            if not self._applicability_matches_locked(state, token):
-                                stale_snapshot = True
-                            else:
+                            metrics["manager_lock_wait_ms"] = int(
+                                metrics["manager_lock_wait_ms"]
+                            ) + elapsed_ms(manager_wait_started)
+                            stale_snapshot = not self._applicability_matches_locked(state, token)
+                        if not stale_snapshot:
+                            store_started = monotonic()
+                            try:
                                 result = await asyncio.to_thread(
                                     self.store.apply_reconcile_snapshot,
                                     token.workspace_id,
@@ -1761,6 +1778,19 @@ class FileWatchManager:
                                     primary=state.primary,
                                     cancel_event=state.reconcile_cancel,
                                 )
+                            finally:
+                                for key in ("store_lock_wait_ms", "transaction_wait_ms",
+                                            "transaction_apply_ms", "commit_ms"):
+                                    metrics[key] = int(metrics[key]) + int(scan_report.get(key, 0))
+                                metrics["store_apply_ms"] = int(
+                                    metrics["store_apply_ms"]
+                                ) + elapsed_ms(store_started)
+                            # Watch/lifecycle changes can run while SQLite works.
+                            # Never broadcast a retired generation's payload.
+                            async with self._lock:
+                                stale_snapshot = not self._applicability_matches_locked(state, token)
+                            if state.reconcile_cancel.is_set():
+                                raise WorkspaceScanCancelled("workspace lifecycle changed")
                     finally:
                         metrics["replay_ms"] = int(
                             metrics["replay_ms"]

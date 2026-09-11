@@ -7408,12 +7408,24 @@ def test_fast_completed_queued_turn_reconciles_footer_without_refresh(
     _assert_no_browser_errors(page, errors)
 
 
+@pytest.mark.parametrize("width,height,memory_count", [
+    (1440, 900, 1), (1440, 900, 15), (1024, 768, 15), (390, 844, 15),
+])
 def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
-    page: Page, backend_url, auth_token,
+    page: Page, backend_url, auth_token, tmp_path, width, height, memory_count,
 ):
     """Done completes the live tail while canonical history is still retrying."""
     errors = _capture_browser_errors(page)
-    page.set_viewport_size({"width": 1440, "height": 900})
+    page.set_viewport_size({"width": width, "height": height})
+    detail_requests = []
+
+    def memory_detail(route):
+        detail_requests.append(route.request.url)
+        route.fulfill(json={"sites": []} if route.request.url.endswith("/traceback") else {
+            "kind": "preference", "content": "A deliberately long memory detail " * 36,
+        })
+
+    page.route("**/api/memory/items/**", memory_detail)
     _install_fake_event_source(page)
     sid = "perf-tool-tail-done-metadata"
     assistant_uuid = "tool-tail-assistant-boundary"
@@ -7596,11 +7608,12 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
           total_cost_usd: 0.001,
           model: 'e2e-model',
           memory_recall: {
-            id: 'tool-tail-memory-trace', count: 1,
-            latency_ms: 8, status: 'ok', items: [{
-              id: 'tool-tail-memory-item', kind: 'preference',
+            id: 'tool-tail-memory-trace', count: arg.memoryCount,
+            latency_ms: 8, status: 'ok', items: Array.from({length: arg.memoryCount}, (_, i) => ({
+              id: `tool-tail-memory-item-${i}`, kind: 'preference',
               content: 'A deliberately long memory detail '.repeat(36),
-            }],
+              _traceback: arg.memoryCount === 1 ? [] : null,
+            })),
           },
           session_usage: {
             context_used_pct: 5,
@@ -7614,6 +7627,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
             "assistantUuid": assistant_uuid,
             "completedAtMs": completed_at_ms,
             "durationMs": duration_ms,
+            "memoryCount": memory_count,
         },
     )
 
@@ -7669,7 +7683,7 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     recall_trigger = footer.locator(".memory-recall-trace")
     expect(recall_trigger).to_be_visible()
     expected_recall = _app_eval(
-        page, "return app.lang === 'zh' ? '使用了 1 条记忆' : 'Used 1 memories';"
+        page, "return app.lang === 'zh' ? `使用了 ${arg} 条记忆` : `Used ${arg} memories`;", memory_count
     )
     expect(recall_trigger).to_contain_text(expected_recall)
     expect(
@@ -7679,29 +7693,78 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     recall_trigger.click()
     recall = page.locator(".memory-recall-global")
     expect(recall).to_be_visible()
-    recall_geometry = recall.evaluate(
-        """node => {
-          const rect = node.getBoundingClientRect();
-          return {
-            position: getComputedStyle(node).position,
-            zIndex: Number(getComputedStyle(node).zIndex),
-            insideChatScroller: !!node.closest('.chat-body'),
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.bottom,
-            viewportWidth: window.innerWidth,
-            viewportHeight: window.innerHeight,
-          };
-        }"""
-    )
-    assert recall_geometry["position"] == "fixed"
-    assert recall_geometry["zIndex"] >= 800
-    assert recall_geometry["insideChatScroller"] is False
-    assert recall_geometry["left"] >= 0
-    assert recall_geometry["top"] >= 0
-    assert recall_geometry["right"] <= recall_geometry["viewportWidth"]
-    assert recall_geometry["bottom"] <= recall_geometry["viewportHeight"]
+    page.wait_for_function("""() => document.querySelector('#app')._x_dataStack[0]
+        .memoryRecallPopover.recall.items.every(item => Array.isArray(item._traceback))""")
+
+    def settle_position():
+        # Include detail hydration's nextTick and the queued resize/scroll frame.
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+
+    settle_position()
+    assert len(detail_requests) == (0 if memory_count == 1 else memory_count * 2)
+    page.screenshot(path=str(tmp_path / "memory-recall-popover.png"))
+
+    def assert_anchored():
+        recall_geometry = recall.evaluate(
+            """node => {
+              const rect = node.getBoundingClientRect();
+              const anchor = document.querySelector('.memory-recall-trace[aria-expanded="true"]')
+                .getBoundingClientRect();
+              return {
+                anchorLeft: anchor.left, anchorRight: anchor.right,
+                anchorTop: anchor.top, anchorBottom: anchor.bottom,
+                position: getComputedStyle(node).position,
+                zIndex: Number(getComputedStyle(node).zIndex),
+                insideChatScroller: !!node.closest('.chat-body'),
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+                viewportWidth: window.innerWidth,
+                viewportHeight: window.innerHeight,
+              };
+            }"""
+        )
+        assert recall_geometry["position"] == "fixed"
+        assert recall_geometry["zIndex"] >= 800
+        assert recall_geometry["insideChatScroller"] is False
+        assert recall_geometry["left"] >= 0
+        assert recall_geometry["top"] >= 0
+        assert recall_geometry["right"] <= recall_geometry["viewportWidth"]
+        assert recall_geometry["bottom"] <= recall_geometry["viewportHeight"]
+        assert recall_geometry["left"] <= recall_geometry["anchorLeft"] <= recall_geometry["right"], recall_geometry
+        assert min(abs(recall_geometry["bottom"] - recall_geometry["anchorTop"]),
+                   abs(recall_geometry["top"] - recall_geometry["anchorBottom"])) <= 10, recall_geometry
+        return recall_geometry
+
+    initial_geometry = assert_anchored()
+    # Repeated browser resize notifications may leave the viewport unchanged.
+    page.evaluate("() => window.dispatchEvent(new Event('resize'))")
+    settle_position()
+    repeated_geometry = assert_anchored()
+    assert repeated_geometry["left"] == initial_geometry["left"]
+    assert repeated_geometry["top"] == initial_geometry["top"]
+    if width > 720:
+        page.set_viewport_size({"width": width + 100, "height": height})
+        settle_position()
+        assert_anchored()
+    # Add synthetic space after the completed turn, keeping its button visible
+    # while exercising the real chat scroller and its scroll event handler.
+    before_scroll = assert_anchored()
+    moved = page.locator('.chat-body').evaluate("""el => {
+        const app = document.querySelector('#app')._x_dataStack[0];
+        app._ensureTabState(app.currentId).atBottom = false;
+        const spacer = document.createElement('div');
+        spacer.style.cssText = `height:${window.innerHeight}px;flex-shrink:0`;
+        el.append(spacer);
+        const before = el.scrollTop;
+        el.scrollTop += 48;
+        return el.scrollTop - before;
+    }""")
+    assert moved == 48
+    settle_position()
+    after_scroll = assert_anchored()
+    assert abs(after_scroll["anchorTop"] - (before_scroll["anchorTop"] - moved)) <= 1
     page.keyboard.press("Escape")
     expect(recall).to_be_hidden()
 
@@ -11096,3 +11159,135 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
     assert max(long_tasks or [0]) < 2000, long_tasks
 
     _assert_no_browser_errors(page, errors)
+
+
+def test_unchanged_quiet_history_retains_nested_values_and_repository(
+    page: Page, backend_url, auth_token, tmp_path,
+):
+    import json
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    result = _app_eval(page, r'''
+        const sid = "quiet-incremental-fixture";
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.hydrateSubagents = async () => {};
+        app.hydrateHookTraces = async () => {};
+        app.sessions = [{id: sid, name: "Quiet refresh", message_count: 120}];
+        app.openTabIds = [sid]; app.tabState = {}; app.currentId = sid;
+        const st = app._ensureTabState(sid);
+        st._loaded = true; st.atBottom = true;
+        app._activateTabState(sid);
+        const messages = Array.from({length: 120}, (_, i) => ({
+            role: i % 2 ? "assistant" : "user", uuid: `quiet-row-${i}`,
+            block_id: `quiet-row-${i}:0:${i % 2 ? "assistant" : "user"}`,
+            text: `Complete synthetic message ${i} ` + "body ".repeat(80),
+            model_usage: {fixture: {input: i, output: i + 1}},
+            memoryRecall: {count: 15, status: "ok", items: [{id: `fixture-${i}`}]},
+        }));
+        const originalFetch = window.fetch;
+        window.fetch = async (url, options) => {
+            if (!String(url).includes(`/api/chat/sessions/${sid}?`)) return originalFetch(url, options);
+            return new Response(JSON.stringify({id: sid, name: "Quiet refresh", model: "e2e-model",
+                messages, total: messages.length, message_count: messages.length, offset: 0,
+                pre_total: 0, history_order: "normal", history_generation: "same-generation",
+                completion_state: {stable: true, active: false},
+                permission: "default", updated_at: 1}), {status: 200,
+                headers: {"content-type": "application/json"}});
+        };
+        try {
+            const first = await app.loadSession(sid, {probeActive: false});
+            await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+            const repository = Alpine.raw(st.messages);
+            const nested = st.messages.map(row => Alpine.raw(row.model_usage));
+            const rows = [...document.querySelectorAll(`.msg-pane[data-tid="${sid}"] .msg`)];
+            const durations = [];
+            for (let i = 0; i < 5; i++) {
+                const start = performance.now();
+                await app.loadSession(sid, {quiet: true, followTail: true, probeActive: false});
+                durations.push(performance.now() - start);
+            }
+            return {first, count: st.messages.length, durations,
+                sameRepository: Alpine.raw(st.messages) === repository,
+                sameNested: st.messages.every((row, i) => Alpine.raw(row.model_usage) === nested[i]),
+                rowsRetained: rows.some(row => row.isConnected) && rows.every(row => {
+                    const current = document.querySelector(`.msg-pane[data-tid="${sid}"] .msg[data-message-key="${CSS.escape(row.dataset.messageKey)}"]`);
+                    return !current || current === row;
+                }),
+                finalVisible: document.querySelector(`.msg-pane[data-tid="${sid}"]`)?.innerText
+                    .includes("Complete synthetic message 119")};
+        } finally { window.fetch = originalFetch; }
+    ''')
+    (tmp_path / 'quiet-refresh-metrics.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+    assert result['first'] is True and result['count'] == 120, result
+    assert result['sameRepository'] and result['sameNested'], result
+    assert result['rowsRetained'] and result['finalVisible'], result
+    _assert_no_browser_errors(page, errors)
+
+
+def test_palette_search_cancels_old_work_without_clobbering_new_results(
+    page: Page, backend_url, auth_token,
+):
+    _login(page, backend_url, auth_token)
+    result = _app_eval(page, r'''
+        const originalFetch = window.fetch;
+        const requests = [];
+        window.fetch = (url, options) => {
+            if (!String(url).startsWith("/api/chat/search?")) return originalFetch(url, options);
+            return new Promise((resolve, reject) => requests.push({resolve, reject, signal: options.signal}));
+        };
+        try {
+            app.palette.query = "older";
+            const first = app._fetchPaletteMessages();
+            app.palette.query = "newer";
+            const second = app._fetchPaletteMessages();
+            const aborted = requests[0].signal.aborted;
+            requests[0].reject(new DOMException("cancelled", "AbortError"));
+            await first;
+            const stillLoading = app.palette.messageLoading;
+            requests[1].resolve(new Response(JSON.stringify({hits: [{uuid: "new-result"}]}), {status: 200}));
+            await second;
+            const result = app.palette.messageResults[0]?.uuid;
+            app.palette.query = "close";
+            const third = app._fetchPaletteMessages();
+            app.closePalette();
+            const closedAbort = requests[2].signal.aborted;
+            requests[2].reject(new DOMException("cancelled", "AbortError"));
+            await third;
+            return {aborted, stillLoading, result, closedAbort, loading: app.palette.messageLoading};
+        } finally { window.fetch = originalFetch; }
+    ''')
+    assert result == {'aborted': True, 'stillLoading': True, 'result': 'new-result',
+                      'closedAbort': True, 'loading': False}
+
+
+def test_browser_error_diagnostics_send_fingerprints_without_raw_details(
+    page: Page, backend_url, auth_token,
+):
+    import json
+    _login(page, backend_url, auth_token)
+    records = []
+    def capture(route):
+        records.append(json.loads(route.request.post_data or '{}'))
+        route.fulfill(status=200, json={'ok': True})
+    page.route('**/api/log/client-error', capture)
+    page.evaluate(r'''() => {
+        const error = new TypeError("synthetic-private-error-fixture");
+        error.stack = "TypeError: synthetic-private-error-fixture\n at fixture ("
+            + location.origin + "/static/app.js?v=12345678:42:3)";
+        window.dispatchEvent(new ErrorEvent("error", {
+            error, message: error.message, lineno: 5, colno: 7,
+            filename: location.origin + "/static/vendor/alpine.min.js",
+        }));
+    }''')
+    for _ in range(40):
+        if any(row.get('reason_fp') for row in records):
+            break
+        page.wait_for_timeout(50)
+    diagnostic = next(row for row in records if row.get('reason_fp'))
+    assert len(diagnostic['reason_fp']) == len(diagnostic['trace_fp']) == 24
+    assert diagnostic['app_line'] == 42 and diagnostic['app_column'] == 3
+    assert diagnostic['asset_revision']
+    assert 'synthetic-private-error-fixture' not in json.dumps(records)
+    assert not ({'message', 'stack', 'filename', 'url'} & diagnostic.keys())
