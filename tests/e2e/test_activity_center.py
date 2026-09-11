@@ -2268,7 +2268,7 @@ def test_activity_row_targeted_lookup_opens_mobile_session_and_workspace(
     assert target_history_requests, "target session history was never loaded"
 
 
-def test_real_fork_appears_in_ungrouped_without_a_new_turn(page, backend_url, auth_token):
+def test_real_fork_appears_in_ungrouped_without_a_new_turn(page, backend_url, auth_token, request):
     """Exercise the real SDK fork, API, Activity SSE and persisted snapshot."""
     from claude_agent_sdk._internal.sessions import _sanitize_path
 
@@ -2277,6 +2277,17 @@ def test_real_fork_appears_in_ungrouped_without_a_new_turn(page, backend_url, au
                                  data={"name": "Activity fork fixture"})
     assert response.ok, response.text()
     source = response.json()
+    created = [source["id"]]
+
+    def cleanup():
+        # The backend is shared across the suite. Later browser logins must
+        # not adopt this fixture's real transcript as their starting history.
+        page.goto("about:blank")
+        for sid in reversed(created):
+            deleted = page.request.delete(f"{backend_url}/api/chat/sessions/{sid}", headers=headers)
+            assert deleted.ok, deleted.text()
+
+    request.addfinalizer(cleanup)
     root = Path(source["cwd"])
     # The E2E backend puts SDK transcripts under its own disposable root.
     project = root / "state" / "muselab" / "vendor-cli" / "projects" / _sanitize_path(str(root))
@@ -2319,6 +2330,7 @@ def test_real_fork_appears_in_ungrouped_without_a_new_turn(page, backend_url, au
         }""", {"sid": source["id"], "boundary": assistant_id})
     assert fork_response.value.ok, fork_response.value.text()
     child = fork_response.value.json()
+    created.append(child["id"])
     page.wait_for_function("""sid => document.querySelector('#app')._x_dataStack[0]
         .activity.events.some(row => row.session_id === sid)""", arg=child["id"], timeout=5000)
     page.evaluate("""() => {
