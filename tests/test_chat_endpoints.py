@@ -1769,6 +1769,12 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
     fake = _FakeCompactClient(result, totals=(190_000,))
 
     observed = {}
+    retired = []
+    metrics = []
+    async def disconnect(sid):
+        retired.append(sid)
+    monkeypatch.setattr(chat_mod, "disconnect_client", disconnect)
+    monkeypatch.setattr(chat_mod.obs, "perf_event", lambda event, **fields: metrics.append((event, fields)))
 
     async def fake_get_client(*args, **kwargs):
         observed["permission"] = args[2] if len(args) > 2 else kwargs.get("permission")
@@ -1792,6 +1798,12 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
     assert "context window" in r.json()["detail"]
     assert fake.queries == ["/compact"]
     assert observed["permission"] == "default"
+
+    assert retired == [sid]
+    diagnostic = next(fields for event, fields in metrics if event == "chat.compact")
+    assert diagnostic["status_code"] == 409 and diagnostic["after_count"] == 0
+    assert len(diagnostic["reason_fp"]) == 24
+    assert "Your input exceeds" not in str(metrics)
 
 
 def test_native_compact_rejects_active_turn(chat_mod, client, monkeypatch):

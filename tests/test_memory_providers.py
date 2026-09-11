@@ -758,3 +758,19 @@ def test_qdrant_search_accepts_object_and_legacy_list_results(monkeypatch, wrapp
     result = _run(store.search([1., 0.], owner_id="default", limit=1))
     assert result[0]["id"] == "memory"
     assert result[0]["score"] == .9
+
+
+def test_generation_repairs_non_object_once_and_preserves_schema(monkeypatch):
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+    provider = GenerationProvider(MemoryConfig())
+    calls = []
+    async def complete(system, prompt):
+        calls.append((system, prompt))
+        return '[]' if len(calls) == 1 else '{"memories":[{"content":"complete synthetic fact"}]}'
+    monkeypatch.setattr(provider, 'complete', complete)
+    assert _run(provider.complete_json('Object schema', 'synthetic input')) == {
+        'memories': [{'content': 'complete synthetic fact'}]}
+    assert len(calls) == 2
+    assert calls[0][1] == calls[1][1]
+    assert 'wrong format' in calls[1][0]

@@ -1384,6 +1384,16 @@ def _safe_client_error_record(payload: object) -> dict[str, object] | None:
         record["reason_fp"] = reason_fp
     if trace_fp:
         record["trace_fp"] = trace_fp
+    for field in ("reason_fp", "trace_fp"):
+        value = payload.get(field)
+        if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{24}", value):
+            record[field] = value
+    for field in ("app_line", "app_column"):
+        if field in payload:
+            record[field] = _client_error_int(payload[field])
+    revision = payload.get("asset_revision")
+    if isinstance(revision, str) and re.fullmatch(r"[a-f0-9]{8,64}", revision):
+        record["asset_revision"] = revision
     last_fetch = payload.get("lastFetch")
     if isinstance(last_fetch, dict):
         method = str(last_fetch.get("method") or "").upper()

@@ -49,7 +49,8 @@ class RetrievalConfig(BaseModel):
     dense_candidates: int = Field(default=20, ge=1, le=100)
     lexical_candidates: int = Field(default=20, ge=1, le=100)
     final_limit: int = Field(default=6, ge=1, le=20)
-    max_context_chars: int = Field(default=3000, ge=500, le=12000)
+    # Legacy field accepted for saved configurations; recall no longer truncates.
+    max_context_chars: int = Field(default=0, ge=0, le=12000)
     # One end-to-end recall budget. Zero waits for every enabled stage without
     # a timer; preserve the existing key so saved configurations keep working.
     soft_timeout_ms: int = Field(default=0, ge=0)

@@ -724,6 +724,10 @@ class MemoryEngine:
                 min(300.0, 2 ** attempts)
                 if error and retryable and attempts < 3 else None
             )
+            if retry_seconds is not None and failure and failure.get("reason") == "timeout":
+                # Starting another expensive CLI immediately after a timeout
+                # amplifies load on the same unavailable provider.
+                retry_seconds = min(300.0, 30.0 * (2 ** max(0, attempts - 1)))
             outcome = "retry" if retry_seconds is not None else "failed" if error else "done"
             if failure:
                 log.warning(

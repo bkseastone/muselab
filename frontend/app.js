@@ -58,7 +58,7 @@
     return record;
   }
 
-  function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
+  async function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
     targetRing.push(rec);
     if (targetRing.length > RING_MAX) targetRing.shift();
     try { console[consoleMethod](label, rec); } catch (_) { /* noop */ }
@@ -72,6 +72,23 @@
       // reverse proxies may retain request bodies before MuseLab sees them.
       const wireRecord = _clientErrorWireRecord(rec);
       if (!wireRecord) return;
+      if (window.crypto?.subtle) {
+        for (const [field, value] of [["reason_fp", rec.message], ["trace_fp", rec.stack]]) {
+          if (!value) continue;
+          const bytes = new TextEncoder().encode(String(value).slice(0, 4096));
+          const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+          wireRecord[field] = Array.from(new Uint8Array(digest), byte =>
+            byte.toString(16).padStart(2, "0")).join("").slice(0, 24);
+        }
+      }
+      const appFrame = String(rec.stack || "").match(/(?:\/|^)app\.js(?:\?[^\s:)]*)?:(\d+):(\d+)/);
+      if (appFrame) {
+        wireRecord.app_line = Number(appFrame[1]);
+        wireRecord.app_column = Number(appFrame[2]);
+      }
+      const script = document.querySelector('script[src*="/app.js"]');
+      const revision = script ? new URL(script.src, location.href).searchParams.get("v") : "";
+      if (/^[a-f0-9]{8,64}$/.test(revision || "")) wireRecord.asset_revision = revision;
       const body = JSON.stringify(wireRecord);
       const ok = navigator.sendBeacon &&
                  navigator.sendBeacon("/api/log/client-error",
@@ -1321,7 +1338,7 @@ function portal() {
           rerank: { enabled: false, base_url: "", api_key: "",
             model: "", timeout_seconds: 3 },
           retrieval: { dense_candidates: 20, lexical_candidates: 20,
-            final_limit: 6, max_context_chars: 3000, soft_timeout_ms: 0 },
+            final_limit: 6, max_context_chars: 0, soft_timeout_ms: 0 },
           consolidation: { episode_turns: 6, episode_idle_minutes: 30,
             dreamer_enabled: true, verifier_enabled: true,
             skill_learning_enabled: true, min_reflection_episodes: 2,
@@ -18952,8 +18969,12 @@ function portal() {
         const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
         st.messageRange.visibleStart = quiet ? quietStart : startIdx;
         st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
-        st.messages = all;
-        _paneMessageIndexCache.delete(st);
+        const sameRepository = st.messages.length === all.length
+          && st.messages.every((message, index) => message === all[index]);
+        if (!sameRepository) {
+          st.messages = all;
+          _paneMessageIndexCache.delete(st);
+        }
         Object.assign(st.messageRange, {
           visibleStart: quiet ? quietStart : startIdx,
           visibleEnd: quiet ? quietEnd : startIdx,
@@ -19578,8 +19599,10 @@ function portal() {
         // later canonical refresh; replacing it with renderKey here remounts
         // the bubble on the second poll even though object identity survived.
         const mountedKey = existing._k || renderKey;
-        Object.assign(existing, m, { _k: mountedKey });
-        if (loadedBody) Object.assign(existing, loadedBody);
+        const fields = { ...m, ...(loadedBody || {}), _k: mountedKey };
+        for (const [key, value] of Object.entries(fields)) {
+          if (!this._sameCanonicalValue(existing[key], value)) existing[key] = value;
+        }
         if (staleAssistantPresentation) {
           this._invalidateAssistantPresentation(existing, nextText, sid);
         }
@@ -19657,6 +19680,17 @@ function portal() {
       push("summary", m.summary);
       return out;
     },
+    _sameCanonicalValue(left, right) {
+      const raw = value => window.Alpine?.raw ? window.Alpine.raw(value) : value;
+      left = raw(left); right = raw(right);
+      if (left === right) return true;
+      if (!left || !right || typeof left !== "object" || typeof right !== "object"
+          || Array.isArray(left) !== Array.isArray(right)) return false;
+      const keys = Object.keys(left);
+      return keys.length === Object.keys(right).length
+        && keys.every(key => Object.prototype.hasOwnProperty.call(right, key)
+          && this._sameCanonicalValue(left[key], right[key]));
+    },
     _preserveCanonicalMessageIdentity(st, incoming, completedBoundary = null) {
       const existing = st.messages;
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
@@ -19725,7 +19759,9 @@ function portal() {
         } : null;
         const canonicalFields = { ...canonical };
         delete canonicalFields._k;
-        Object.assign(matched, canonicalFields);
+        for (const [key, value] of Object.entries(canonicalFields)) {
+          if (!this._sameCanonicalValue(matched[key], value)) matched[key] = value;
+        }
         if (liveFields) {
           if (liveFields.ts) matched.ts = liveFields.ts;
           if (liveFields.elapsed) matched.elapsed = liveFields.elapsed;
@@ -20652,8 +20688,9 @@ function portal() {
       // the initial geometry appeared to fit.
       popover.style.width = `${Math.round(width)}px`;
       popover.style.maxHeight = `${Math.round(maxHeight)}px`;
-      popover.style.left = `${pad}px`;
-      popover.style.top = `${pad}px`;
+      // Preserve the anchored coordinates while measuring. If positioning
+      // yields the same reactive style string, Alpine will not reapply it to
+      // undo temporary top/left writes (for example after details hydrate).
       const measuredHeight = Math.min(
         maxHeight,
         Math.max(1, popover.getBoundingClientRect().height || popover.scrollHeight),
@@ -36114,6 +36151,7 @@ function portal() {
 
     // ===== command palette =====
     openPalette() {
+      this._cancelPaletteMessageSearch();
       this.palette.query = "";
       this.palette.activeIndex = 0;
       this.palette.fileResults = [];
@@ -36126,33 +36164,44 @@ function portal() {
         if (el) el.focus();
       });
     },
-    closePalette() { this.palette.show = false; },
-    // Cross-session full-text message search. Mirrors _fetchPaletteFiles
-    // shape — debounced from palette input, race-safe via query echo
-    // check. Server caps at 30 hits.
+    _cancelPaletteMessageSearch() {
+      if (this._paletteMessageAbort) this._paletteMessageAbort.abort();
+      this._paletteMessageAbort = null;
+      this.palette.messageLoading = false;
+    },
+    closePalette() {
+      this._cancelPaletteMessageSearch();
+      this.palette.show = false;
+    },
     async _fetchPaletteMessages() {
       const q = this.palette.query.trim();
-      if (q.length < 2) {
-        this.palette.messageResults = [];
-        this.palette.messageQuery = "";
-        return;
-      }
-      if (q === this.palette.messageQuery) return;
-      this.palette.messageQuery = q;
+      if (q === this.palette.messageQuery && q.length >= 2) return;
+      this._cancelPaletteMessageSearch();
+      this.palette.messageQuery = q.length >= 2 ? q : "";
+      this.palette.messageResults = [];
+      if (q.length < 2) return;
+      const controller = new AbortController();
+      this._paletteMessageAbort = controller;
       this.palette.messageLoading = true;
+      const owns = () => this._paletteMessageAbort === controller
+        && this.palette.query.trim() === q;
       try {
         const r = await fetch(
           "/api/chat/search?q=" + encodeURIComponent(q) + "&limit=20",
-          { headers: this.hdr() });
-        if (!r.ok) { this.palette.messageResults = []; return; }
+          { headers: this.hdr(), signal: controller.signal });
+        if (!r.ok) throw new Error("Search unavailable");
         const data = await r.json();
-        if (this.palette.query.trim() === q) {
-          this.palette.messageResults = data.hits || [];
+        if (owns()) this.palette.messageResults = data.hits || [];
+      } catch (error) {
+        if (owns()) {
+          this.palette.messageResults = [];
+          this.palette.messageQuery = ""; // allow retry after a transient failure
         }
-      } catch {
-        this.palette.messageResults = [];
       } finally {
-        this.palette.messageLoading = false;
+        if (this._paletteMessageAbort === controller) {
+          this._paletteMessageAbort = null;
+          this.palette.messageLoading = false;
+        }
       }
     },
     // Jump to a session and scroll to a specific message uuid. Used by

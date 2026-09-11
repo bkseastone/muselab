@@ -3077,7 +3077,8 @@ def test_reconcile_budget_reports_partial_without_inventing_deletes(
         report=report,
     )
 
-    assert report == {
+    assert {key: report[key] for key in ("partial", "partial_reason", "scanned_files",
+                                       "snapshot_files", "resumed", "scan_ms")} == {
         "partial": True,
         "partial_reason": "file_limit",
         "scanned_files": 1,
@@ -3437,3 +3438,47 @@ async def test_continuous_watcher_mutations_back_off_instead_of_rescanning_forev
         assert state.reconcile_failures == 1
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_slow_reconcile_does_not_hold_global_query_lock(app_module, temp_root, monkeypatch):
+    from backend import file_events
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+    store = WorkspaceStore(temp_root)
+    entry = registry.entry_for(temp_root)
+    store.reconcile(entry.id, temp_root, entry.name)
+    manager = file_events.FileWatchManager(store)
+    state = await manager.ensure_workspace(temp_root)
+    entered, release = threading.Event(), threading.Event()
+    original = store.apply_reconcile_snapshot
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+    async def scan(_state):
+        return [], {}
+    monkeypatch.setattr(store, 'apply_reconcile_snapshot', blocked)
+    monkeypatch.setattr(manager, '_scan_workspace', scan)
+    task = asyncio.create_task(manager._reconcile_and_broadcast(state))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        # The prior code waited on the manager lock until the writer finished.
+        assert await asyncio.wait_for(manager.ensure_workspace(temp_root), .3) is state
+        payload = await asyncio.wait_for(manager.delta(temp_root, 0), .3)
+        assert 'cursor' in payload
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await manager.shutdown()
+
+
+def test_workspace_connection_context_closes_handle(app_module, temp_root):
+    import sqlite3
+    from backend.workspace_store import WorkspaceStore
+    store = WorkspaceStore(temp_root)
+    store.initialize()
+    with store._connect() as connection:
+        assert connection.execute('SELECT 1').fetchone()[0] == 1
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        connection.execute('SELECT 1')

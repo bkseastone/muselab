@@ -129,3 +129,128 @@ def test_search_decodes_json_escapes(client, auth, _staged_jsonls, text, query):
     response = client.get('/api/chat/search', params={'q': query}, headers=auth)
     assert response.status_code == 200
     assert [hit['uuid'] for hit in response.json()['hits']] == ['escaped-match']
+
+
+def test_incremental_search_append_rewrite_delete_and_warm_reads(tmp_path):
+    import threading
+    from backend.chat_search import SearchIndex
+    from backend.chat import _extract_searchable_text, _strip_cli_slash_wrapper, _make_snippet
+
+    path = tmp_path / 'canonical.jsonl'
+    index = SearchIndex(tmp_path / 'private' / 'search.sqlite3')
+
+    def entry(text, uid):
+        return {'type': 'assistant', 'uuid': uid, 'message': {'content': text},
+                'timestamp': '2026-09-11T00:00:00Z'}
+
+    def search(query, paths=None):
+        metrics = dict(read_bytes=0, parsed_lines=0, updated_files=0)
+        result = index.search([path] if paths is None else paths, query, 20, {},
+                              threading.Event(), _extract_searchable_text,
+                              _strip_cli_slash_wrapper, _make_snippet, metrics)
+        return [hit['uuid'] for hit in result['hits']], metrics
+
+    _write_jsonl(path, [entry('完整搜索 first body', 'first')])
+    assert search('完整搜索')[0] == ['first']
+    assert search('first')[1]['read_bytes'] == 0
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(entry('完整搜索 appended', 'second')) + '\n')
+    hits, metrics = search('完整搜索')
+    assert set(hits) == {'first', 'second'}
+    assert metrics['parsed_lines'] == 1
+    _write_jsonl(path, [entry('replacement different content', 'replaced')])
+    assert search('完整搜索')[0] == []
+    assert search('replacement')[0] == ['replaced']
+    path.unlink()
+    assert search('replacement', [])[0] == []
+
+
+@pytest.mark.parametrize('query', ['测', '测试', '测试搜索', '"quoted"', 'line\nbreak', 'CAFÉ', '%_'])
+def test_index_preserves_exact_substring_semantics(tmp_path, query):
+    import threading
+    from backend.chat_search import SearchIndex
+    from backend.chat import _extract_searchable_text, _strip_cli_slash_wrapper, _make_snippet
+    path = tmp_path / 'source.jsonl'
+    _write_jsonl(path, [{'type': 'user', 'uuid': 'hit', 'message': {'content':
+                         '测试搜索 "quoted" line\nbreak café %_'}}])
+    result = SearchIndex(tmp_path / 'private' / 'search.sqlite3').search(
+        [path], query, 20, {}, threading.Event(), _extract_searchable_text,
+        _strip_cli_slash_wrapper, _make_snippet,
+        dict(read_bytes=0, parsed_lines=0, updated_files=0))
+    assert [row['uuid'] for row in result['hits']] == ['hit']
+
+
+def test_index_partial_tail_and_cancelled_write_are_recoverable(tmp_path):
+    import threading
+    from backend.chat_search import SearchIndex, SearchCancelled
+    from backend.chat import _extract_searchable_text, _strip_cli_slash_wrapper, _make_snippet
+    path = tmp_path / 'source.jsonl'
+    value = json.dumps({'type': 'user', 'uuid': 'full', 'message': {'content': 'tail probe'}})
+    path.write_text(value[:30], encoding='utf-8')
+    index = SearchIndex(tmp_path / 'private' / 'search.sqlite3')
+    cancel = threading.Event()
+    def search(extract=_extract_searchable_text):
+        return index.search([path], 'probe', 20, {}, cancel, extract,
+                            _strip_cli_slash_wrapper, _make_snippet,
+                            dict(read_bytes=0, parsed_lines=0, updated_files=0))
+    assert not search()['hits']
+    path.write_text(value, encoding='utf-8')  # valid final line without newline
+    def cancelled_extract(content):
+        cancel.set()
+        return _extract_searchable_text(content)
+    with pytest.raises((SearchCancelled, __import__('sqlite3').OperationalError)):
+        search(cancelled_extract)
+    cancel.clear()
+    assert search()['hits'][0]['uuid'] == 'full'
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write('\n' + value.replace('full', 'next') + '\n')
+    assert {row['uuid'] for row in search()['hits']} == {'full', 'next'}
+
+
+@pytest.mark.asyncio
+async def test_disconnected_search_stops_worker_and_releases_next_query():
+    import asyncio
+    import threading
+    from backend import chat_search
+    entered, stopped = threading.Event(), threading.Event()
+    class Request:
+        async def is_disconnected(self):
+            return entered.is_set()
+    def slow(cancel, metrics):
+        entered.set()
+        try:
+            assert cancel.wait(2)
+            raise chat_search.SearchCancelled
+        finally:
+            stopped.set()
+    try:
+        with pytest.raises(chat_search.SearchCancelled):
+            await chat_search.run_search(Request(), slow)
+        assert await asyncio.to_thread(stopped.wait, 1)
+        result = await chat_search.run_search(Request(), lambda cancel, metrics: {'hits': []})
+        assert result == {'hits': []}
+    finally:
+        chat_search.shutdown()
+
+
+def test_search_remains_complete_without_optional_trigram(tmp_path, monkeypatch):
+    import sqlite3
+    import threading
+    from backend import chat_search
+    from backend.chat import _extract_searchable_text, _strip_cli_slash_wrapper, _make_snippet
+    connect = sqlite3.connect
+    class NoTrigram(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith('CREATE VIRTUAL TABLE'):
+                raise sqlite3.OperationalError('no such tokenizer: trigram')
+            return super().execute(sql, *args, **kwargs)
+    monkeypatch.setattr(chat_search.sqlite3, 'connect',
+                        lambda *args, **kwargs: connect(*args, factory=NoTrigram, **kwargs))
+    path = tmp_path / 'source.jsonl'
+    _write_jsonl(path, [{'type': 'user', 'uuid': 'complete', 'message': {'content': '中文完整搜索'}}])
+    metrics = dict(read_bytes=0, parsed_lines=0, updated_files=0)
+    result = chat_search.SearchIndex(tmp_path / 'private' / 'search.sqlite3').search(
+        [path], '完整搜索', 10, {}, threading.Event(), _extract_searchable_text,
+        _strip_cli_slash_wrapper, _make_snippet, metrics)
+    assert [row['uuid'] for row in result['hits']] == ['complete']
+    assert metrics['fts'] is False

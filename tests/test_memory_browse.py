@@ -57,3 +57,28 @@ def test_api_sort_validation_and_total(client, auth):
     assert data["total"] == 3
     assert data["has_more"] is True
     assert client.get("/api/memory/items?sort=unknown", headers=auth).status_code == 422
+
+
+def test_default_browse_uses_ordered_index_before_loading_large_bodies(registry, monkeypatch):
+    from contextlib import contextmanager
+    import uuid
+    with registry._connect() as connection:
+        connection.execute('BEGIN')
+        connection.executemany('''INSERT INTO memories
+            (id, owner_id, kind, content, created_at, updated_at)
+            VALUES (?, 'fixture', 'fact', ?, ?, ?)''',
+            [(uuid.uuid4().hex, 'complete synthetic body ' * 100, i, i) for i in range(2000)])
+    original = registry._connect
+    plans = []
+    @contextmanager
+    def observed():
+        with original() as connection:
+            def trace(sql):
+                if sql.startswith('SELECT m.*'):
+                    plans.extend(str(row[3]) for row in connection.execute('EXPLAIN QUERY PLAN ' + sql))
+            connection.set_trace_callback(trace)
+            yield connection
+    monkeypatch.setattr(registry, '_connect', observed)
+    rows, total = registry.browse_memories('fixture', limit=5)
+    assert total == 2000 and [row['updated_at'] for row in rows] == [1999, 1998, 1997, 1996, 1995]
+    assert plans and not any('TEMP B-TREE' in plan for plan in plans)
