@@ -449,6 +449,12 @@ async def _lifespan(app: FastAPI):
         _asyncio.to_thread(_activity.initialize_runtime_state),
         _asyncio.to_thread(_todos.initialize_runtime_state),
     )
+    repaired_fork_activity = await _asyncio.to_thread(
+        _activity.reconcile_fork_sessions)
+    if repaired_fork_activity:
+        sys.stderr.write(
+            f"[muselab] restored {repaired_fork_activity} fork activity row(s) on startup\n")
+        sys.stderr.flush()
     # Older releases allowed a successor CLI's synthetic ``stopped`` record to
     # overwrite the predecessor's real terminal state. Repair each runtime
     # chain from its oldest owner before applying restart recovery, so a true

@@ -58,12 +58,17 @@ def backend_url(tmp_path_factory):
             encoding="utf-8",
         )
 
+    # Real fork tests write SDK transcripts. Keep vendor storage and legacy
+    # migration sources inside this fixture, away from developer state.
+    (root / "tmp").mkdir()
     port = _free_port()
     env = {
         **os.environ,
         "MUSELAB_TOKEN": TEST_TOKEN,
         "MUSELAB_ROOT": str(root),
         "MUSELAB_SESSIONS_DIR": str(root / "sessions"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "TMPDIR": str(root / "tmp"),
         "MUSELAB_PORT": str(port),
         "MUSELAB_ENV_PATH": str(root / "e2e.env"),
         "MUSELAB_MODEL": "deepseek-v4-pro",

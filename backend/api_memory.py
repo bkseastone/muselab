@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import require_token
+from .observability import to_thread_io
 from .memory_config import (
     MemoryConfig,
     load_config,
@@ -110,15 +111,21 @@ def get_config() -> dict:
 
 @router.put("/config")
 async def put_config(config: dict, probe: bool = Query(default=True)) -> dict:
-    current = load_config(fresh=True)
+    current = await to_thread_io("memory.config_read", "", load_config, fresh=True)
     merged = _resolve_config_input(config, current)
-    if merged.enabled and probe:
+    retrieval_only = (
+        current.model_dump(exclude={"retrieval"})
+        == merged.model_dump(exclude={"retrieval"}))
+    if merged.enabled and probe and not retrieval_only:
         try:
             await engine.probe(merged)
         except Exception as exc:
             raise HTTPException(400, _failure_detail(exc)) from None
-    save_config(merged)
-    await engine.reconfigure()
+    await to_thread_io("memory.config_write", "", save_config, merged, owned=True)
+    # Recall reads these settings for each request. Changing its limit/budget
+    # does not invalidate provider connections or the current background job.
+    if not retrieval_only:
+        await engine.reconfigure()
     return {"config": public_config(merged), "status": await engine.status()}
 
 

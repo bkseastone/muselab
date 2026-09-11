@@ -1452,7 +1452,7 @@ class MemoryEngine:
                     lambda store: store.recent_evidence(
                         cfg.owner_id, session_id, role="user", limit=2), deadline=deadline))
                 result = await self._recall_candidates(
-                    cfg, query, recent, deadline, stages, stage)
+                    cfg, query, recent, deadline, stages, stage, recall_id)
                 return result
         except asyncio.CancelledError:
             cancelled = True
@@ -1482,7 +1482,7 @@ class MemoryEngine:
                        duration_ms=round(latency, 1), count=len(result),
                        status=status, timeout_ms=timeout_ms, **fields)
 
-    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage):
+    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage, recall_id):
         prior = [str(item.get("content", ""))[:1000] for item in recent
                  if item.get("content")]
         # Bound what goes to the embedder. Local CPU BGE-M3 latency scales
@@ -1493,11 +1493,29 @@ class MemoryEngine:
         # lives there; earlier turns only disambiguate it.
         retrieval_query = "\n".join([*prior, query])[-_RECALL_QUERY_CHARS:]
 
+        async def dependency(name, operation):
+            started = time.perf_counter()
+            status = "ok"
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                status = ("timeout" if deadline is not None
+                          and time.perf_counter() >= deadline else "cancelled")
+                raise
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                perf_event("memory.recall_dependency", recall_id=recall_id,
+                           dependency=name, status=status,
+                           duration_ms=round((time.perf_counter() - started) * 1000, 1))
+
         async def dense() -> list[dict]:
-            vector = (await EmbeddingProvider(cfg.embedding).embed([retrieval_query]))[0]
-            return await vector_store(cfg.vector).search(
-                vector, owner_id=cfg.owner_id,
-                limit=cfg.retrieval.dense_candidates)
+            vectors = await dependency("embedding", lambda: EmbeddingProvider(
+                cfg.embedding).embed([retrieval_query]))
+            return await dependency("vector", lambda: vector_store(cfg.vector).search(
+                vectors[0], owner_id=cfg.owner_id,
+                limit=cfg.retrieval.dense_candidates))
 
         async def lexical() -> list[dict]:
             return await self._recall_store_call(lambda store: store.lexical_search(

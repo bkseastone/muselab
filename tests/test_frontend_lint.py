@@ -1922,7 +1922,11 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     custom_sort = app.index("const aManual = Number.isFinite")
     assert "if (aManual !== bManual) return aManual ? 1 : -1" in app[custom_sort:]
     assert "Number(a.group_order) - Number(b.group_order)" in app[custom_sort:]
-    assert 'groupKey === "custom:__ungrouped__"' in app[custom_sort:]
+    # The built-in inbox must apply time ordering before saved manual positions.
+    ungrouped_sort = app.index('groupKey === "custom:__ungrouped__"')
+    assert ungrouped_sort < custom_sort
+    assert "return this.activityEventTimestamp(b) - this.activityEventTimestamp(a)" in (
+        app[ungrouped_sort:custom_sort])
     assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
     assert '"/api/activity/events-ticket"' in app
     assert "new EventSource(" in app

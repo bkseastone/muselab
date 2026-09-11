@@ -301,3 +301,102 @@ def test_recall_timeout_roundtrips_and_negative_is_rejected(client, auth, timeou
     assert client.get("/api/memory/config", headers=auth).json()["retrieval"]["soft_timeout_ms"] == timeout_ms
     config["retrieval"]["soft_timeout_ms"] = -1
     assert client.put("/api/memory/config?probe=false", headers=auth, json=config).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_slow_config_save_keeps_other_requests_and_cached_reads_responsive(app_module, monkeypatch):
+    import asyncio
+    import threading
+    import time
+    import httpx
+    from backend import api_memory, memory_config
+    from tests.conftest import TEST_TOKEN
+
+    current = memory_config.MemoryConfig()
+    memory_config.save_config(current)
+    real_fsync = memory_config.os.fsync
+    real_save = api_memory.save_config
+    saving = threading.local()
+    writing = threading.Event()
+    release = threading.Event()
+
+    def slow_fsync(fd):
+        if getattr(saving, "active", False):
+            writing.set()
+            release.wait(0.6)
+        real_fsync(fd)
+
+    def save(config):
+        saving.active = True
+        try:
+            return real_save(config)
+        finally:
+            saving.active = False
+
+    async def status():
+        return {"enabled": False}
+
+    async def reconfigure():
+        pass
+
+    monkeypatch.setattr(memory_config.os, "fsync", slow_fsync)
+    monkeypatch.setattr(api_memory, "save_config", save)
+    monkeypatch.setattr(api_memory.engine, "status", status)
+    monkeypatch.setattr(api_memory.engine, "reconfigure", reconfigure)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_module.app),
+                                base_url="http://fixture") as client:
+        assert (await client.get("/api/meta", headers={"X-Auth-Token": TEST_TOKEN})).status_code == 200
+        started = time.perf_counter()
+        task = asyncio.create_task(client.put("/api/memory/config?probe=false",
+            headers={"X-Auth-Token": TEST_TOKEN}, json=current.model_dump()))
+        try:
+            for _ in range(100):
+                if writing.is_set():
+                    break
+                await asyncio.sleep(.005)
+            assert writing.is_set()
+            # This cache lookup is used by active chat/memory code on the loop.
+            assert memory_config.load_config().mode == "off"
+            response = await client.get("/api/meta", headers={"X-Auth-Token": TEST_TOKEN})
+            assert response.status_code == 200
+            assert time.perf_counter() - started < .3
+            assert not task.done()
+        finally:
+            release.set()
+            response = await task
+        assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_retrieval_settings_save_does_not_probe_or_restart_running_worker(app_module, monkeypatch):
+    from backend import api_memory, memory_config
+
+    cfg = memory_config.MemoryConfig.model_validate({
+        "mode": "active", "generation_model": "fixture:model",
+        "embedding": {"base_url": "http://fixture", "model": "fixture"},
+        "vector": {"url": "http://fixture"},
+    })
+    memory_config.save_config(cfg)
+    calls = []
+
+    async def probe(*args):
+        calls.append("probe")
+
+    async def reconfigure():
+        calls.append("restart")
+
+    async def status():
+        return {"enabled": True}
+
+    monkeypatch.setattr(api_memory.engine, "probe", probe)
+    monkeypatch.setattr(api_memory.engine, "reconfigure", reconfigure)
+    monkeypatch.setattr(api_memory.engine, "status", status)
+    changed = cfg.model_copy(deep=True)
+    changed.retrieval.final_limit = 15
+    changed.retrieval.soft_timeout_ms = 0
+    result = await api_memory.put_config(changed.model_dump(), probe=True)
+    assert result["config"]["retrieval"]["final_limit"] == 15
+    assert calls == []
+    changed.embedding.model = "new-embedding-model"
+    await api_memory.put_config(changed.model_dump(), probe=True)
+    assert calls == ["probe", "restart"]

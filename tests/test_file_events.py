@@ -3396,3 +3396,44 @@ async def test_scan_exchange_deadline_releases_shared_worker(app_module, temp_ro
         guard.cancel()
         manager._scan_cancel.set()
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_continuous_watcher_mutations_back_off_instead_of_rescanning_forever(
+    app_module, temp_root, monkeypatch,
+):
+    import backend.file_events as module
+
+    class Store:
+        def current_cursor(self, workspace_id):
+            return 0
+
+        def apply_reconcile_snapshot(self, *args, **kwargs):
+            raise AssertionError("invalidated snapshot must not replace the index")
+
+        def close(self):
+            pass
+
+    manager = module.FileWatchManager(Store())
+    state = module._WatchState(root=temp_root, workspace_id="busy-fixture", initialized=True)
+    scans = 0
+
+    async def scan(current):
+        nonlocal scans
+        scans += 1
+        current.native_mutation_revision += 1
+        current.scan_progress["fixture"] = "must be discarded"
+        if scans > 3:
+            pytest.fail("reconcile kept scanning despite continuous invalidation")
+        return [], {}
+
+    monkeypatch.setattr(manager, "_scan_workspace", scan)
+    try:
+        with pytest.raises(module.WorkspaceScanIncomplete):
+            await manager._reconcile_and_broadcast(state)
+        assert scans == 3
+        assert not state.scan_progress
+        assert state.initialized and state.reconcile_retry_at > module.monotonic()
+        assert state.reconcile_failures == 1
+    finally:
+        await manager.shutdown()

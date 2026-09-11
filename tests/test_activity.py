@@ -9,6 +9,8 @@ from backend.activity import ActivityService
 
 
 def _service(tmp_path, monkeypatch):
+    # app_module reloads backend packages; use the matching module generation.
+    from backend.activity import ActivityService
     service = ActivityService(tmp_path)
     workspace = str(tmp_path / "ws")
     monkeypatch.setattr(
@@ -612,7 +614,9 @@ def test_ordinary_fork_inherits_group_without_stealing_source_lineage(
 
     inherited = service.inherit_session("source", "child")
 
-    assert inherited["item"] is None
+    assert inherited["item"]["session_id"] == "child"
+    assert inherited["item"]["turn_count"] == 0
+    assert inherited["item"]["read"] is True
     assert inherited["group_id"] == group["id"]
     assert next(row for row in service.list() if row["session_id"] == "source")
     child = service.start("child", summary="new branch")
@@ -1191,3 +1195,96 @@ def test_activity_group_endpoints_manage_and_assign_custom_groups(
     )
     assert deleted.status_code == 200
     assert "group_id" not in service.list()[0]
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+def test_fork_gets_independent_read_row_before_first_turn(tmp_path, monkeypatch, hidden):
+    service = _service(tmp_path, monkeypatch)
+    source = service.start("source", summary="source turn", owner_id="source-owner")
+    service.set_pin(source["id"], True)
+    before = next(row for row in service.list() if row["session_id"] == "source")
+    revision = service.revision
+
+    result = service.inherit_session("source", "child", activity_hidden=hidden)
+    assert service.revision == revision  # No SSE before the child is public.
+    assert next(row for row in service.list() if row["session_id"] == "source") == before
+    if hidden:
+        assert result["item"] is None
+        assert service._latest("child") is None
+        return
+    child = result["item"]
+    assert child["id"] != source["id"]
+    assert child["state"] == "completed" and child["read"] is True
+    assert child["turn_count"] == 0
+    assert not child.get("group_id")
+    assert not child.get("pinned")
+    assert not child.get("owner_id") and not child.get("active_owner_ids")
+    assert service.summary()["running"] == 1
+    assert service.summary()["unread"] == 0
+    assert service.inherit_session("source", "child")["item"] == child
+    restarted = _service(tmp_path, monkeypatch)
+    assert restarted._latest("child") == child
+    first_turn = restarted.start("child", summary="first child turn")
+    assert first_turn["id"] == child["id"] and first_turn["turn_count"] == 1
+
+
+def test_startup_backfills_only_visible_forks_and_preserves_placement(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    activity_globals = service.reconcile_fork_sessions.__globals__
+    existing = service.start("existing", summary="keep existing")
+    group = service.create_group("Branches", "green")["group"]
+    service._group_assignments["missing"] = group["id"]
+    service._save_group_state()
+    metadata = [
+        {"id": "missing", "name": "Older fork", "forked_from": "source", "created_at": 123},
+        {"id": "existing", "forked_from": "source", "created_at": 124},
+        {"id": "ungrouped", "forked_from": "source", "created_at": 125},
+        {"id": "ordinary", "created_at": 126},
+        *({"id": key, "forked_from": "source", key: True, "created_at": 127}
+          for key in ("activity_hidden", "runtime_shadow", "runtime_predecessor", "runtime_successor")),
+    ]
+    monkeypatch.setattr(activity_globals["sessions"], "list_sessions", lambda: metadata)
+    assert service.reconcile_fork_sessions() == 2
+    child = service._latest("missing")
+    assert child["group_id"] == group["id"]
+    assert child["updated_at"] == 123 and child["turn_count"] == 0
+    assert child["read"] is True
+    assert not service._latest("ungrouped").get("group_id")
+    assert service._latest("existing") == existing
+    assert {row["session_id"] for row in service.list()} == {"missing", "existing", "ungrouped"}
+    revision = service.revision
+    saved = service.path.read_bytes()
+    assert service.reconcile_fork_sessions() == 0
+    assert service.revision == revision and service.path.read_bytes() == saved
+    restarted = ActivityService(tmp_path)
+    assert restarted._latest("missing") == child
+    assert restarted.reconcile_fork_sessions() == 0
+
+
+def test_startup_fork_repair_respects_retention_and_rolls_back_failed_write(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    activity_globals = service.reconcile_fork_sessions.__globals__
+    source = service.start("source")
+    monkeypatch.setitem(activity_globals, "_MAX_EVENTS", 2)
+    monkeypatch.setattr(activity_globals["sessions"], "list_sessions", lambda: [
+        {"id": "source"},
+        {"id": "old", "forked_from": "source", "created_at": 1},
+        {"id": "new", "forked_from": "source", "created_at": 2},
+    ])
+    real_save = service._save
+    calls = 0
+
+    def fail_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("fork repair disk failure")
+        real_save()
+
+    monkeypatch.setattr(service, "_save", fail_once)
+    with pytest.raises(OSError, match="fork repair disk failure"):
+        service.reconcile_fork_sessions()
+    assert service.list() == [source]
+    assert service.reconcile_fork_sessions() == 1
+    assert {row["session_id"] for row in service.list()} == {"source", "new"}
+    assert service.reconcile_fork_sessions() == 0

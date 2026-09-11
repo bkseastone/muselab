@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
+import uuid
 
 import pytest
 
@@ -2264,3 +2266,148 @@ def test_activity_row_targeted_lookup_opens_mobile_session_and_workspace(
     assert target_sid not in result["listRequests"][0]
     assert target_sid in result["listRequests"][1]
     assert target_history_requests, "target session history was never loaded"
+
+
+def test_real_fork_appears_in_ungrouped_without_a_new_turn(page, backend_url, auth_token, request):
+    """Exercise the real SDK fork, API, Activity SSE and persisted snapshot."""
+    from claude_agent_sdk._internal.sessions import _sanitize_path
+
+    headers = {"X-Auth-Token": auth_token}
+    response = page.request.post(f"{backend_url}/api/chat/sessions", headers=headers,
+                                 data={"name": "Activity fork fixture"})
+    assert response.ok, response.text()
+    source = response.json()
+    created = [source["id"]]
+
+    def cleanup():
+        # The backend is shared across the suite. Later browser logins must
+        # not adopt this fixture's real transcript as their starting history.
+        page.goto("about:blank")
+        for sid in reversed(created):
+            deleted = page.request.delete(f"{backend_url}/api/chat/sessions/{sid}", headers=headers)
+            assert deleted.ok, deleted.text()
+
+    request.addfinalizer(cleanup)
+    root = Path(source["cwd"])
+    # The E2E backend puts SDK transcripts under its own disposable root.
+    project = root / "state" / "muselab" / "vendor-cli" / "projects" / _sanitize_path(str(root))
+    project.mkdir(parents=True, exist_ok=True)
+    user_id, assistant_id = str(uuid.uuid4()), str(uuid.uuid4())
+    transcript = [
+        {"type": "user", "uuid": user_id, "parentUuid": None,
+         "sessionId": source["id"], "cwd": str(root),
+         "timestamp": "2026-01-01T00:00:00.000Z",
+         "message": {"role": "user", "content": "Synthetic fork question"}},
+        {"type": "assistant", "uuid": assistant_id, "parentUuid": user_id,
+         "sessionId": source["id"], "cwd": str(root),
+         "timestamp": "2026-01-01T00:00:01.000Z",
+         "message": {"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "Synthetic fork answer"}]}},
+    ]
+    (project / f"{source['id']}.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in transcript), encoding="utf-8")
+    _login(page, backend_url, auth_token)
+    page.evaluate("""async () => {
+        const app = document.querySelector('#app')._x_dataStack[0];
+        await app.openActivityCenter();
+        app.setActivityView('groups');
+    }""")
+    page.wait_for_function("""() => document.querySelector('#app')._x_dataStack[0]
+        ._activityLiveSource?.readyState === EventSource.OPEN""")
+    # Suppress HTTP snapshots after the initial load: only SSE can deliver the
+    # new row, rather than a convenient poll hiding a broken publication.
+    def block_snapshot(route):
+        if '/api/activity/events' in route.request.url:
+            route.continue_()
+        else:
+            route.fulfill(status=304)
+
+    page.route("**/api/activity?*", block_snapshot)
+    with page.expect_response(f"**/api/chat/sessions/{source['id']}/fork") as fork_response:
+        page.evaluate("""async ({sid, boundary}) => {
+            const app = document.querySelector('#app')._x_dataStack[0];
+            await app.forkConversation(sid, boundary);
+        }""", {"sid": source["id"], "boundary": assistant_id})
+    assert fork_response.value.ok, fork_response.value.text()
+    child = fork_response.value.json()
+    created.append(child["id"])
+    page.wait_for_function("""sid => document.querySelector('#app')._x_dataStack[0]
+        .activity.events.some(row => row.session_id === sid)""", arg=child["id"], timeout=5000)
+    page.evaluate("""() => {
+        const app = document.querySelector('#app')._x_dataStack[0];
+        app.activity.show = true;
+        app.setActivityView('groups');
+    }""")
+    lane = page.locator('.activity-group.is-custom').filter(
+        has=page.locator('.activity-custom-group-head > strong', has_text=re.compile('未分组|Ungrouped')))
+    expect(lane.locator('.activity-row').filter(has_text=child['name'])).to_be_visible()
+    rows = page.request.get(f"{backend_url}/api/activity?limit=500", headers=headers).json()['events']
+    fork_row = next(row for row in rows if row['session_id'] == child['id'])
+    assert fork_row['turn_count'] == 0 and fork_row['read'] is True
+    assert not fork_row.get('group_id')
+
+    page.unroute("**/api/activity?*", block_snapshot)
+    page.reload(wait_until="domcontentloaded")
+    _login(page, backend_url, auth_token)
+    page.evaluate("""async () => {
+        const app = document.querySelector('#app')._x_dataStack[0];
+        await app.openActivityCenter();
+        app.setActivityView('groups');
+    }""")
+    expect(page.locator('.activity-row').filter(has_text=child['name'])).to_be_visible()
+
+
+def test_ungrouped_uses_latest_activity_despite_saved_manual_positions(page, backend_url, auth_token):
+    rows = [
+        {"id": "old", "session_id": "old", "session_name": "Old fixture",
+         "state": "completed", "read": True, "updated_at": 100, "group_order": 0, "pinned": True},
+        {"id": "new", "session_id": "new", "session_name": "Newest fixture",
+         "state": "completed", "read": True, "updated_at": 300, "group_order": 9},
+        {"id": "middle", "session_id": "middle", "session_name": "Middle fixture",
+         "state": "waiting_approval", "read": False, "updated_at": 200},
+        {"id": "manual-first", "session_id": "manual-first", "session_name": "Manual first",
+         "state": "completed", "read": True, "updated_at": 10, "group_order": 0, "group_id": "manual"},
+        {"id": "manual-last", "session_id": "manual-last", "session_name": "Manual last",
+         "state": "completed", "read": True, "updated_at": 400, "group_order": 1, "group_id": "manual"},
+    ]
+    revision = 1
+
+    def snapshot(route):
+        route.fulfill(json={
+            "events": rows, "generation": "newest-time-fixture", "revision": revision,
+            "summary": {"generation": "newest-time-fixture", "revision": revision,
+                        "running": 1, "unread": 0, "attention": 1, "workspaces": []},
+            "custom_groups": [{"id": "manual", "name": "Manual group", "color": "blue"}],
+            "group_order": ["manual", "__ungrouped__"],
+        })
+
+    page.route("**/api/activity?*", snapshot)
+
+    def open_groups():
+        _login(page, backend_url, auth_token)
+        page.evaluate("""async () => {
+            const app = document.querySelector('#app')._x_dataStack[0];
+            app._stopActivityEvents();
+            await app.openActivityCenter();
+            app.setActivityView('groups');
+        }""")
+
+    def lane(title):
+        return page.locator('.activity-group.is-custom').filter(
+            has=page.locator('.activity-custom-group-head > strong', has_text=title))
+
+    open_groups()
+    ungrouped = lane(re.compile('未分组|Ungrouped')).locator('.activity-session-name')
+    expect(ungrouped).to_have_text(['Newest fixture', 'Middle fixture', 'Old fixture'])
+    expect(lane('Manual group').locator('.activity-session-name')).to_have_text(
+        ['Manual first', 'Manual last'])
+    # A new task transition must invalidate cached ordering immediately.
+    rows[0]['updated_at'] = 500
+    revision = 2
+    page.evaluate("""item => document.querySelector('#app')._x_dataStack[0]
+        ._applyActivityUpdate({generation: 'newest-time-fixture', revision: 2, item})""", rows[0])
+    expect(ungrouped).to_have_text(['Old fixture', 'Newest fixture', 'Middle fixture'])
+    page.reload(wait_until='domcontentloaded')
+    open_groups()
+    expect(lane(re.compile('未分组|Ungrouped')).locator('.activity-session-name')).to_have_text(
+        ['Old fixture', 'Newest fixture', 'Middle fixture'])

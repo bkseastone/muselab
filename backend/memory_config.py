@@ -139,6 +139,11 @@ def load_config(*, fresh: bool = False) -> MemoryConfig:
         stamp = path.stat().st_mtime_ns
     except OSError:
         stamp = -1
+    # Saving holds the writer lock across fsync/replace. Readers can keep
+    # using the last committed immutable snapshot while that write is pending.
+    cached = _cached
+    if not fresh and cached and cached[0] == stamp:
+        return cached[1].model_copy(deep=True)
     with _LOCK:
         if not fresh and _cached and _cached[0] == stamp:
             return _cached[1].model_copy(deep=True)

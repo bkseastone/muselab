@@ -36668,6 +36668,11 @@ function portal() {
             if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
+          // The built-in inbox always follows activity time, including rows
+          // that acquired manual positions while moving between custom lanes.
+          if (groupKey === "custom:__ungrouped__") {
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
           if (custom) {
             const aManual = Number.isFinite(Number(a.group_order));
             const bManual = Number.isFinite(Number(b.group_order));
@@ -36677,9 +36682,6 @@ function portal() {
             if (aManual && bManual) {
               const order = Number(a.group_order) - Number(b.group_order);
               if (order) return order;
-            }
-            if (groupKey === "custom:__ungrouped__") {
-              return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
             }
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
@@ -37224,7 +37226,7 @@ function portal() {
       if (this._activityGroupPending[eventId]) return false;
       const target = String(groupId || "");
       const previous = String(item.group_id || "");
-      const hasPlacement = beforeEventId !== null;
+      const hasPlacement = !!target && beforeEventId !== null;
       this.closeActivityMoveMenu(true);
       if (!hasPlacement && target === previous) return true;
       const previousPlacement = new Map(this.activity.events.map(row => [
