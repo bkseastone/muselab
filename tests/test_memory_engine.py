@@ -1,5 +1,6 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -1367,13 +1368,13 @@ def test_recall_retries_lexical_lock_contention_instead_of_returning_empty(
     attempts = []
 
     class Connection:
-        def __init__(self): self.connection = original()
+        def __init__(self): self.context = original()
 
         def __enter__(self):
-            self.connection.__enter__()
+            self.connection = self.context.__enter__()
             return self
 
-        def __exit__(self, *args): return self.connection.__exit__(*args)
+        def __exit__(self, *args): return self.context.__exit__(*args)
 
         def execute(self, sql, *args):
             if 'memory_fts MATCH' in sql:
@@ -1394,5 +1395,61 @@ def test_recall_retries_lexical_lock_contention_instead_of_returning_empty(
             assert instance.pop_recall_trace('busy-read')['lexical_status'] == 'ok'
         finally:
             await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("final_limit,max_chars", [(1, 3000), (6, 3000), (15, 3000), (20, 3000), (15, 500)])
+def test_prepared_recall_injects_configured_limit_and_reports_actual_count(
+    recall_case, monkeypatch, final_limit, max_chars,
+):
+    from backend import memory_client as client, memory_engine as module
+
+    instance, cfg, _, vector = recall_case
+    cfg.retrieval.final_limit = final_limit
+    cfg.retrieval.max_context_chars = max_chars
+    cfg.retrieval.soft_timeout_ms = 0
+    memories = [instance.store.create_memory(
+        "default", "fact", f"Synthetic project {index} uses workspace fixture-{index}.",
+        authority="confirmed", confidence=1.0,
+    ) for index in range(20)]
+
+    async def search(*args, **kwargs):
+        return [{"id": row["id"], "channel": "dense"} for row in memories]
+
+    monkeypatch.setattr(vector, "search", search)
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(client, "native_enabled", lambda: True)
+    events = []
+    monkeypatch.setattr(client, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    async def scenario():
+        sid = f"configured-limit-{final_limit}-{max_chars}"
+        prompt = "Retrieve the synthetic projects"
+        await client.prepare_recall(sid, "turn", prompt)
+        response = await client.build_recall_hook(sid, prepared_only=True)(
+            {"prompt": prompt}, None, None)
+        block = response["hookSpecificOutput"]["additionalContext"]
+        facts = json.loads(next(line for line in block.splitlines()
+                                if line.startswith('{"facts":')))['facts']
+        trace = client.pop_recall_trace(sid)
+        assert len(block) <= max_chars
+        if max_chars == 3000:
+            assert len(facts) == final_limit
+        else:
+            assert 0 < len(facts) < final_limit
+        assert trace["matched_count"] == final_limit
+        assert trace["count"] == len(trace["items"]) == len(facts)
+        assert trace["injected"] is True
+        rendering = next(fields for event, fields in events if event == "memory.recall_context")
+        assert rendering["count"] == len(facts)
+        assert rendering["final_limit"] == final_limit
+        assert rendering["context_limited"] is (max_chars == 500)
+        assert "Synthetic project" not in str(events)
+        expected_ids = {row["id"] for row in memories if row["content"] in facts}
+        assert {row["id"] for row in trace["items"]} == expected_ids
+        assert await client.build_recall_hook(sid, prepared_only=True)(
+            {"prompt": prompt}, None, None) == {}
+        await instance.stop()
 
     _run(scenario())

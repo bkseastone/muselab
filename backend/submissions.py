@@ -17,8 +17,23 @@ from .private_storage import ensure_private_directory, ensure_private_regular_fi
 
 
 @contextmanager
-def _connect():
+def _connect(*, read_only: bool = False):
     base = sessions.SESS_DIR / ".submissions"
+    path = base / "receipts.sqlite3"
+    if read_only:
+        if (not ensure_private_directory(base, create=False)
+                or not ensure_private_regular_file(path)):
+            yield None
+            return
+        conn = sqlite3.connect(path.absolute().as_uri() + "?mode=ro",
+                               uri=True, timeout=.2)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            yield conn
+        finally:
+            conn.close()
+        return
     ensure_private_directory(base)
     path = base / "receipts.sqlite3"
     if not ensure_private_regular_file(path):
@@ -31,6 +46,9 @@ def _connect():
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
+        # Readers must stay available while admission/cancellation is writing.
+        # Keep FULL durability for the idempotency receipt's commit boundary.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("""CREATE TABLE IF NOT EXISTS receipts (
           sid TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT NOT NULL,
@@ -83,7 +101,11 @@ def finish(sid: str, kind: str, request_id: str, state: str, result: dict) -> di
 
 
 def lookup(sid: str, kind: str, request_id: str) -> dict:
-    with _connect() as conn:
+    with _connect(read_only=True) as conn:
+        if conn is None or conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='receipts'"
+        ).fetchone() is None:
+            return {"state": "not_found"}
         return _public(conn.execute(
             "SELECT * FROM receipts WHERE sid=? AND kind=? AND request_id=?",
             (sid, kind, request_id)).fetchone())

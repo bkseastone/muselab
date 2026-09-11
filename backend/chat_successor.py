@@ -183,7 +183,8 @@ def commit_fork_lifecycle(
         activity.inherit_session(
             source_sid,
             child_sid,
-            **({"successor": True} if successor else {}),
+            **({"successor": True} if successor else (
+                {"activity_hidden": True} if child_meta.get("activity_hidden") else {})),
         )
         activity_projected = True
 
@@ -197,8 +198,10 @@ def commit_fork_lifecycle(
             if not _link_if_source_live():
                 raise ValueError("successor link changed")
             linked = True
-        elif not sess.publish_fork_child(child_sid):
-            raise ValueError("fork child disappeared before publication")
+        else:
+            if not sess.publish_fork_child(child_sid):
+                raise ValueError("fork child disappeared before publication")
+            activity.publish_session(child_sid)
 
         return {
             "child_sid": child_sid,

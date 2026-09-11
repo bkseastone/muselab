@@ -1149,11 +1149,13 @@ class ActivityService:
         child_sid: str,
         *,
         successor: bool = False,
+        activity_hidden: bool = False,
     ) -> dict[str, Any]:
         """Inherit a fork's durable group placement and optional activity row.
 
-        Ordinary forks copy only the custom-group assignment: the source remains
-        an independent conversation and the child gets its own row on first use.
+        Ordinary visible forks get an independent, read row immediately. The
+        caller publishes it only after committing the child's session metadata.
+        Hidden side questions inherit placement without adding a visible row.
         A true successor (for example compact recovery) moves the existing row,
         preserving its id, ordering, pin/read state and turn lineage.  The shared
         group/event journal makes the mutation atomic, while the child-key checks
@@ -1164,7 +1166,7 @@ class ActivityService:
         child = str(child_sid or "").strip()
         if not source or not child or source == child:
             raise ValueError("distinct source and child sessions are required")
-        child_name, _, _ = self._metadata(child)
+        child_name, workspace, workspace_name = self._metadata(child)
         with self._lock:
             source_item = self._latest(source)
             child_item = self._latest(child)
@@ -1180,6 +1182,11 @@ class ActivityService:
             changed = False
             if source_group and not child_group:
                 self._group_assignments[child] = source_group
+                changed = True
+            if not successor and not activity_hidden and child_item is None:
+                child_item = self._fork_row(
+                    child, child_name, workspace, workspace_name, time.time())
+                self._events.append(child_item)
                 changed = True
             if successor:
                 if source_item is not None:
@@ -1213,6 +1220,72 @@ class ActivityService:
                 "group_id": self._group_assignments.get(child, ""),
                 "successor": successor,
             }
+
+    def _fork_row(
+        self, sid: str, name: str, workspace: str, workspace_name: str, at: float,
+    ) -> dict[str, Any]:
+        # Fork creation has finished, but the child has not run a turn. Never
+        # copy a predecessor's running owners, unread result, pin or turn count.
+        item = {
+            "id": uuid.uuid4().hex, "session_id": sid,
+            "kind": "fork", "activity_source": "fork",
+            "session_name": name, "workspace": workspace,
+            "workspace_name": workspace_name, "task_summary": name[:500],
+            "state": "completed", "read": True, "needs_attention": False,
+            "status_detail": "", "turn_count": 0,
+            "started_at": at, "finished_at": at, "updated_at": at,
+        }
+        self._apply_assignment_locked(item)
+        return item
+
+    def publish_session(self, sid: str) -> None:
+        """Notify clients after a fork becomes openable, without starting work."""
+        self.initialize_runtime_state()
+        with self._lock:
+            item = self._latest(sid)
+            if item is not None and self._filter_live([item]):
+                # The durable write already applies retention. Keep older rows
+                # in memory until publication so a failed fork can roll back
+                # without losing the row it would otherwise have evicted.
+                self._events = self._events[-_MAX_EVENTS:]
+                self._publish_locked(item=item)
+
+    def reconcile_fork_sessions(self) -> int:
+        """Backfill missing visible forks once at startup using cached metadata.
+
+        Fill only spare ledger capacity, newest forks first. Never evict task
+        history or resurrect old forks beyond the normal retention limit. This
+        repair stays off the event loop and out of snapshot/polling paths.
+        """
+        self.initialize_runtime_state()
+        candidates = [
+            meta for meta in sessions.list_sessions()
+            if meta.get("id") and meta.get("forked_from")
+            and not any(meta.get(key) for key in (
+                "activity_hidden", "runtime_shadow", "runtime_predecessor",
+                "runtime_successor"))
+        ]
+        with self._lock:
+            known = {row.get("session_id") for row in self._events}
+            missing = sorted(
+                (meta for meta in candidates if meta["id"] not in known),
+                key=lambda meta: float(meta.get("created_at") or 0),
+                reverse=True,
+            )[:max(0, _MAX_EVENTS - len(self._events))]
+            if not missing:
+                return 0
+            snapshot = self._group_event_snapshot_locked()
+            # Append in oldest-first order, matching ordinary ledger insertion.
+            for meta in reversed(missing):
+                sid = str(meta["id"])
+                name = str(meta.get("name") or "Muse task")
+                workspace = str(meta.get("cwd") or ROOT)
+                self._events.append(self._fork_row(
+                    sid, name, workspace, Path(workspace).name or "Workspace",
+                    float(meta.get("created_at") or 0)))
+            self._save_group_event_state_locked(snapshot)
+            self._publish_locked(resync=True)
+            return len(missing)
 
     def discard_session(self, sid: str) -> bool:
         """Remove a provisional child's Activity projection transactionally."""

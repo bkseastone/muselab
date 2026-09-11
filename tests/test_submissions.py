@@ -183,3 +183,56 @@ async def test_queue_commit_after_previous_turn_stop_remains_runnable(app_module
     finally:
         chat._active_turns.pop(sid, None)
         broadcast.close()
+
+
+def test_receipt_lookup_remains_readable_while_writer_holds_exclusive_transaction(app_module):
+    import sqlite3
+    import time
+    from backend import sessions, submissions
+
+    submissions.reserve("fixture", "turn", "request", {"prompt": "fixture"})
+    path = sessions.SESS_DIR / ".submissions" / "receipts.sqlite3"
+    with sqlite3.connect(path) as writer:
+        # In WAL, an exclusive writer does not block readers. The old rollback
+        # journal plus CREATE TABLE in lookup instead times out with SQLITE_BUSY.
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute("UPDATE receipts SET state='accepted'")
+        started = time.perf_counter()
+        try:
+            assert submissions.lookup("fixture", "turn", "request")["state"] == "pending"
+            assert time.perf_counter() - started < .3
+        finally:
+            writer.rollback()
+    writer.close()
+
+
+
+@pytest.mark.asyncio
+async def test_receipt_status_busy_is_retryable_and_not_a_missing_receipt(app_module, monkeypatch):
+    import sqlite3
+    from backend import chat, submissions
+
+    def busy(*args):
+        error = sqlite3.OperationalError("synthetic busy fixture")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(submissions, "lookup", busy)
+    with pytest.raises(HTTPException) as caught:
+        await chat.submission_status("fixture", "request", kind="turn")
+    assert caught.value.status_code == 503
+    assert caught.value.headers == {"Retry-After": "1"}
+    assert "synthetic" not in caught.value.detail
+
+
+def test_unknown_receipt_does_not_initialize_storage_and_handles_pending_schema(app_module):
+    import sqlite3
+    from backend import sessions, submissions
+
+    base = sessions.SESS_DIR / ".submissions"
+    assert submissions.lookup("fixture", "turn", "unknown") == {"state": "not_found"}
+    assert not base.exists()
+    base.mkdir(mode=0o700)
+    path = base / "receipts.sqlite3"
+    sqlite3.connect(path).close()
+    assert submissions.lookup("fixture", "turn", "unknown") == {"state": "not_found"}

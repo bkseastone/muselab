@@ -14088,8 +14088,19 @@ async def _run_submission_owned(sid, kind, request_id, payload, operation):
 async def submission_status(
     sid: str, request_id: str, kind: str = Query("turn", pattern="^(turn|queue)$"),
 ) -> dict:
+    import sqlite3
     from . import submissions
-    return await asyncio.to_thread(submissions.lookup, sid, kind, request_id)
+    try:
+        return await obs.to_thread_io(
+            "chat.submission_lookup", sid, submissions.lookup, sid, kind, request_id)
+    except sqlite3.OperationalError as exc:
+        if (getattr(exc, "sqlite_errorcode", 0) & 0xff) not in {
+            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
+        }:
+            raise
+        raise HTTPException(
+            503, "Submission status unavailable; retry shortly",
+            headers={"Retry-After": "1"}) from None
 
 
 @router.post("/sessions/{sid}/submissions/{request_id}/cancel", dependencies=[Depends(require_token)])

@@ -1955,7 +1955,7 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["activity_hidden"] is True
     assert body["runtime_profile"] == "side_question"
     assert body["cwd"] == source.json()["cwd"]
-    assert activity_inherits == [(sid, new_sid, {})]
+    assert activity_inherits == [(sid, new_sid, {"activity_hidden": True})]
 
 
 def test_fork_activity_inheritance_failure_removes_provisional_child(
@@ -3196,3 +3196,74 @@ async def test_force_stop_finalizes_attachments_for_every_owner_state(
         with chat_mod._image_store_lock:
             chat_mod._image_store.pop(aid, None)
             chat_mod._staged_attachment_claims.pop(aid, None)
+
+
+@pytest.mark.parametrize("hidden,grouped", [(False, False), (False, True), (True, False)])
+def test_fork_activity_is_published_only_when_child_is_openable(
+    chat_mod, client, monkeypatch, hidden, grouped,
+):
+    from backend.activity import ActivityService, activity
+
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    source = client.post("/api/chat/sessions", headers=headers,
+                         json={"name": "fork activity source"}).json()
+    source_row = activity.start(source["id"], summary="source background work", owner_id="source-owner")
+    if grouped:
+        group = activity.create_group("Fork fixtures", "green")["group"]
+        activity.set_group(source_row["id"], group["id"])
+    source_before = activity._latest(source["id"]).copy()
+    child_sid = "25252525-3636-4789-89ab-898989898989"
+    monkeypatch.setattr(chat_mod, "sdk_fork_session",
+                        lambda *args, **kwargs: SimpleNamespace(session_id=child_sid))
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda sid: {})
+    updates = []
+    real_publish = activity._publish_locked
+
+    def inspect_publish(**kwargs):
+        item = kwargs.get("item")
+        if item and item.get("session_id") == child_sid:
+            assert child_sid in {row["id"] for row in chat_mod.sess.list_sessions()}
+            assert chat_mod.sess.get_session_meta(child_sid)["runtime_shadow"] is False
+            updates.append(dict(item))
+        return real_publish(**kwargs)
+
+    monkeypatch.setattr(activity, "_publish_locked", inspect_publish)
+    response = client.post(f"/api/chat/sessions/{source['id']}/fork", headers=headers,
+                           json={"activity_hidden": hidden})
+    assert response.status_code == 200, response.text
+    assert activity._latest(source["id"]) == source_before
+    events = client.get("/api/activity?limit=500", headers=headers).json()["events"]
+    children = [row for row in events if row["session_id"] == child_sid]
+    if hidden:
+        assert children == updates == []
+        return
+    assert len(children) == len(updates) == 1
+    child = children[0]
+    assert child["turn_count"] == 0 and child["read"] is True
+    assert child["group_id"] == group["id"] if grouped else not child.get("group_id")
+    restarted = ActivityService(activity.path.parent.parent)
+    assert restarted._latest(child_sid) == child
+
+
+def test_failed_fork_publication_removes_activity_without_evicting_source(
+    chat_mod, client, monkeypatch,
+):
+    from backend import activity as module
+
+    activity = module.activity
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    source = client.post("/api/chat/sessions", headers=headers,
+                         json={"name": "retained source"}).json()
+    source_row = activity.start(source["id"], summary="retained activity")
+    monkeypatch.setattr(module, "_MAX_EVENTS", 1)
+    child_sid = "26262626-3737-489a-8abc-909090909090"
+    monkeypatch.setattr(chat_mod, "sdk_fork_session",
+                        lambda *args, **kwargs: SimpleNamespace(session_id=child_sid))
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda sid: {})
+    monkeypatch.setattr(chat_mod.sess, "publish_fork_child", lambda sid: False)
+    monkeypatch.setattr(chat_mod, "sdk_delete_session", lambda *args, **kwargs: None)
+    response = client.post(f"/api/chat/sessions/{source['id']}/fork", headers=headers, json={})
+    assert response.status_code == 400
+    assert chat_mod.sess.get_session_meta(child_sid) is None
+    assert activity.list() == [source_row]
+    assert json.loads(activity.path.read_text()) == [source_row]

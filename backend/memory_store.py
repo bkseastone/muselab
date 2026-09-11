@@ -260,25 +260,32 @@ class MemoryStore:
                 except OSError as exc:
                     log.debug("could not chmod %s: %s", sibling, exc)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         # Recall must never run schema migration or wait ten seconds for a writer.
         target = self.path.absolute().as_uri() + "?mode=ro" if self._read_only else self.path
         conn = sqlite3.connect(target, uri=self._read_only,
                                timeout=0.05 if self._read_only else 10,
                                isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=50" if self._read_only
-                     else "PRAGMA busy_timeout=10000")
-        if self._read_only:
-            conn.execute("PRAGMA query_only=ON")
-            deadline = getattr(self, "_query_deadline", None)
-            cancelled = getattr(self, "_read_cancelled", None)
-            if deadline is not None or cancelled is not None:
-                conn.set_progress_handler(
-                    lambda: int((deadline is not None and time.perf_counter() >= deadline)
-                                or (cancelled is not None and cancelled.is_set())), 1000)
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=50" if self._read_only
+                         else "PRAGMA busy_timeout=10000")
+            if self._read_only:
+                conn.execute("PRAGMA query_only=ON")
+                deadline = getattr(self, "_query_deadline", None)
+                cancelled = getattr(self, "_read_cancelled", None)
+                if deadline is not None or cancelled is not None:
+                    conn.set_progress_handler(
+                        lambda: int((deadline is not None and time.perf_counter() >= deadline)
+                                    or (cancelled is not None and cancelled.is_set())), 1000)
+            with conn:
+                yield conn
+        finally:
+            # Do not defer SQLite handles and WAL cleanup to cyclic GC, which
+            # may otherwise run on the application's event-loop thread.
+            conn.close()
 
     @contextmanager
     def read_budget(self, deadline: float | None, *, cancel_event=None):

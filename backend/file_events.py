@@ -50,6 +50,7 @@ _RECONCILE_RETRY_MAX_S = 30.0
 _MAX_WATCHED_ROOTS = 16
 _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
+_RECONCILE_MAX_STALE_SCANS = 3
 _SCAN_CANCEL_GRACE_S = 0.25
 _SCAN_EXCHANGE_TIMEOUT_S = max(30.0, _SCAN_MAX_SECONDS * 3)
 _PARTIAL_RECONCILE_YIELD_S = 0.01
@@ -1566,6 +1567,7 @@ class FileWatchManager:
             "mutation_lock_wait_ms": 0,
             "scan_slot_wait_ms": 0,
             "scan_ms": 0,
+            "stale_scans": 0,
             "replay_ms": 0,
             "scanned_files": 0,
             "snapshot_files": 0,
@@ -1621,6 +1623,7 @@ class FileWatchManager:
                 scan_slot_wait_ms=metrics["scan_slot_wait_ms"],
                 mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
                 scan_ms=metrics["scan_ms"],
+                stale_scans=metrics["stale_scans"],
                 replay_ms=metrics["replay_ms"],
                 scanned_files=metrics["scanned_files"],
                 snapshot_files=metrics["snapshot_files"],
@@ -1777,6 +1780,12 @@ class FileWatchManager:
                 # A token change invalidates accumulated resume state; a new
                 # applicability window must establish its own complete snapshot.
                 state.scan_progress.clear()
+                metrics["stale_scans"] = int(metrics["stale_scans"]) + 1
+                if metrics["stale_scans"] >= _RECONCILE_MAX_STALE_SCANS:
+                    # Busy workspaces can invalidate every snapshot. Retain
+                    # the last-good index and let the existing retry backoff
+                    # yield disk/CPU time instead of looping through full walks.
+                    raise WorkspaceScanIncomplete("workspace changed during repeated scans")
                 continue
             break
         state.initialized = True

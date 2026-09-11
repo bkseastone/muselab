@@ -195,6 +195,7 @@ def _json_data(facts: list[str]) -> str:
 
 def _render_block_with_count(
     mems: list[str], max_chars: int = _MAX_BLOCK_CHARS,
+    *, max_items: int = _SEARCH_LIMIT,
 ) -> tuple[str, int]:
     """Render untrusted facts and return the number actually injected."""
     if not mems:
@@ -207,7 +208,7 @@ def _render_block_with_count(
     )
     suffix = "\n</recalled_memory_data>\n"
     accepted: list[str] = []
-    for memory in mems[:_SEARCH_LIMIT]:
+    for memory in mems[:max_items]:
         candidate = prefix + _json_data([*accepted, memory]) + suffix
         if len(candidate) > max_chars:
             break
@@ -321,10 +322,19 @@ async def search_context(query: str, session_id: str) -> str:
             rows = await engine.recall(query, session_id)
             clean_rows = [(row, clean) for row in rows
                           if (clean := _sanitize(str(row.get("content", ""))))]
+            retrieval = engine.config().retrieval
             block, count = _render_block_with_count(
                 [clean for row, clean in clean_rows],
-                max_chars=engine.config().retrieval.max_context_chars)
+                max_chars=retrieval.max_context_chars,
+                max_items=retrieval.final_limit)
             trace = engine.peek_recall_trace(session_id)
+            perf_event(
+                "memory.recall_context", session=short_id(session_id) or "none",
+                recall_id=(trace or {}).get("id", "none"),
+                matched_count=len(rows), sanitized_count=len(clean_rows), count=count,
+                final_limit=retrieval.final_limit,
+                max_context_chars=retrieval.max_context_chars, context_chars=len(block),
+                context_limited=count < min(len(clean_rows), retrieval.final_limit))
             if trace is not None:
                 trace["matched_count"] = trace["count"]
                 trace["count"] = count
