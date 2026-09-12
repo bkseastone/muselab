@@ -47,6 +47,25 @@ Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CL
 
 代码、`.venv/`、依赖缓存、构建产物和日志可从版本库或安装器恢复，不必作为数据备份。
 
+`$MUSELAB_SESSIONS_DIR/<sid>.transcript-index.sqlite3` 是私有的字节偏移与描述符缓存，
+不承担对话原始记录的职责。追加记录时，只在一次 SQLite 事务中写入新增描述符与小型源文件检查点。
+CLI JSONL 始终是权威来源；索引缺失、损坏、旧 JSON 格式或版本不兼容时，会从 JSONL 重建，
+不会重写对话。普通主链追加增量更新显示坐标，分叉、压缩和重复 UUID 则使用完整链解析兜底。
+这些缓存可以不备份；会话 sidecar、队列与 canonical JSONL 仍须保留。
+
+
+任务交付功能在 `$MUSELAB_SESSIONS_DIR/` 下增加三个私有位置：
+
+| 路径 | 内容 |
+|---|---|
+| `delivery/<sid>.json` | 观测到的任务／工具证据及任务开始时的 Git 身份 |
+| `checkpoints/<sid>.json` | 实际 SDK 检查点 ID 和观测到的文件指纹 |
+| `checkpoint-recovery/<sid>/` | 用户确认撤销前备份的文件内容 |
+
+需要保留任务及恢复记录时一并备份。恢复文件可能包含敏感工作区内容；
+删除会话会同时删除这些记录和备份。备份不代表迁移后的旧检查点可以
+直接重放，仍须通过当前目录身份及文件检查。详见[任务交付与 SDK 兼容性](task-delivery-sdk_zh.md)。
+
 ## Claude CLI 数据
 
 | 路径 | 内容 |
@@ -87,3 +106,7 @@ Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CL
 7. 运行 `bash scripts/doctor.sh` 做基础自检。
 
 备份中包含 token、API key、OAuth 凭据、Push 私钥，终端 Profile 还可能包含用户写入的命令。应加密保存，切勿提交到 Git 或共享盘。
+
+## Docker 的持久配置布局
+
+容器的 `/app/sessions` 挂载还包括 `config/.env`、`config/mcp.json`、`config/provider_overrides.json` 与 `state/muselab/vendor-cli/`。全量备份应包含整个挂载目录，此外还要备份工作区与 Claude 状态挂载。不要把 `config/` 当作可重建缓存。网页保存值会覆盖初始 env-file 同名值；需要重置时先备份，再明确编辑持久文件。旧镜像升级前按[迁移指南](docker-state-migration_zh.md)导出未挂载状态。

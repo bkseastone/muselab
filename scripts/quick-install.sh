@@ -44,7 +44,9 @@ ask_tty() {
     echo "$def"
     return
   fi
-  if [[ -t 0 ]] || [[ -c /dev/tty ]]; then
+  if [[ -t 0 ]]; then
+    read -rp "  $q ${def:+[$def]} " ans
+  elif ( : </dev/tty ) 2>/dev/null; then
     read -rp "  $q ${def:+[$def]} " ans </dev/tty
   else
     err "interactive prompts need a terminal — this script is being run"
@@ -80,28 +82,24 @@ case "$(uname -s)" in
 esac
 ok "OS: $OS"
 
-# WSL needs systemd for the install-linux.sh service-registration step.
-# WSL2 only has systemd when /etc/wsl.conf has `[boot]\nsystemd=true` set
-# and the distro has been restarted with `wsl --shutdown` (from PowerShell).
-# Fail fast here instead of letting the user wait through 5 minutes of dep
-# installs only to crash on `systemctl --user enable`.
+# Refuse unavailable interactive input before downloading or changing files.
+if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]] && ! ( : </dev/tty ) 2>/dev/null; then
+  err "No controlling terminal. Set MUSELAB_NONINTERACTIVE=1 for unattended installation."
+  exit 1
+fi
+
+# A reachable user manager can be degraded and still register services.
 if [[ "$OS" == "linux" ]] && grep -qi "microsoft" /proc/version 2>/dev/null; then
-  if ! systemctl --user is-system-running >/dev/null 2>&1; then
-    # is-system-running prints "offline"/"running"/etc — exit 0 means the
-    # user instance is reachable. Non-zero = no systemd-user → bail.
-    err "WSL detected without systemd-user enabled — install would fail at service registration."
-    err ""
-    err "Fix (one-time, ~30 seconds):"
-    err "  1) Inside WSL:"
-    err "       sudo tee /etc/wsl.conf >/dev/null <<<\$'[boot]\\nsystemd=true'"
-    err "  2) From PowerShell on the Windows host:"
-    err "       wsl --shutdown"
-    err "  3) Re-open WSL, then re-run this installer."
-    err ""
-    err "(systemd is needed so the muselab service can survive logout / reboot.)"
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    err "WSL systemd user manager is unavailable."
+    err "Check systemd and your user session before continuing. If systemd is disabled:"
+    err "  1) Back up /etc/wsl.conf if it exists; edit it with sudoedit /etc/wsl.conf."
+    err "     Set systemd=true in its [boot] section; preserve every other section."
+    err "  2) From Windows PowerShell run wsl --shutdown, then reopen WSL."
+    err "Current Ubuntu WSL installations may already enable systemd."
     exit 1
   fi
-  ok "WSL detected — systemd-user is up, proceeding"
+  ok "WSL detected — systemd-user is reachable, proceeding"
 fi
 
 # ----- 3. Check git + curl (curl piped this script, so it must exist) -------
@@ -188,7 +186,7 @@ echo
 cd "$DEST"
 # Re-attach /dev/tty so the platform installer's `read` prompts work even
 # when WE were invoked via curl|bash.
-if [[ -c /dev/tty ]]; then
+if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]]; then
   exec bash "scripts/install-$OS.sh" </dev/tty
 else
   exec bash "scripts/install-$OS.sh"

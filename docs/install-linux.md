@@ -143,11 +143,20 @@ Keep that terminal open. Now `http://localhost:8765` in your laptop's
 browser hits the muselab on the VPS. No firewall opens, no auth exposure,
 no extra moving parts.
 
-### B. Tailscale / WireGuard (best for "always on" remote)
+### B. Tailscale (for persistent remote access)
 
-Put your VPS and laptop in the same Tailscale net, then visit
-`http://<vps-tailscale-ip>:8765`. The tunnel is end-to-end encrypted and
-auth'd by Tailscale, so binding 127.0.0.1 is fine.
+Join both devices to the same tailnet, then explicitly proxy the local listener.
+On the machine running MuseLab:
+
+```bash
+tailscale serve --bg http://127.0.0.1:8765
+tailscale serve status
+```
+
+Follow the prompts to enable tailnet HTTPS, open the printed HTTPS address from
+the other device, and sign in with the MuseLab token. Joining Tailscale or
+WireGuard alone does not expose a loopback-only listener on the VPN IP.
+See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
 ### C. Bind to LAN (only if you trust the network) — see below
 

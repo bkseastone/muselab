@@ -51,6 +51,11 @@ README.md
 TODO.md
 *.md
 LICENSE
+# Runtime distribution must retain application and complete third-party notices.
+!LICENSE
+!THIRD_PARTY_LICENSES.md
+!frontend/vendor/licenses/
+!frontend/vendor/licenses/**
 
 # CI / build cruft
 dist/

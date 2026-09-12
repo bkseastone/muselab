@@ -314,3 +314,36 @@ def test_imported_active_skill_requires_local_reapproval(tmp_path: Path):
     assert imported["status"] == "pending_review"
     assert "installed_path" not in imported["payload"]
     assert "approved_at" not in imported["payload"]
+
+
+def test_registry_operations_release_connections_without_waiting_for_gc(tmp_path, monkeypatch):
+    import sqlite3
+
+    # Retain the Python objects deliberately: database handles must close at
+    # operation completion, rather than via GC on an arbitrary application thread.
+    store = MemoryStore(tmp_path / "registry.sqlite3")
+    real_connect = sqlite3.connect
+    opened = []
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    try:
+        row = store.create_memory("owner", "fact", "Synthetic resource fixture")
+        reader = MemoryStore(store.path, read_only=True)
+        for _ in range(20):
+            assert reader.memories_with_stats_by_ids("owner", [row["id"]])[0]["id"] == row["id"]
+        live = 0
+        for conn in opened:
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                continue
+            live += 1
+        assert live == 0, f"{live} SQLite connections retained after completed operations"
+    finally:
+        for conn in opened:
+            conn.close()

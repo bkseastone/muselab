@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from .settings import ROOT, atomic_write_text, env_int, is_chinese_locale
-from . import observability as obs
+from . import observability as obs, sdk_lifecycle
 
 
 def _scheduled_label_prefix() -> str:
@@ -117,6 +117,8 @@ class SchedulerPersistenceError(RuntimeError):
 _STATE_ERROR = ""
 
 _scheduler_task: asyncio.Task | None = None
+_scheduler_closing = False
+_scheduler_lifecycle_lock = asyncio.Lock()
 # Strong references to fire-and-forget execution tasks (tick-loop fires,
 # run-now clicks, startup catch-up). asyncio holds only a weak reference to
 # a task, so a bare `create_task(...)` whose handle goes out of scope can be
@@ -1141,23 +1143,50 @@ def ack_unread() -> int:
 # ---------- task execution ----------
 
 
+async def _terminate_scheduled_runtime(session_id: str, client=None) -> None:
+    """Confirm process cleanup before releasing the scheduled task's pins."""
+    from .chat import (
+        disconnect_client, _disconnect_background_task_owner,
+        _sessions_with_inflight_tasks, _on_task_settled_owned,
+        _retire_unpinned_task_watcher, _schedule_queue_drain,
+    )
+    if client is None:
+        await disconnect_client(session_id)
+    else:
+        await _disconnect_background_task_owner(session_id, client)
+    for task_id in tuple(_sessions_with_inflight_tasks.get(session_id, ())):
+        await _on_task_settled_owned(
+            session_id, task_id, status="stopped",
+            summary="Scheduled run ended; owning runtime terminated.")
+    await _retire_unpinned_task_watcher(session_id)
+    if not _scheduler_closing:
+        _schedule_queue_drain(session_id)
+
+
 @asynccontextmanager
 async def _disconnect_runtime_on_cancel(session_id: str):
     """Fence a timed-out/cancelled scheduled turn before releasing its lock."""
     try:
         yield
     except asyncio.CancelledError:
-        from .chat import disconnect_client
         try:
-            await disconnect_client(session_id)
+            await _terminate_scheduled_runtime(session_id)
         except Exception as exc:
-            # disconnect_client retains an unfinished SDK close in a per-session
-            # fence. A later turn must join it before creating/reusing a client.
+            # Failed SDK closes retain an admission fence and pending task pins.
             sys.stderr.write(
                 f"[scheduler] runtime cleanup pending sid={session_id[:8]} "
                 f"({type(exc).__name__})\n"
             )
         raise
+
+
+class _ScheduledTurnResult(tuple):
+    """Keep the historical (text, error) pair and carry canonical status."""
+    def __new__(cls, text, error, status="completed", terminal_reason=""):
+        value = super().__new__(cls, (text, error))
+        value.status = status
+        value.terminal_reason = terminal_reason
+        return value
 
 
 async def _run_sdk_task_turn(
@@ -1169,7 +1198,7 @@ async def _run_sdk_task_turn(
     activity_source_id: str = "",
     activity_summary: str = "",
 ) -> tuple[str, str | None]:
-    """Run one unattended turn under the session-wide SDK mutex."""
+    """Own one unattended turn through all background continuation Results."""
     from .chat import (
         _STREAM_EOF,
         _active_turns,
@@ -1179,6 +1208,9 @@ async def _run_sdk_task_turn(
         _stream_for,
         _session_message_uuids,
         _TurnResponseBoundary,
+        _observe_background_task_lifecycle,
+        _spawn_task_watcher,
+        _schedule_queue_drain,
         get_client,
     )
     from . import sessions as session_store
@@ -1186,6 +1218,9 @@ async def _run_sdk_task_turn(
     reply_text = ""
     error: str | None = None
     saw_result = False
+    status = "completed"
+    terminal_reason = ""
+    pending: dict[str, dict] = {}
     # Exit order matters: the cancellation guard tears down/fences the CLI
     # while the session runtime lock is still owned. A timeout can therefore
     # never release the lock and let the next turn reuse a still-running client.
@@ -1260,12 +1295,14 @@ async def _run_sdk_task_turn(
         existing_uuids = _session_message_uuids(session_id, model)
         boundary = _TurnResponseBoundary(existing_uuids)
 
-        def _consume(msg: Any) -> str:
-            """Collect one scheduler response; True at terminal Result."""
-            nonlocal reply_text, error, saw_result
+        async def _consume(msg: Any) -> str:
+            """Collect current parent text and share task lifecycle handling."""
+            nonlocal reply_text, error, saw_result, status, terminal_reason
             decision = boundary.classify(msg)
             if decision in {"drop", "stale_result"}:
                 return decision
+            if await _observe_background_task_lifecycle(session_id, pending, msg):
+                return "forward"
             if decision == "forward" and not isinstance(
                 msg, (AssistantMessage, ResultMessage)
             ):
@@ -1279,7 +1316,15 @@ async def _run_sdk_task_turn(
                         reply_text += getattr(block, "text", "") or ""
             elif isinstance(msg, ResultMessage):
                 saw_result = True
-                if getattr(msg, "is_error", False):
+                if not reply_text.strip():
+                    reply_text = str(getattr(msg, "result", None) or "")
+                terminal_reason = sdk_lifecycle.normalize_terminal_reason(
+                    getattr(msg, "terminal_reason", None))
+                status = sdk_lifecycle.terminal_status(
+                    terminal_reason, is_error=bool(getattr(msg, "is_error", False)))
+                if status in {"cancelled", "stopped"}:
+                    error = f"SDK result {status} ({terminal_reason})"
+                elif getattr(msg, "is_error", False):
                     subtype = getattr(msg, "subtype", None) or "error"
                     errors = getattr(msg, "errors", None) or []
                     detail = "; ".join(str(e) for e in errors)
@@ -1288,44 +1333,69 @@ async def _run_sdk_task_turn(
                 return "current_result"
             return decision
 
-        stream = _stream_for(client)
-        if stream is not None:
-            # The pooled stream pump is the client's sole SDK reader. Attach
-            # before query so the response cannot land in its orphan park.
-            queue = stream.attach_turn()
-            try:
-                await client.query(prompt)
-                while True:
-                    msg = await queue.get()
-                    if msg is _STREAM_EOF:
-                        raise (
-                            stream._failure
-                            or RuntimeError(
-                                "SDK message stream ended without "
-                                "a ResultMessage"
+        try:
+            stream = _stream_for(client)
+            if stream is not None:
+                # The pooled stream pump is the client's sole SDK reader. Attach
+                # before query so the response cannot land in its orphan park.
+                queue = stream.attach_turn()
+                try:
+                    await client.query(prompt)
+                    while True:
+                        msg = await queue.get()
+                        if msg is _STREAM_EOF:
+                            raise (
+                                stream._failure
+                                or RuntimeError(
+                                    "SDK message stream ended without "
+                                    "a ResultMessage"
+                                )
                             )
-                        )
-                    if _consume(msg) == "current_result":
+                        if await _consume(msg) == "current_result":
+                            break
+                finally:
+                    stream.detach_turn(queue)
+                    stream.park_unconsumed(queue)
+            else:
+                # Test doubles/unpooled clients have no pump, so the SDK bounded
+                # reader remains the only reader and is safe here.
+                await client.query(prompt)
+                async for msg in client.receive_response():
+                    if await _consume(msg) == "current_result":
                         break
-            finally:
-                stream.detach_turn(queue)
-                stream.park_unconsumed(queue)
-        else:
-            # Test doubles/unpooled clients have no pump, so the SDK bounded
-            # reader remains the only reader and is safe here.
-            await client.query(prompt)
-            async for msg in client.receive_response():
-                if _consume(msg) == "current_result":
-                    break
-            if not saw_result:
-                raise RuntimeError(
-                    "SDK response ended without a ResultMessage")
-    return reply_text, error
+                if not saw_result:
+                    raise RuntimeError(
+                        "SDK response ended without a ResultMessage")
+            if pending:
+                if status != "completed":
+                    # A cancelled/failed parent cannot hand off unattended work.
+                    await _terminate_scheduled_runtime(session_id, client)
+                else:
+                    watcher = _spawn_task_watcher(
+                        session_id, client, pending,
+                        origin_turn_id=activity_owner_id,
+                        drain_queue=False,
+                    )
+                    continuation = await watcher
+                    reply_text = continuation["text"] or reply_text
+                    status = continuation["status"]
+                    terminal_reason = continuation["terminal_reason"]
+                    error = continuation["error"] or None
+        except Exception:
+            # EOF/failed handoff is not a Result boundary. In particular, pins
+            # created before an SDK failure must not survive with no owner.
+            await _terminate_scheduled_runtime(session_id, client)
+            raise
+        # Do not drain from the watcher while this run still holds the runtime
+        # mutex. The scheduled drain runs after the mutex is released below.
+        if not _scheduler_closing:
+            _schedule_queue_drain(session_id)
+    return _ScheduledTurnResult(reply_text, error, status, terminal_reason)
 
 
 async def run_task_now(tid: str) -> bool:
     """Fire-and-forget out-of-schedule run. Returns True if the task exists
-    and got scheduled; False if not found. Does NOT advance next_run — this
+    and got scheduled; False if absent or shutting down. Does NOT advance next_run — this
     is a one-off, the regular schedule keeps ticking.
 
     Useful as a "retry" affordance after a failure, and as a smoke test
@@ -1338,7 +1408,7 @@ async def run_task_now(tid: str) -> bool:
 
     task = await obs.to_thread_io(
         "scheduler.task_read", tid, _read_task_for_run)
-    if not task:
+    if not task or _scheduler_closing:
         return False
     t = _track_task(
         asyncio.create_task(_execute_task(task)),
@@ -1379,6 +1449,8 @@ async def _execute_task(task: dict) -> None:
     reply_text = ""
     error: str | None = None
     cancelled = False
+    terminal_status = "completed"
+    terminal_reason = ""
     activity_owner_id = f"{tid}:{uuid.uuid4().hex}"
     from . import sessions as session_store
 
@@ -1512,12 +1584,16 @@ async def _execute_task(task: dict) -> None:
             timeout_s = env_int(
                 "MUSELAB_SCHEDULER_TIMEOUT_S", 1800, min_value=0)
             async with asyncio.timeout(timeout_s or None):
-                reply_text, error = await _run_sdk_task_turn(
+                turn_result = await _run_sdk_task_turn(
                     sid, model, task["prompt"],
                     activity_owner_id=activity_owner_id,
                     activity_source_id=tid,
                     activity_summary=task["name"],
                 )
+                reply_text, error = turn_result
+                terminal_status = getattr(
+                    turn_result, "status", "failed" if error else "completed")
+                terminal_reason = getattr(turn_result, "terminal_reason", "")
             if error:
                 sys.stderr.write(
                     f"[scheduler] task {tid} ({task['name']}) "
@@ -1553,7 +1629,11 @@ async def _execute_task(task: dict) -> None:
                 "task_name": task["name"],
                 "session_id": sid,
                 "ts": now,
-                "ok": error is None,
+                "ok": error is None and terminal_status == "completed",
+                "status": "cancelled" if cancelled else (
+                    "failed" if error and terminal_status == "completed"
+                    else terminal_status),
+                "terminal_reason": terminal_reason,
                 "error": error,
                 "reply_preview": preview if error is None else None,
             }
@@ -1611,7 +1691,8 @@ async def _execute_task(task: dict) -> None:
                         _activity.finish,
                         sid,
                         "cancelled" if (cancelled or revoked) else (
-                            "failed" if error else "completed"),
+                            "failed" if error and terminal_status == "completed"
+                            else terminal_status),
                         owner_id=activity_owner_id,
                         owned=True,
                     )
@@ -1694,7 +1775,8 @@ async def _delayed_execute(task: dict, delay: float) -> None:
     """Run _execute_task after `delay` seconds — used to stagger catch-up."""
     if delay > 0:
         await asyncio.sleep(delay)
-    await _execute_task(task)
+    if not _scheduler_closing:
+        await _execute_task(task)
 
 
 async def _scheduler_loop() -> None:
@@ -1707,6 +1789,7 @@ async def _scheduler_loop() -> None:
             now = time.time()
 
             committed_due: list[dict] = []
+            due_advances: list[tuple[dict, dict, dict]] = []
 
             def _advance_due_tasks() -> list[dict]:
                 with _STATE_LOCK:
@@ -1720,11 +1803,15 @@ async def _scheduler_loop() -> None:
                         return []
                     state_snapshot = copy.deepcopy(_state)
                     for task in due:
+                        before = {key: copy.deepcopy(task.get(key)) for key in
+                                  ("next_run", "enabled", "schedule")}
                         # Persist advancement before launch so a long-running
                         # task cannot fire twice on a later scheduler tick.
                         task["next_run"] = _compute_next_run(task["schedule"])
                         if (task.get("schedule") or {}).get("kind") == "once":
                             task["enabled"] = False
+                        after = {key: copy.deepcopy(task.get(key)) for key in before}
+                        due_advances.append((task, before, after))
                     try:
                         _save_state()
                     except Exception:
@@ -1739,23 +1826,38 @@ async def _scheduler_loop() -> None:
                     owned=True,
                 )
             except asyncio.CancelledError:
-                # owned I/O joined the commit. Preserve launch-after-commit even
-                # when shutdown arrives during fsync, then propagate cancellation.
-                due_tasks = list(committed_due)
-                for task in due_tasks:
-                    task_obj = _track_task(
-                        asyncio.create_task(_execute_task(task)),
-                        task_id=str(task.get("id") or ""),
-                        session_id=(
-                            str(task.get("session_id") or "")
-                            if _effective_session_mode(task) == "reuse"
-                            else ""
-                        ),
+                # owned I/O has joined fsync. No launch is allowed after stop
+                # closes admission; restore only untouched schedule fields so
+                # the committed trigger is recovered on restart, including once.
+                if committed_due:
+                    def _restore_unlaunched_due() -> None:
+                        with _STATE_LOCK:
+                            snapshot = copy.deepcopy(_state)
+                            for original, before, after in due_advances:
+                                current = _state["tasks"].get(original["id"])
+                                if current is None or any(
+                                    current.get(key) != value
+                                    for key, value in after.items()
+                                ):
+                                    continue  # a newer edit/revocation owns it
+                                current["next_run"] = before["next_run"]
+                                current["enabled"] = before["enabled"]
+                            try:
+                                _save_state()
+                            except Exception:
+                                _restore_state(snapshot)
+                                raise
+
+                    await obs.to_thread_io(
+                        "scheduler.restore_unlaunched_due", "scheduler",
+                        _restore_unlaunched_due, owned=True,
                     )
-                    task_obj.add_done_callback(
-                        _make_task_done(task.get("id", "?")))
                 raise
             for task in due_tasks:
+                # No await separates this gate from registration. stop sets
+                # the gate before waiting for the tick owner.
+                if _scheduler_closing:
+                    break
                 task_obj = _track_task(
                     asyncio.create_task(_execute_task(task)),
                     task_id=str(task.get("id") or ""),
@@ -1768,10 +1870,17 @@ async def _scheduler_loop() -> None:
                 task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
         except Exception as e:
             sys.stderr.write(f"[scheduler] loop error: {e}\n")
+            if _scheduler_closing:
+                raise  # rollback I/O failure must not swallow shutdown
         await asyncio.sleep(60)
 
 
 async def start_scheduler() -> None:
+    async with _scheduler_lifecycle_lock:
+        await _start_scheduler()
+
+
+async def _start_scheduler() -> None:
     """Idempotent — main.py startup awaits this. Loads persisted state,
     fires any task whose previous window was missed while muselab was
     down (one catch-up run per task — not N for multi-day outages, to
@@ -1782,9 +1891,10 @@ async def start_scheduler() -> None:
     was offline at 09:00, restarting at 09:30 fires the task once
     immediately and schedules the next one for tomorrow 09:00 — instead
     of silently skipping today as the old code did."""
-    global _scheduler_task
+    global _scheduler_task, _scheduler_closing
     if _scheduler_task and not _scheduler_task.done():
         return
+    _scheduler_closing = False
     now = time.time()
     missed: list[dict] = []
     # Cap catch-up window at 24 h. Without this, a task whose next_run
@@ -1879,20 +1989,26 @@ async def start_scheduler() -> None:
 
 
 async def stop_scheduler() -> None:
-    """Stop the tick loop and every scheduled execution owned by this process."""
-    global _scheduler_task
-
-    with _RUN_REGISTRY_LOCK:
-        tracked = tuple(_RUN_TASKS)
-    tasks = [task for task in (_scheduler_task, *tracked)
-             if task is not None and not task.done()]
-    _scheduler_task = None
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    with _RUN_REGISTRY_LOCK:
-        _RUN_TASKS.clear()
-        _RUN_TASK_IDS.clear()
-        _RUN_SESSION_IDS.clear()
-        _RUN_ACTIVITY_STARTED.clear()
+    """Close admission, join the tick, then cancel every remaining run owner."""
+    global _scheduler_task, _scheduler_closing
+    async with _scheduler_lifecycle_lock:
+        _scheduler_closing = True
+        tick = _scheduler_task
+        _scheduler_task = None
+        if tick is not None and not tick.done():
+            tick.cancel()
+            await asyncio.gather(tick, return_exceptions=True)
+        # The tick can no longer register work after this snapshot. Manual
+        # run-now also rechecks the closing gate after its asynchronous read.
+        with _RUN_REGISTRY_LOCK:
+            tasks = tuple(_RUN_TASKS)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Do not silently discard any live owner if a future launch path is
+        # added without the admission guard.
+        for task in tasks:
+            if task.done():
+                _forget_tracked_task(task)

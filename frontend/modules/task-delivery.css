@@ -1,0 +1,31 @@
+.task-delivery-overlay{position:fixed;inset:0;z-index:1600;background:#0006;display:flex;justify-content:flex-end}
+.task-delivery-panel{width:min(760px,100vw);height:100%;overflow:auto;background:var(--c-bg-1);color:var(--c-fg-1);padding:20px;box-sizing:border-box;box-shadow:-8px 0 30px #0003}
+.task-delivery-panel>header{display:flex;align-items:center;gap:12px;position:sticky;top:-20px;background:var(--c-bg-1);padding:14px 0;z-index:1}
+.task-delivery-panel h2{font-size:18px;flex:1;margin:0}
+.task-delivery-panel h3{font-size:15px;margin:0 0 10px}
+.task-delivery-panel section section{border-top:1px solid var(--c-border);padding:18px 0}
+.delivery-content>section{border-top:1px solid var(--c-border);padding:18px 0}
+.task-delivery-panel p,.task-delivery-panel li{font-size:13px;line-height:1.6}
+.task-delivery-panel button,.task-delivery-panel select{border:1px solid var(--c-border-strong);border-radius:6px;padding:6px 9px;background:var(--c-bg-1);color:inherit;cursor:pointer}
+.task-delivery-panel button:disabled{opacity:.5;cursor:default}
+.delivery-environment dl{display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px;font-size:13px}
+.delivery-environment dd{margin:0;overflow-wrap:anywhere}
+.delivery-turn-picker{display:flex;align-items:center;gap:12px}
+.delivery-turn-picker select{min-width:0;max-width:100%}
+.delivery-item{display:flex;gap:10px;justify-content:space-between;align-items:center;margin:8px 0;font-size:13px}
+.delivery-item button:first-child{overflow-wrap:anywhere;min-width:0;text-align:left}
+.delivery-command{padding:10px 0;border-bottom:1px solid var(--c-border)}
+.delivery-command code{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
+.delivery-command>div{display:flex;gap:6px;align-items:center;font-size:12px;margin-top:8px}
+.delivery-command button{margin-left:auto}
+.delivery-diff{font-size:12px;overflow:auto;max-height:400px;padding:12px;background:var(--c-bg-2)}
+.delivery-error{color:var(--c-danger-hover);overflow-wrap:anywhere}
+.delivery-warning{color:var(--c-warn)}
+.delivery-restore-preview{border:1px solid #c89632!important;border-radius:8px;padding:16px!important}
+.delivery-restore-preview label{display:flex;gap:8px;font-size:13px;line-height:1.6}
+.delivery-restore-button{font-weight:600}
+@media(max-width:600px){.task-delivery-panel{padding:14px}
+.task-delivery-panel>header{top:-14px}
+.delivery-environment dl{grid-template-columns:85px minmax(0,1fr)}
+.delivery-command>div{flex-wrap:wrap}
+}

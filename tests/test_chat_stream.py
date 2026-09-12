@@ -99,7 +99,7 @@ def stream_env(app_module, monkeypatch):
 
 def test_mem0_never_rewrites_canonical_user_query(
         stream_env, client, monkeypatch):
-    """Recall is an SDK hook; client.query must receive only user-authored text."""
+    """Preparing recall must leave the canonical user prompt untouched."""
     chat_mod = stream_env
     sid = _make_session(client)
     messages = [ResultMessage(
@@ -112,17 +112,24 @@ def test_mem0_never_rewrites_canonical_user_query(
     async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
-    async def must_not_search_here(*args, **kwargs):
-        raise AssertionError("recall must run in UserPromptSubmit hook")
+    recalled = []
+
+    async def recall_before_query(query, session_id):
+        assert fake.queried == []
+        recalled.append((query, session_id))
+        return "synthetic memory"
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
-    monkeypatch.setattr(chat_mod.mem0, "search_context", must_not_search_here)
+    monkeypatch.setattr(chat_mod.mem0, "enabled", lambda: True)
+    monkeypatch.setattr(chat_mod.mem0, "search_context", recall_before_query)
     prompt = "the exact user-authored prompt"
     response = client.get(
         f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
         f"&prompt={prompt}&model=claude-sonnet-4-6")
     assert response.status_code == 200
     assert fake.queried == [prompt]
+    assert recalled == [(prompt, sid)]
+    assert sid not in chat_mod.mem0._prepared_recalls
     done = next(
         json.loads(data)
         for event, data in _parse_sse(response.text)
@@ -1278,6 +1285,14 @@ def test_activity_finishes_before_background_continuation_settles(
         watcher_attached = asyncio.Event()
         release_watcher = asyncio.Event()
         activity_transitions = []
+        boundary_threads = []
+        original_boundary = chat_mod.sess.set_runtime_background_boundary
+
+        def capture_boundary(*args):
+            boundary_threads.append(threading.get_ident())
+            return original_boundary(*args)
+
+        monkeypatch.setattr(chat_mod.sess, "set_runtime_background_boundary", capture_boundary)
 
         started = TaskStartedMessage(
             subtype="task_started", data={}, task_id="task_deferred",
@@ -1350,6 +1365,8 @@ def test_activity_finishes_before_background_continuation_settles(
         assert chat_mod._sessions_with_inflight_tasks[sid] == {
             "task_deferred",
         }
+        assert boundary_threads
+        assert threading.get_ident() not in boundary_threads
         await asyncio.wait_for(broadcast.task, timeout=1)
         watcher = chat_mod._task_watchers[sid]
         release_watcher.set()
@@ -2251,6 +2268,9 @@ class _FakeWatchClient:
     def __init__(self, messages):
         self._messages = messages
 
+    async def disconnect(self):
+        pass
+
     async def receive_messages(self):
         for m in self._messages:
             yield m
@@ -2268,6 +2288,9 @@ class _BatchedWatchClient:
         self._batches = list(batches)
         self.queries = []
         self._receive_count = 0
+
+    async def disconnect(self):
+        pass
 
     async def query(self, prompt_or_gen):
         items = []
@@ -3186,6 +3209,9 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
     )
 
     class _PartialClient:
+        async def disconnect(self):
+            pass
+
         async def receive_messages(self):
             yield notification
             yield partial
@@ -4116,6 +4142,7 @@ def test_turn_does_not_consume_buffered_continuation(stream_env):
     async def exercise():
         stream = chat_mod._SessionStream.__new__(chat_mod._SessionStream)
         # Build the routing state directly; a real pump needs a live CLI.
+        stream.key = ("buffered-continuation", "model", "auto", "")
         stream._turn = None
         stream._background = None
         stream._orphans = collections.deque(maxlen=8)
@@ -4242,6 +4269,8 @@ def test_replay_corruption_is_typed_and_subscriber_resyncs_once(
     chat_mod = stream_env
     monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
     spool = chat_mod._ReplaySpool()
+    # Corrupt an accepted record, not bytes outside the committed replay prefix.
+    spool.append({"event": "done", "data": "{}"})
     spool.path.write_bytes(b'{"event":"done","data":7}\n')
     try:
         with pytest.raises(chat_mod._ReplayRecordCorruption):
@@ -6823,6 +6852,9 @@ def test_watcher_timeout_waits_for_terminal_stop_before_queue_drain(
             self.stop_requested = asyncio.Event()
             self.release_terminal = asyncio.Event()
 
+        async def disconnect(self):
+            pass
+
         async def stop_task(self, requested):
             self.stop_calls.append(requested)
             self.stop_requested.set()
@@ -7042,7 +7074,12 @@ def test_native_cron_tools_update_live_schedule_state(stream_env):
             "scheduled_active": True,
             "scheduled_count": 1,
         }
-        assert chat_mod._sdk_cron_jobs[sid] == {
+        row = chat_mod._sdk_cron_jobs[sid]["93d1bb35"]
+        assert row["runtime_state"] == "active"
+        assert row["model"] == key[1]
+        assert {"93d1bb35": {field: row[field] for field in (
+            "cron", "recurring", "durable", "prompt", "prompt_sha256", "prompt_truncated",
+        )}} == {
             "93d1bb35": {
                 "cron": "7 * * * *",
                 "recurring": True,
@@ -8633,3 +8670,101 @@ async def test_shutdown_timeout_records_cleanup_intent_for_slow_prepare(
     assert aid not in chat._staged_attachment_claims
     chat._drain_attachment_cleanup_intents()
     assert not intent_path.exists()
+
+
+def test_native_recall_hook_receipt_reaches_sse_done(
+        stream_env, client, monkeypatch, tmp_path):
+    from backend import memory_engine as module
+    from tests.test_memory_engine import _config
+    chat_mod = stream_env
+    sid = _make_session(client)
+    instance = module.MemoryEngine(module.MemoryStore(tmp_path / "recall.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    memory = instance.store.create_memory(
+        "default", "preference", "晚餐喜欢清淡饮食", authority="confirmed", confidence=1)
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(chat_mod.mem0, "native_enabled", lambda: True)
+    events = []
+    monkeypatch.setattr(module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    monkeypatch.setattr(chat_mod.mem0, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    class Embedding:
+        def __init__(self, config):
+            pass
+
+        async def embed(self, texts):
+            return [[1., 0., 0.]]
+
+    class Vector:
+        async def search(self, *args, **kwargs):
+            return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(module, "EmbeddingProvider", Embedding)
+    monkeypatch.setattr(module, "vector_store", lambda config: Vector())
+    receipt = {}
+
+    class HookClient(_FakeStreamClient):
+        async def query(self, prompt_or_gen):
+            await super().query(prompt_or_gen)
+            response = await chat_mod.mem0.build_recall_hook(sid, prepared_only=True)(
+                {"prompt": prompt_or_gen}, None, None)
+            assert "晚餐喜欢清淡饮食" in response["hookSpecificOutput"]["additionalContext"]
+            receipt.update(instance._recall_trace[sid])
+
+    async def fake_get_client(*args, **kwargs):
+        return HookClient([
+            AssistantMessage(content=[TextBlock(text="建议晚餐少油少盐。")],
+                             model="claude-sonnet-4-6", usage={}),
+            ResultMessage(subtype="success", duration_ms=20, duration_api_ms=10,
+                          is_error=False, num_turns=1, session_id=sid,
+                          total_cost_usd=0., usage={}),
+        ])
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=dinner&model=claude-sonnet-4-6")
+    assert response.status_code == 200
+    done = next(json.loads(data) for event, data in _parse_sse(response.text)
+                if event == "done")
+    assert done["memory_recall"] == receipt
+    assert receipt["count"] == 1 and receipt["injected"] is True
+    finish = next(fields for event, fields in events if event == "memory.recall_finish")
+    assert finish["recall_id"] == receipt["id"] and finish["count"] == 1
+    persisted = chat_mod._persistable_memory_recall(receipt)
+    assert persisted["injected"] is True
+    assert "content" not in str(persisted)
+    asyncio.run(instance.stop())
+
+
+@pytest.mark.asyncio
+async def test_stop_during_recall_never_submits_query(stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    fake = _FakeStreamClient([])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    async def slow_recall(*_args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod.mem0, "enabled", lambda: True)
+    monkeypatch.setattr(chat_mod.mem0, "search_context", slow_recall)
+    broadcast = await chat_mod._start_turn(sid, "synthetic prompt", model="claude-sonnet-4-6")
+    await asyncio.wait_for(entered.wait(), 2)
+    assert fake.queried == []
+    broadcast.cancelled = True
+    async with asyncio.timeout(2):
+        while not broadcast.done:
+            await asyncio.sleep(.01)
+    assert cancelled.is_set()
+    assert fake.queried == []
+    assert sid not in chat_mod.mem0._prepared_recalls

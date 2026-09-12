@@ -3077,7 +3077,8 @@ def test_reconcile_budget_reports_partial_without_inventing_deletes(
         report=report,
     )
 
-    assert report == {
+    assert {key: report[key] for key in ("partial", "partial_reason", "scanned_files",
+                                       "snapshot_files", "resumed", "scan_ms")} == {
         "partial": True,
         "partial_reason": "file_limit",
         "scanned_files": 1,
@@ -3361,3 +3362,123 @@ def test_slow_subscriber_is_collapsed_to_resync(
         ),
     ]
     assert str(temp_root) not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_scan_exchange_deadline_releases_shared_worker(app_module, temp_root, monkeypatch):
+    import backend.file_events as file_events
+
+    class Store:
+        def close(self):
+            pass
+
+    manager = file_events.FileWatchManager(Store())
+    state = file_events._WatchState(root=temp_root, workspace_id="scan-timeout")
+    entered = threading.Event()
+
+    def blocked_exchange(_request):
+        entered.set()
+        manager._scan_cancel.wait(2)
+        return ("error", "WorkspaceScanCancelled", "cancelled", {})
+
+    monkeypatch.setattr(file_events, "_SCAN_EXCHANGE_TIMEOUT_S", .05, raising=False)
+    monkeypatch.setattr(manager, "_ensure_scan_worker_locked", lambda: None)
+    monkeypatch.setattr(manager, "_exchange_scan_request", blocked_exchange)
+    guard = threading.Timer(.8, manager._scan_cancel.set)
+    guard.start()
+    try:
+        with pytest.raises(file_events.WorkspaceScanIncomplete, match="deadline"):
+            await manager._scan_workspace(state)
+        assert entered.is_set()
+        assert not manager._scan_worker_lock.locked()
+        monkeypatch.setattr(manager, "_exchange_scan_request", lambda _request: ("ok", [], {}, {}))
+        assert await manager._scan_workspace(state) == ([], {})
+    finally:
+        guard.cancel()
+        manager._scan_cancel.set()
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_continuous_watcher_mutations_back_off_instead_of_rescanning_forever(
+    app_module, temp_root, monkeypatch,
+):
+    import backend.file_events as module
+
+    class Store:
+        def current_cursor(self, workspace_id):
+            return 0
+
+        def apply_reconcile_snapshot(self, *args, **kwargs):
+            raise AssertionError("invalidated snapshot must not replace the index")
+
+        def close(self):
+            pass
+
+    manager = module.FileWatchManager(Store())
+    state = module._WatchState(root=temp_root, workspace_id="busy-fixture", initialized=True)
+    scans = 0
+
+    async def scan(current):
+        nonlocal scans
+        scans += 1
+        current.native_mutation_revision += 1
+        current.scan_progress["fixture"] = "must be discarded"
+        if scans > 3:
+            pytest.fail("reconcile kept scanning despite continuous invalidation")
+        return [], {}
+
+    monkeypatch.setattr(manager, "_scan_workspace", scan)
+    try:
+        with pytest.raises(module.WorkspaceScanIncomplete):
+            await manager._reconcile_and_broadcast(state)
+        assert scans == 3
+        assert not state.scan_progress
+        assert state.initialized and state.reconcile_retry_at > module.monotonic()
+        assert state.reconcile_failures == 1
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_slow_reconcile_does_not_hold_global_query_lock(app_module, temp_root, monkeypatch):
+    from backend import file_events
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+    store = WorkspaceStore(temp_root)
+    entry = registry.entry_for(temp_root)
+    store.reconcile(entry.id, temp_root, entry.name)
+    manager = file_events.FileWatchManager(store)
+    state = await manager.ensure_workspace(temp_root)
+    entered, release = threading.Event(), threading.Event()
+    original = store.apply_reconcile_snapshot
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+    async def scan(_state):
+        return [], {}
+    monkeypatch.setattr(store, 'apply_reconcile_snapshot', blocked)
+    monkeypatch.setattr(manager, '_scan_workspace', scan)
+    task = asyncio.create_task(manager._reconcile_and_broadcast(state))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        # The prior code waited on the manager lock until the writer finished.
+        assert await asyncio.wait_for(manager.ensure_workspace(temp_root), .3) is state
+        payload = await asyncio.wait_for(manager.delta(temp_root, 0), .3)
+        assert 'cursor' in payload
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await manager.shutdown()
+
+
+def test_workspace_connection_context_closes_handle(app_module, temp_root):
+    import sqlite3
+    from backend.workspace_store import WorkspaceStore
+    store = WorkspaceStore(temp_root)
+    store.initialize()
+    with store._connect() as connection:
+        assert connection.execute('SELECT 1').fetchone()[0] == 1
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        connection.execute('SELECT 1')

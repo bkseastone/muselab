@@ -14,11 +14,7 @@ test-serial:
 lint:
 	uv run ruff check backend tests
 	bash scripts/lint.sh
-	node --check frontend/app.js
-	node --check frontend/i18n/index.js
-	node --check frontend/data/constants.js
-	node --check frontend/modules/file-capabilities.mjs
-	node --check frontend/modules/persistent-cache.mjs
+	bash scripts/check-frontend.sh
 
 fmt:
 	@echo "no formatter configured yet; consider adding ruff later"

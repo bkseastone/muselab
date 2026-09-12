@@ -31,6 +31,42 @@ _SAFE_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_EVENT_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _T = TypeVar("_T")
+_perf_writer = None
+
+
+def start_diagnostics() -> None:
+    global _perf_writer
+    from .diagnostic_worker import DiagnosticWorker
+    if _perf_writer is None:
+        _perf_writer = DiagnosticWorker("muselab-perf")
+
+
+def stop_diagnostics() -> None:
+    global _perf_writer
+    writer, _perf_writer = _perf_writer, None
+    if writer is not None:
+        writer.close()
+
+
+def _write_line(line: str) -> None:
+    sys.stderr.write(line)
+    sys.stderr.flush()
+
+
+
+def diagnostic_line(line: str) -> None:
+    """Write a caller-sanitized diagnostic without waiting on the stderr sink.
+
+    Keep this independent of MUSELAB_PERF_LOG: operational failure summaries
+    still matter when performance logging is disabled. The lifespan starts a
+    bounded worker; synchronous startup/test callers retain immediate output.
+    Never pass provider payloads or raw exception text to this function.
+    """
+    bounded = _CONTROL_RE.sub(" ", str(line)).strip()[:2048] + "\n"
+    if _perf_writer is not None:
+        _perf_writer.submit(_write_line, bounded)
+    else:
+        _write_line(bounded)
 
 
 def perf_enabled() -> bool:
@@ -120,8 +156,11 @@ async def to_thread_io(
     file name is never retained or logged.
     """
     measured: dict[str, int] = {}
+    submitted = monotonic()
 
     def invoke() -> _T:
+        entered = monotonic()
+        measured["queue_ms"] = elapsed_ms(submitted, entered)
         size = max(0, int(file_size or 0))
         path = file_path() if callable(file_path) else file_path
         if path is not None:
@@ -157,12 +196,15 @@ async def to_thread_io(
             raise
     finally:
         duration = measured.get("duration_ms")
-        if duration is not None and is_slow(duration, threshold_ms=slow_io_ms()):
+        total = elapsed_ms(submitted)
+        if duration is not None and is_slow(total, threshold_ms=slow_io_ms()):
             perf_event(
                 "runtime.io",
                 site=site,
                 session=short_id(session_id) or "none",
                 duration_ms=duration,
+                queue_ms=measured.get("queue_ms", 0),
+                total_ms=total,
                 file_size=measured.get("file_size", 0),
             )
 
@@ -183,13 +225,16 @@ def perf_event(event: str, /, **fields: Any) -> None:
         raise ValueError(
             "sensitive or invalid performance field(s): " + ", ".join(unsafe)
         )
-    payload: dict[str, Any] = {"event": event}
+    payload: dict[str, Any] = {"event": event, "at_ms": round(time.time() * 1000)}
     for name, value in fields.items():
         if value is not None:
             payload[name] = _safe_value(value)
-    sys.stderr.write(
+    line = (
         "[perf] "
         + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         + "\n"
     )
-    sys.stderr.flush()
+    if _perf_writer is not None:
+        _perf_writer.submit(_write_line, line)
+    else:
+        _write_line(line)

@@ -1,38 +1,28 @@
 #!/usr/bin/env python3
-"""Dump the bundled CLI's live built-in tool catalog, one name per line.
+"""Print the bundled CLI catalog observed in an isolated offline probe.
 
-The CLI announces its full tool list in the `init` SystemMessage of every
-session — that IS the programmatic catalog. This probe spins up a throwaway
-1-turn session in /tmp, captures that list, filters MCP tools
-(muselab-injected, not CLI-bundled), and prints it sorted — ready to diff
-against docs/tool-catalog.txt:
-
-    .venv/bin/python scripts/dump-tool-catalog.py | diff docs/tool-catalog.txt -
-
-Run on every SDK bump (checklist item 1). A new line on the right that is
-harness-only (plan-mode / cron / worktree / notification primitives with no
-muselab UI) belongs in `disallowed_tools` in backend/chat.py; a useful tool
-(new editor/search verb) should be left exposed and noted in the bump PR.
+The probe uses a localhost model fixture and disposable files. It never loads
+provider credentials or sends a real model request. The init catalog depends
+on CLI settings and environment; this snapshot is not a universal tool list.
+Run after an SDK bump and review differences against docs/tool-catalog.txt.
 """
+import json
+from pathlib import Path
+import subprocess
 import sys
 
-import anyio
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SystemMessage
-
-
-async def main() -> None:
-    opts = ClaudeAgentOptions(cwd="/tmp", max_turns=1)
-    async with ClaudeSDKClient(options=opts) as client:
-        await client.query("hi")
-        async for msg in client.receive_response():
-            if (isinstance(msg, SystemMessage)
-                    and getattr(msg, "subtype", "") == "init"):
-                tools = (getattr(msg, "data", None) or {}).get("tools") or []
-                for name in sorted(t for t in tools
-                                   if not t.startswith("mcp__")):
-                    print(name)
-                return
-        sys.exit("no init SystemMessage received — CLI broken?")
-
-
-anyio.run(main)
+probe = Path(__file__).with_name("probe-checkpoint-offline.py")
+result = subprocess.run(
+    [sys.executable, str(probe), "--all-tools"],
+    capture_output=True, text=True, timeout=90,
+)
+if result.returncode:
+    sys.exit("isolated CLI capability probe failed; run the probe directly for its safe status")
+try:
+    report = json.loads(result.stdout)
+    assert report["localhost_only_model"] and report["sdk_result_ok"]
+    names = report["builtin_tools"]
+    assert isinstance(names, list) and all(isinstance(name, str) for name in names)
+except (ValueError, KeyError, AssertionError):
+    sys.exit("isolated CLI capability probe returned an invalid report")
+print("\n".join(sorted(name for name in names if not name.startswith("mcp__"))))

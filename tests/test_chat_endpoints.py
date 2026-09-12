@@ -459,6 +459,7 @@ def test_native_cron_jobs_have_authenticated_read_only_inspector(
         assert payload == {
             "session_id": sid,
             "runtime_owned": True,
+            "scheduled_active": True,
             "count": 1,
             "tasks": [{
                 "job_id": "job-a",
@@ -540,7 +541,7 @@ def test_interrupt_rejects_stale_turn_before_touching_client_or_queue(
 
 
 @pytest.mark.asyncio
-async def test_interrupt_rechecks_exact_owner_after_queue_pause(
+async def test_interrupt_rechecks_exact_owner_after_admission_lock(
         chat_mod, monkeypatch):
     sid = "sid-stop-owner-race"
     sdk_client = _seed(
@@ -548,26 +549,20 @@ async def test_interrupt_rechecks_exact_owner_after_queue_pause(
     old = chat_mod.TurnBroadcast(sid)
     replacement = chat_mod.TurnBroadcast(sid)
     chat_mod._active_turns[sid] = old
-    pause_entered = threading.Event()
-    release_pause = threading.Event()
-
-    def blocked_pause(_sid):
-        pause_entered.set()
-        assert release_pause.wait(1)
-        return {"items": [], "paused": False}
-
-    monkeypatch.setattr(
-        chat_mod.sess, "pause_queue_if_nonempty", blocked_pause)
+    admission_lock = asyncio.Lock()
+    await admission_lock.acquire()
+    monkeypatch.setattr(chat_mod, "_lock", admission_lock)
     try:
         stop_task = asyncio.create_task(
             chat_mod.interrupt(sid, turn_id=old.turn_id))
-        assert await asyncio.to_thread(pause_entered.wait, 1)
+        await asyncio.sleep(0)
+        assert not stop_task.done()
 
         # Model the old pump finishing and a successor taking the same session
-        # while the queue pause is in flight. The delayed Stop belongs only to
+        # while admission is locked. The delayed Stop belongs only to
         # `old`; its pooled runtime snapshot must never reach `replacement`.
         chat_mod._active_turns[sid] = replacement
-        release_pause.set()
+        admission_lock.release()
         response = await asyncio.wait_for(stop_task, timeout=1)
 
         assert response["stale"] is True
@@ -577,7 +572,8 @@ async def test_interrupt_rechecks_exact_owner_after_queue_pause(
         assert replacement.cancelled is False
         assert (sid, old.turn_id) not in chat_mod._pending_interrupts
     finally:
-        release_pause.set()
+        if admission_lock.locked():
+            admission_lock.release()
         chat_mod._active_turns.pop(sid, None)
         old.close()
         replacement.close()
@@ -798,7 +794,8 @@ async def test_request_cancel_during_activity_start_releases_queue_claim(
     queue = chat_mod.sess.get_queue(sid)
     assert sid not in chat_mod._active_turns
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "cancelled"
     assert [item["id"] for item in queue["items"]] == [queued["id"]]
     assert transitions == [
         ("start", sid, "queued startup", "queued"),
@@ -926,10 +923,8 @@ async def test_second_cancel_during_snapshot_still_finishes_startup_cleanup(
     recent.close()
 
 
-def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
-    """The current turn may finish while interrupt() awaits the SDK. Queue
-    state must already be paused then, otherwise its finally block can dequeue
-    and start the next turn after the user pressed Stop."""
+def test_interrupt_leaves_unrelated_queued_input_runnable(chat_mod, client):
+    """Stop is not a mutation of the remaining queue."""
     from backend import sessions as sess
 
     sid = "sid-queued-stop"
@@ -946,7 +941,7 @@ def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
         f"/api/chat/interrupt?session_id={sid}&token={TEST_TOKEN}")
 
     assert response.status_code == 200, response.text
-    assert observed and observed[0]["paused"] is True
+    assert observed and observed[0]["paused"] is False
     assert observed[0]["items"][0]["text"] == "do not auto-run"
 
 
@@ -1498,7 +1493,7 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod, monkeypatch):
     monkeypatch.setattr(
         chat_mod.sess, "release_queue_claim",
         lambda got_sid, item_id, **kwargs: queue_releases.append(
-            (got_sid, item_id, kwargs.get("turn_id"), kwargs.get("pause"))) or True,
+            (got_sid, item_id, kwargs.get("turn_id"), kwargs.get("issue"))) or True,
     )
     monkeypatch.setattr(
         chat_mod.sess, "pause_queue_if_nonempty", queue_pauses.append)
@@ -1518,8 +1513,8 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod, monkeypatch):
         assert bc.cancelled is True
         assert bc.done is True                    # subscribers get the sentinel
         assert activity_finishes == [(sid, bc.turn_id, "cancelled")]
-        assert queue_releases == [(sid, "q-stuck", bc.turn_id, True)]
-        assert queue_pauses == [sid]
+        assert queue_releases == [(sid, "q-stuck", bc.turn_id, "cancelled")]
+        assert queue_pauses == []
         assert memory_clears == [sid]
         assert remembered == [(sid, bc.turn_id)]
     finally:
@@ -1775,6 +1770,12 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
     fake = _FakeCompactClient(result, totals=(190_000,))
 
     observed = {}
+    retired = []
+    metrics = []
+    async def disconnect(sid):
+        retired.append(sid)
+    monkeypatch.setattr(chat_mod, "disconnect_client", disconnect)
+    monkeypatch.setattr(chat_mod.obs, "perf_event", lambda event, **fields: metrics.append((event, fields)))
 
     async def fake_get_client(*args, **kwargs):
         observed["permission"] = args[2] if len(args) > 2 else kwargs.get("permission")
@@ -1798,6 +1799,12 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
     assert "context window" in r.json()["detail"]
     assert fake.queries == ["/compact"]
     assert observed["permission"] == "default"
+
+    assert retired == [sid]
+    diagnostic = next(fields for event, fields in metrics if event == "chat.compact")
+    assert diagnostic["status_code"] == 409 and diagnostic["after_count"] == 0
+    assert len(diagnostic["reason_fp"]) == 24
+    assert "Your input exceeds" not in str(metrics)
 
 
 def test_native_compact_rejects_active_turn(chat_mod, client, monkeypatch):
@@ -1961,7 +1968,7 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["activity_hidden"] is True
     assert body["runtime_profile"] == "side_question"
     assert body["cwd"] == source.json()["cwd"]
-    assert activity_inherits == [(sid, new_sid, {})]
+    assert activity_inherits == [(sid, new_sid, {"activity_hidden": True})]
 
 
 def test_fork_activity_inheritance_failure_removes_provisional_child(
@@ -3202,3 +3209,74 @@ async def test_force_stop_finalizes_attachments_for_every_owner_state(
         with chat_mod._image_store_lock:
             chat_mod._image_store.pop(aid, None)
             chat_mod._staged_attachment_claims.pop(aid, None)
+
+
+@pytest.mark.parametrize("hidden,grouped", [(False, False), (False, True), (True, False)])
+def test_fork_activity_is_published_only_when_child_is_openable(
+    chat_mod, client, monkeypatch, hidden, grouped,
+):
+    from backend.activity import ActivityService, activity
+
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    source = client.post("/api/chat/sessions", headers=headers,
+                         json={"name": "fork activity source"}).json()
+    source_row = activity.start(source["id"], summary="source background work", owner_id="source-owner")
+    if grouped:
+        group = activity.create_group("Fork fixtures", "green")["group"]
+        activity.set_group(source_row["id"], group["id"])
+    source_before = activity._latest(source["id"]).copy()
+    child_sid = "25252525-3636-4789-89ab-898989898989"
+    monkeypatch.setattr(chat_mod, "sdk_fork_session",
+                        lambda *args, **kwargs: SimpleNamespace(session_id=child_sid))
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda sid: {})
+    updates = []
+    real_publish = activity._publish_locked
+
+    def inspect_publish(**kwargs):
+        item = kwargs.get("item")
+        if item and item.get("session_id") == child_sid:
+            assert child_sid in {row["id"] for row in chat_mod.sess.list_sessions()}
+            assert chat_mod.sess.get_session_meta(child_sid)["runtime_shadow"] is False
+            updates.append(dict(item))
+        return real_publish(**kwargs)
+
+    monkeypatch.setattr(activity, "_publish_locked", inspect_publish)
+    response = client.post(f"/api/chat/sessions/{source['id']}/fork", headers=headers,
+                           json={"activity_hidden": hidden})
+    assert response.status_code == 200, response.text
+    assert activity._latest(source["id"]) == source_before
+    events = client.get("/api/activity?limit=500", headers=headers).json()["events"]
+    children = [row for row in events if row["session_id"] == child_sid]
+    if hidden:
+        assert children == updates == []
+        return
+    assert len(children) == len(updates) == 1
+    child = children[0]
+    assert child["turn_count"] == 0 and child["read"] is True
+    assert child["group_id"] == group["id"] if grouped else not child.get("group_id")
+    restarted = ActivityService(activity.path.parent.parent)
+    assert restarted._latest(child_sid) == child
+
+
+def test_failed_fork_publication_removes_activity_without_evicting_source(
+    chat_mod, client, monkeypatch,
+):
+    from backend import activity as module
+
+    activity = module.activity
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    source = client.post("/api/chat/sessions", headers=headers,
+                         json={"name": "retained source"}).json()
+    source_row = activity.start(source["id"], summary="retained activity")
+    monkeypatch.setattr(module, "_MAX_EVENTS", 1)
+    child_sid = "26262626-3737-489a-8abc-909090909090"
+    monkeypatch.setattr(chat_mod, "sdk_fork_session",
+                        lambda *args, **kwargs: SimpleNamespace(session_id=child_sid))
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda sid: {})
+    monkeypatch.setattr(chat_mod.sess, "publish_fork_child", lambda sid: False)
+    monkeypatch.setattr(chat_mod, "sdk_delete_session", lambda *args, **kwargs: None)
+    response = client.post(f"/api/chat/sessions/{source['id']}/fork", headers=headers, json={})
+    assert response.status_code == 400
+    assert chat_mod.sess.get_session_meta(child_sid) is None
+    assert activity.list() == [source_row]
+    assert json.loads(activity.path.read_text()) == [source_row]

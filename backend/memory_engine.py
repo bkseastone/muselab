@@ -10,10 +10,11 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeVar
@@ -37,6 +38,8 @@ from .memory_providers import (
     EmbeddingProvider,
     GenerationError,
     GenerationProvider,
+    generation_job_ref,
+    recall_request_budget,
     Reranker,
     vector_store,
 )
@@ -52,6 +55,7 @@ _MEMORY_KINDS = {"fact", "preference", "decision", "state", "episode", "reflecti
 # `deleted` are terminal outcomes of a governance action and are deliberately
 # not creatable.
 _MEMORY_STATUSES = {"active", "pending_review"}
+_REINDEX_BATCH_SIZE = 256
 
 
 def _unwrap_schema_response(value: object, expected_key: str) -> dict:
@@ -184,6 +188,8 @@ def classify_memory_failure(exc: BaseException) -> tuple[bool, dict[str, object]
     }
     if status is not None:
         detail["status"] = status
+    if isinstance(exc, GenerationError) and exc.reason != "unknown":
+        detail["reason"] = exc.reason
     return retryable, detail
 
 
@@ -207,15 +213,17 @@ class _MemoryStoreActor:
     spreads related operations across the shared executor, where cancellation
     and scheduling can reorder them.
 
-    This actor gives each engine one FIFO database lane. Once submitted, an
-    operation is shielded from coroutine cancellation: SQLite cannot cancel a
-    running statement safely, so the transaction is allowed to finish and the
-    next operation observes its committed state. close appends a barrier,
+    Each actor owns a FIFO database lane. Write operations are shielded from
+    coroutine cancellation; the separate read actor can discard queued reads.
+    Running writes finish their transactions before the next operation.
+    Read-only callers may install a SQLite progress handler to interrupt
+    expensive queries when their budget expires. close appends a barrier,
     drains every accepted operation, then joins the owned thread.
     """
 
-    def __init__(self, resolve_store: Callable[[], MemoryStore]):
+    def __init__(self, resolve_store: Callable[[], MemoryStore], *, cancel_pending: bool = False):
         self._resolve_store = resolve_store
+        self._cancel_pending = cancel_pending
         self._executor: ThreadPoolExecutor | None = None
         self._state_lock = threading.Lock()
         self._closed = False
@@ -243,7 +251,33 @@ class _MemoryStoreActor:
         job = self._submit(operation)
         # Cancelling the asyncio waiter must not cancel or overtake a SQLite
         # transaction already queued on the actor.
-        return await asyncio.shield(asyncio.wrap_future(job))
+        wrapped = asyncio.wrap_future(job)
+        try:
+            return await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            # shield detaches a cancelled waiter; the underlying worker still
+            # finishes and can raise (e.g. SQLite's read-budget interrupt).
+            # Retain an observer so asyncio does not report an unhandled
+            # Future with a full traceback after the HTTP request has left.
+            def observe_detached(done: asyncio.Future) -> None:
+                if done.cancelled():
+                    return
+                exc = done.exception()
+                expected_interrupt = self._cancel_pending and (
+                    isinstance(exc, TimeoutError)
+                    or (isinstance(exc, sqlite3.OperationalError)
+                        and getattr(exc, "sqlite_errorcode", None)
+                        == sqlite3.SQLITE_INTERRUPT)
+                )
+                if exc is not None and not expected_interrupt:
+                    log.warning(
+                        "memory store operation failed after caller cancellation "
+                        "exception_class=%s", type(exc).__name__)
+
+            wrapped.add_done_callback(observe_detached)
+            if self._cancel_pending:
+                job.cancel()  # A read that has not started is no longer useful.
+            raise
 
     async def close(self) -> None:
         with self._state_lock:
@@ -269,17 +303,28 @@ class _MemoryStoreActor:
         executor.shutdown(wait=True)
 
 
+class _RegistryNotInitialized(Exception):
+    """A read-only connection needs the writer to create the first schema."""
+
+
 class MemoryEngine:
     def __init__(self, store: MemoryStore | None = None):
         self._store: MemoryStore | None = store
         self._store_pinned = store is not None
         self._store_actor = _MemoryStoreActor(self._resolve_store)
+        self._recall_store: MemoryStore | None = None
+        self._recall_store_actor = _MemoryStoreActor(
+            self._resolve_recall_store, cancel_pending=True)
+        self._ui_store: MemoryStore | None = None
+        self._ui_store_actor = _MemoryStoreActor(
+            self._resolve_ui_store, cancel_pending=True)
         self._workers: set[asyncio.Task] = set()
         self._telemetry_tasks: set[asyncio.Task] = set()
         self._closing = False
         self._wake = asyncio.Event()
         self._recall_trace: dict[str, dict] = {}
         self._generation_lock = asyncio.Lock()
+        self._vector_mutation_lock = asyncio.Lock()
         self._last_idle_sweep = 0.0
 
     @property
@@ -297,6 +342,65 @@ class MemoryEngine:
                 not self._store_pinned and self._store.path != path):
             self._store = MemoryStore(path)
         return self._store
+
+    def _resolve_recall_store(self) -> MemoryStore:
+        path = self._store.path if self._store_pinned else database_path()
+        if self._recall_store is None or self._recall_store.path != path:
+            self._recall_store = MemoryStore(path, read_only=True)
+        return self._recall_store
+
+    def _resolve_ui_store(self) -> MemoryStore:
+        path = self._store.path if self._store_pinned else database_path()
+        if (self._store is None or self._store.path != path
+                or not path.exists()):
+            raise _RegistryNotInitialized
+        if self._ui_store is None or self._ui_store.path != path:
+            self._ui_store = MemoryStore(path, read_only=True)
+        return self._ui_store
+
+    UI_READ_TIMEOUT_S = 5.0
+
+    async def _read_store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
+        """Bound UI reads independently of both background writes and recall."""
+        deadline = time.perf_counter() + self.UI_READ_TIMEOUT_S
+
+        def read(store: MemoryStore) -> _T:
+            with store.read_budget(deadline):
+                return operation(store)
+
+        async with asyncio.timeout(self.UI_READ_TIMEOUT_S):
+            try:
+                return await self._ui_store_actor.call(read)
+            except _RegistryNotInitialized:
+                # First use with Memory disabled still needs an empty registry.
+                # Only the writer initializes schema; normal reads never join
+                # it or the shared asyncio thread pool.
+                await self._store_call(lambda store: None)
+                return await self._ui_store_actor.call(read)
+
+    async def _recall_store_call(
+        self, operation: Callable[[MemoryStore], _T], *, deadline: float | None = None,
+    ) -> _T:
+        cancelled = threading.Event()
+
+        def read(store: MemoryStore) -> _T:
+            while True:
+                with store.read_budget(deadline, cancel_event=cancelled):
+                    try:
+                        return operation(store)
+                    except sqlite3.OperationalError as exc:
+                        code = getattr(exc, "sqlite_errorcode", 0) or 0
+                        if (code & 0xff) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                            raise
+                # Short SQLite busy waits make cancellation responsive, but do
+                # not impose a second, hidden recall deadline on contention.
+                cancelled.wait(.01)
+
+        try:
+            return await self._recall_store_actor.call(read)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     async def _store_call(self, operation: Callable[[MemoryStore], _T]) -> _T:
         return await self._store_actor.call(operation)
@@ -335,6 +439,8 @@ class MemoryEngine:
     def start(self) -> None:
         self._closing = False
         self._store_actor.reopen()
+        self._recall_store_actor.reopen()
+        self._ui_store_actor.reopen()
         if (os.environ.get("MUSELAB_MEMORY_WORKER_DISABLED") == "1"
                 or not self.enabled() or self._workers):
             return
@@ -432,6 +538,8 @@ class MemoryEngine:
         await self._drain_telemetry(timeout=min(timeout, 5.0))
         if close_store:
             await self._store_actor.close()
+            await self._recall_store_actor.close()
+            await self._ui_store_actor.close()
 
     async def record_turn(self, session_id: str, model: str, user_text: str,
                           assistant_text: str, *, outcome: str = "success",
@@ -578,6 +686,9 @@ class MemoryEngine:
             failure: dict[str, object] | None = None
             attempts = int(job.get("attempts", 0)) + 1
             safe_kind = job["kind"] if job.get("kind") in _KNOWN_JOB_KINDS else "unknown"
+            job_ref = hashlib.sha256(str(job["id"]).encode()).hexdigest()[:12]
+            perf_event("memory.job_start", job_ref=job_ref, kind=safe_kind, attempt=attempts)
+            job_trace_token = generation_job_ref.set(job_ref)
             try:
                 # Owner fence. Jobs carry the owner that enqueued them; the
                 # handlers below resolve everything else from the LIVE config.
@@ -607,19 +718,29 @@ class MemoryEngine:
             except Exception as exc:
                 retryable, failure = classify_memory_failure(exc)
                 error = _failure_record(failure)
-                log.warning(
-                    "memory job failed category=%s exception_class=%s status=%s",
-                    failure["category"], failure["exception_class"],
-                    failure.get("status"),
-                )
+            finally:
+                generation_job_ref.reset(job_trace_token)
             retry_seconds = (
                 min(300.0, 2 ** attempts)
                 if error and retryable and attempts < 3 else None
             )
+            if retry_seconds is not None and failure and failure.get("reason") == "timeout":
+                # Starting another expensive CLI immediately after a timeout
+                # amplifies load on the same unavailable provider.
+                retry_seconds = min(300.0, 30.0 * (2 ** max(0, attempts - 1)))
+            outcome = "retry" if retry_seconds is not None else "failed" if error else "done"
+            if failure:
+                log.warning(
+                    "memory job outcome=%s job_ref=%s attempt=%s category=%s reason=%s status=%s",
+                    outcome, job_ref, attempts, failure["category"],
+                    failure.get("reason", "unknown"), failure.get("status"))
             await self._store_call(lambda store: store.finish_job(
                 job["id"], error=error, retry_seconds=retry_seconds))
             perf_event(
                 "memory.job",
+                job_ref=job_ref,
+                retry_seconds=retry_seconds,
+                reason=failure.get("reason") if failure else None,
                 kind=safe_kind,
                 attempt=attempts,
                 duration_ms=elapsed_ms(started),
@@ -1199,70 +1320,173 @@ class MemoryEngine:
     async def _index_memory(self, memory_id: str) -> None:
         await self._index_memories([memory_id])
 
+    @staticmethod
+    async def _join_vector_write(operation: Awaitable[_T]) -> _T:
+        """Keep the mutation fence until an already-started write finishes.
+
+        In particular, cancelling pgvector's to_thread awaiter cannot leave its
+        worker writing after a later forget has acquired the fence.
+        """
+        task = asyncio.ensure_future(operation)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
+            raise
+
     async def _index_memories(self, memory_ids: list[str]) -> None:
         cfg = self.config()
-        items = await self._store_call(lambda store: [
-            item for item in store.memories_by_ids(memory_ids)
-            if item.get("status") == "active"
-        ])
-        if not items:
-            return
-        provider = EmbeddingProvider(cfg.embedding)
-        vectors = await provider.embed([item["content"] for item in items])
-        target = vector_store(cfg.vector)
-        dimensions = len(vectors[0])
-        await target.ensure(dimensions)
-        await target.upsert_many([
-            (
-                item["id"],
-                vector,
-                {
-                    # Owner comes from the ROW, not from the live config. A job
-                    # queued before an owner change would otherwise index the
-                    # old owner's memory under the new owner_id, making it
-                    # recallable by the wrong profile — the registry row is the
-                    # source of truth.
-                    "owner_id": item["owner_id"],
-                    "status": item["status"],
-                    "kind": item["kind"],
-                    "authority": item["authority"],
-                    "confidence": item["confidence"],
-                    "updated_at": item["updated_at"],
-                },
-            )
-            for item, vector in zip(items, vectors, strict=True)
-        ])
-        await self._store_call(lambda store: store.mark_memories_indexed(
-            [item["id"] for item in items],
-            model=cfg.embedding.model,
-            dimensions=dimensions,
-        ))
+        # Old durable jobs may contain larger batches. Bound embedding memory
+        # and the duration for which governance waits on the vector write fence.
+        for start in range(0, len(memory_ids), _REINDEX_BATCH_SIZE):
+            ids = memory_ids[start:start + _REINDEX_BATCH_SIZE]
+            items = await self._store_call(lambda store: [
+                item for item in store.memories_by_ids(ids)
+                if item.get("status") == "active"
+            ])
+            if not items:
+                continue
+            vectors = await EmbeddingProvider(cfg.embedding).embed(
+                [item["content"] for item in items])
+            if len(vectors) != len(items):
+                raise ValueError("embedding provider returned an invalid response")
+            async with self._vector_mutation_lock:
+                # Embedding runs outside the fence. A forget/correct that won
+                # meanwhile must not be undone by this older content snapshot.
+                current = await self._store_call(
+                    lambda store: store.memories_by_ids([item["id"] for item in items]))
+                by_id = {item["id"]: item for item in current}
+                valid = [
+                    (by_id[item["id"]], vector)
+                    for item, vector in zip(items, vectors, strict=True)
+                    if item["id"] in by_id
+                    and by_id[item["id"]].get("status") == "active"
+                    and by_id[item["id"]]["content"] == item["content"]
+                ]
+                if not valid:
+                    continue
+                target = vector_store(cfg.vector)
+                dimensions = len(valid[0][1])
+                await self._join_vector_write(target.ensure(dimensions))
+                await self._join_vector_write(target.upsert_many([
+                    (item["id"], vector, {
+                        "owner_id": item["owner_id"],
+                        "status": item["status"],
+                        "kind": item["kind"],
+                        "authority": item["authority"],
+                        "confidence": item["confidence"],
+                        "updated_at": item["updated_at"],
+                    }) for item, vector in valid
+                ]))
+                await self._store_call(lambda store: store.mark_memories_indexed(
+                    [item["id"] for item, _vector in valid],
+                    model=cfg.embedding.model, dimensions=dimensions,
+                ))
 
     async def _unindex_memory(self, memory_id: str) -> None:
-        """Durable retry for a vector delete that failed inline.
-
-        Raising on failure is what makes it retry — finish_job backs off and
-        requeues, so the point is eventually removed instead of lingering in
-        the index after the user deleted the memory.
-        """
+        """Retry retirement under the same fence as index/governance writes."""
         cfg = self.config()
-        await vector_store(cfg.vector).delete(memory_id)
-        def mark_pending(store: MemoryStore) -> None:
-            with store._lock, store._connect() as conn:
-                conn.execute(
-                    "UPDATE memories SET embedding_state='pending' WHERE id=?",
-                    (memory_id,))
-
-        await self._store_call(mark_pending)
+        async with self._vector_mutation_lock:
+            await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
+            def mark_pending(store: MemoryStore) -> None:
+                with store._lock, store._connect() as conn:
+                    conn.execute(
+                        "UPDATE memories SET embedding_state='pending' WHERE id=?",
+                        (memory_id,))
+            await self._store_call(mark_pending)
 
     async def recall(self, query: str, session_id: str) -> list[dict]:
+        started = time.perf_counter()
         cfg = self.config()
+        timeout_ms = cfg.retrieval.soft_timeout_ms
+        deadline = started + timeout_ms / 1000 if timeout_ms else None
         query = str(query).strip()[:8000]
+        self._recall_trace.pop(session_id, None)
         if cfg.mode != "active" or not query:
             return []
-        recent = await self._store_call(lambda store: store.recent_evidence(
-            cfg.owner_id, session_id, role="user", limit=2
-        ))
+        recall_id = MemoryStore.new_recall_id()
+        perf_event("memory.recall_start", recall_id=recall_id,
+                   session=obs.short_id(session_id), timeout_ms=timeout_ms)
+        stages = {name: "skipped" for name in
+                  ("recent", "dense", "lexical", "hydrate", "rerank")}
+        result: list[dict] = []
+        cancelled = False
+        failed = False
+
+        async def stage(name, operation):
+            stage_started = time.perf_counter()
+            perf_event("memory.recall_stage_start", recall_id=recall_id, stage=name)
+            count = 0
+            try:
+                remaining = deadline - time.perf_counter() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(remaining):
+                    value = await operation()
+                stages[name] = "ok"
+                count = len(value) if isinstance(value, (list, dict)) else 0
+                return value
+            except TimeoutError:
+                stages[name] = "timeout"
+            except asyncio.CancelledError:
+                stages[name] = "cancelled"
+                raise
+            except Exception as exc:
+                stages[name] = "error"
+                _, failure = classify_memory_failure(exc)
+                log.debug("recall stage=%s category=%s exception_class=%s",
+                          name, failure["category"], failure["exception_class"])
+            finally:
+                perf_event("memory.recall_stage", recall_id=recall_id, stage=name,
+                           status=stages[name], count=count,
+                           duration_ms=round((time.perf_counter() - stage_started) * 1000, 1))
+            return []
+
+        try:
+            with recall_request_budget(deadline):
+                recent = await stage("recent", lambda: self._recall_store_call(
+                    lambda store: store.recent_evidence(
+                        cfg.owner_id, session_id, role="user", limit=2), deadline=deadline))
+                result = await self._recall_candidates(
+                    cfg, query, recent, deadline, stages, stage, recall_id)
+                return result
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            failed = True
+            raise
+        finally:
+            degraded = any(value in ("timeout", "error") for value in stages.values())
+            status = ("cancelled" if cancelled else "error" if failed else
+                      "partial" if result and degraded else
+                      "timeout" if "timeout" in stages.values() else
+                      "error" if degraded else "ok")
+            latency = (time.perf_counter() - started) * 1000
+            self._schedule_recall_telemetry(
+                recall_id=recall_id, owner_id=cfg.owner_id, session_id=session_id,
+                query=query, results=result, latency_ms=latency, status=status)
+            fields = {f"{name}_status": value for name, value in stages.items()}
+            self._recall_trace[session_id] = {
+                "id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
+                "status": status, **fields,
+                "items": [{"id": item["id"], "kind": item["kind"],
+                           "content": item["content"], "score": round(item["score"], 5),
+                           "sources": item.get("sources", [])} for item in result]}
+            perf_event("memory.recall_finish", recall_id=recall_id,
+                       session=obs.short_id(session_id) or "none",
+                       duration_ms=round(latency, 1), count=len(result),
+                       status=status, timeout_ms=timeout_ms, **fields)
+
+    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage, recall_id):
         prior = [str(item.get("content", ""))[:1000] for item in recent
                  if item.get("content")]
         # Bound what goes to the embedder. Local CPU BGE-M3 latency scales
@@ -1272,50 +1496,64 @@ class MemoryEngine:
         # recall matters most. The tail is kept because the current question
         # lives there; earlier turns only disambiguate it.
         retrieval_query = "\n".join([*prior, query])[-_RECALL_QUERY_CHARS:]
-        started = time.perf_counter()
-        deadline = started + cfg.retrieval.soft_timeout_ms / 1000
+
+        async def dependency(name, operation):
+            started = time.perf_counter()
+            status = "ok"
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                status = ("timeout" if deadline is not None
+                          and time.perf_counter() >= deadline else "cancelled")
+                raise
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                perf_event("memory.recall_dependency", recall_id=recall_id,
+                           dependency=name, status=status,
+                           duration_ms=round((time.perf_counter() - started) * 1000, 1))
 
         async def dense() -> list[dict]:
-            vector = (await EmbeddingProvider(cfg.embedding).embed([retrieval_query]))[0]
-            return await vector_store(cfg.vector).search(
-                vector, owner_id=cfg.owner_id,
-                limit=cfg.retrieval.dense_candidates)
+            vectors = await dependency("embedding", lambda: EmbeddingProvider(
+                cfg.embedding).embed([retrieval_query]))
+            return await dependency("vector", lambda: vector_store(cfg.vector).search(
+                vectors[0], owner_id=cfg.owner_id,
+                limit=cfg.retrieval.dense_candidates))
 
         async def lexical() -> list[dict]:
-            return await self._store_call(lambda store: store.lexical_search(
+            return await self._recall_store_call(lambda store: store.lexical_search(
                 cfg.owner_id, query, limit=cfg.retrieval.lexical_candidates
-            ))
+            ), deadline=search_deadline)
 
-        async def _bounded(channel):
-            """Give each channel its OWN budget against the shared deadline.
+        # Hydrate each channel as soon as it finishes. Waiting for a slow
+        # sibling first left only the final 80-200ms for otherwise healthy
+        # results, discarding every result on a loaded filesystem.
+        search_deadline = deadline
 
-            A single `asyncio.timeout` around `gather` cancels BOTH channels
-            the instant the slower one overruns, so a cold embedder (or a
-            down Qdrant) threw away the lexical hits that had already
-            returned in 5ms — hybrid recall degraded to *nothing* instead of
-            to lexical-only. Per-channel bounding keeps whichever channel
-            finished, which is the whole point of fail-soft fusion.
-            """
-            async with asyncio.timeout(max(0.001, deadline - time.perf_counter())):
-                return await channel()
+        async def retrieve(name, search):
+            rows = await stage(name, search)
+            ids = list(dict.fromkeys(
+                row.get("id") or (row.get("memory") or {}).get("id")
+                for row in rows))
+            ids = [memory_id for memory_id in ids if memory_id]
+            if not ids:
+                return rows, [], None
+            memories = await stage("hydrate", lambda: self._recall_store_call(
+                lambda store: store.memories_with_stats_by_ids(cfg.owner_id, ids),
+                deadline=deadline))
+            return rows, memories, stages["hydrate"]
 
-        status = "ok"
-        dense_rows, lexical_rows = await asyncio.gather(
-            _bounded(dense), _bounded(lexical), return_exceptions=True)
-        if isinstance(dense_rows, Exception):
-            _, failure = classify_memory_failure(dense_rows)
-            log.debug(
-                "dense recall skipped category=%s exception_class=%s status=%s",
-                failure["category"], failure["exception_class"], failure.get("status"))
-            dense_rows, status = [], (
-                "timeout" if isinstance(dense_rows, TimeoutError) else "partial")
-        if isinstance(lexical_rows, Exception):
-            _, failure = classify_memory_failure(lexical_rows)
-            log.debug(
-                "lexical recall skipped category=%s exception_class=%s status=%s",
-                failure["category"], failure["exception_class"], failure.get("status"))
-            lexical_rows, status = [], (
-                "timeout" if isinstance(lexical_rows, TimeoutError) else "partial")
+        dense_result, lexical_result = await asyncio.gather(
+            retrieve("dense", dense), retrieve("lexical", lexical))
+        dense_rows, lexical_rows = dense_result[0], lexical_result[0]
+        hydrate_states = {result[2] for result in (dense_result, lexical_result)}
+        stages["hydrate"] = ("timeout" if "timeout" in hydrate_states else
+                             "error" if "error" in hydrate_states else
+                             "ok" if "ok" in hydrate_states else "skipped")
+        memory_by_id = {memory["id"]: memory
+                        for result in (dense_result, lexical_result)
+                        for memory in result[1]}
 
         fused: dict[str, dict] = {}
         for channel_rows in (dense_rows, lexical_rows):
@@ -1330,14 +1568,6 @@ class MemoryEngine:
         candidates = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
         candidate_limit = max(cfg.retrieval.final_limit * 3, 12)
         candidate_rows = candidates[:candidate_limit]
-        memory_ids = [candidate["id"] for candidate in candidate_rows]
-        memories = await self._observed_store_call(
-            "memory.recall_hydrate",
-            session_id,
-            lambda store: store.memories_with_stats_by_ids(
-                cfg.owner_id, memory_ids),
-        )
-        memory_by_id = {memory["id"]: memory for memory in memories}
         hydrated: list[dict] = []
         for candidate in candidate_rows:
             memory = memory_by_id.get(candidate["id"])
@@ -1355,47 +1585,19 @@ class MemoryEngine:
             hydrated.append(candidate)
         hydrated.sort(key=lambda item: item["score"], reverse=True)
         if cfg.rerank.enabled and hydrated:
-            try:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    raise TimeoutError
-                async with asyncio.timeout(remaining):
-                    reranked = await Reranker(cfg.rerank).rerank(
-                        retrieval_query, [item["content"] for item in hydrated])
+            reranked = await stage("rerank", lambda: Reranker(cfg.rerank).rerank(
+                retrieval_query, [item["content"] for item in hydrated]))
+            if stages["rerank"] == "ok":
                 by_index = {index: score for index, score in reranked}
                 for index, item in enumerate(hydrated):
                     item["score"] = by_index.get(index, 0)
                     item["channels"].append("rerank")
                 hydrated.sort(key=lambda item: item["score"], reverse=True)
-            except TimeoutError:
-                status = "timeout"
-            except Exception as exc:
-                _, failure = classify_memory_failure(exc)
-                log.debug(
-                    "rerank skipped category=%s exception_class=%s status=%s",
-                    failure["category"], failure["exception_class"],
-                    failure.get("status"))
-                status = "partial"
-        result = hydrated[:cfg.retrieval.final_limit]
-        latency = (time.perf_counter() - started) * 1000
-        recall_id = MemoryStore.new_recall_id()
-        self._schedule_recall_telemetry(
-            recall_id=recall_id,
-            owner_id=cfg.owner_id,
-            session_id=session_id,
-            query=retrieval_query,
-            results=result,
-            latency_ms=latency,
-            status=status,
-        )
-        trace = {"id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
-                 "status": status,
-                 "items": [{"id": item["id"], "kind": item["kind"],
-                            "content": item["content"], "score": round(item["score"], 5),
-                            "sources": item.get("sources", [])}
-                           for item in result]}
-        self._recall_trace[session_id] = trace
-        return result
+        return hydrated[:cfg.retrieval.final_limit]
+
+    def peek_recall_trace(self, session_id: str) -> dict | None:
+        """Share the live receipt with the hook without consuming the SSE receipt."""
+        return self._recall_trace.get(session_id)
 
     def pop_recall_trace(self, session_id: str) -> dict | None:
         return self._recall_trace.pop(session_id, None)
@@ -1456,6 +1658,16 @@ class MemoryEngine:
 
     async def correct_memory(self, memory_id: str, content: str,
                              *, kind: str | None = None) -> dict:
+        async with self._vector_mutation_lock:
+            return await self._join_vector_write(
+                self._correct_memory(memory_id, content, kind=kind))
+
+    async def forget_memory(self, memory_id: str) -> bool:
+        async with self._vector_mutation_lock:
+            return await self._join_vector_write(self._forget_memory(memory_id))
+
+    async def _correct_memory(self, memory_id: str, content: str,
+                             *, kind: str | None = None) -> dict:
         cfg = self.config()
         memory = await self._store_call(
             lambda store: store.supersede_memory(
@@ -1463,7 +1675,7 @@ class MemoryEngine:
         if cfg.enabled:
             queue_unindex = False
             try:
-                await vector_store(cfg.vector).delete(memory_id)
+                await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
             except Exception as exc:
                 _, failure = classify_memory_failure(exc)
                 log.warning(
@@ -1485,7 +1697,7 @@ class MemoryEngine:
             self._wake.set()
         return memory
 
-    async def forget_memory(self, memory_id: str) -> bool:
+    async def _forget_memory(self, memory_id: str) -> bool:
         cfg = self.config()
         deleted = await self._store_call(
             lambda store: store.delete_memory(memory_id, cfg.owner_id))
@@ -1497,7 +1709,7 @@ class MemoryEngine:
             # registry, so it wouldn't surface, but the content stayed on disk
             # after the user asked for deletion). Queue a durable retry.
             try:
-                await vector_store(cfg.vector).delete(memory_id)
+                await self._join_vector_write(vector_store(cfg.vector).delete(memory_id))
             except Exception as exc:
                 _, failure = classify_memory_failure(exc)
                 log.warning(
@@ -1521,7 +1733,7 @@ class MemoryEngine:
                 **store.stats(cfg.owner_id),
             }
 
-        registry = await self._store_call(load_status)
+        registry = await self._read_store_call(load_status)
         return {
             "enabled": cfg.enabled, "mode": cfg.mode,
             "worker_running": bool(self._workers),
@@ -1529,8 +1741,14 @@ class MemoryEngine:
             **registry,
         }
 
+    def _maintenance_revision(self) -> str:
+        # Persist only a digest, never URLs, credentials or configuration.
+        return hashlib.sha256(self.config().model_dump_json().encode()).hexdigest()
+
     async def trigger_dream(self) -> str:
         cfg = self.config()
+
+        revision = self._maintenance_revision()
 
         def enqueue_dream(store: MemoryStore) -> str:
             newly_closed = store.close_idle_episodes(
@@ -1541,10 +1759,10 @@ class MemoryEngine:
                     owner_id=cfg.owner_id)
             episodes = store.list_episodes(
                 cfg.owner_id, limit=20, status="closed")
-            ids = [item["id"] for item in episodes]
+            ids = sorted(item["id"] for item in episodes)
             return store.enqueue(
                 "cross_episode_dream", {"episode_ids": ids},
-                owner_id=cfg.owner_id)
+                owner_id=cfg.owner_id, deduplicate=True, revision=revision)
 
         job_id = await self._store_call(enqueue_dream)
         self._wake.set()
@@ -1552,19 +1770,12 @@ class MemoryEngine:
 
     async def reindex_all(self) -> int:
         cfg = self.config()
-
-        def enqueue_reindex(store: MemoryStore) -> int:
-            rows = store.list_memories(
-                cfg.owner_id, limit=10_000, status="active")
-            if rows:
-                store.enqueue(
-                    "reindex_memories",
-                    {"memory_ids": [row["id"] for row in rows]},
-                    owner_id=cfg.owner_id,
-                )
-            return len(rows)
-
-        queued = await self._store_call(enqueue_reindex)
+        # A single Registry transaction enumerates every active ID by a stable
+        # cursor and commits bounded durable jobs together. No updated_at-based
+        # pagination: finishing an index job updates that column.
+        queued = await self._store_call(lambda store: store.enqueue_reindex_batches(
+            cfg.owner_id, batch_size=_REINDEX_BATCH_SIZE,
+            revision=self._maintenance_revision()))
         self._wake.set()
         return queued
 

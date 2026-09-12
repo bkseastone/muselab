@@ -2,57 +2,70 @@
 
 > [English](upgrade.md)
 
-muselab 依赖两个快速演进的上游组件 —— Claude Agent SDK 和 `claude` CLI。`scripts/upgrade.sh` 会同时升级两者、对结果做冒烟测试，并且不动你的数据。
+`bash scripts/upgrade.sh` 安装当前 MuseLab 版本已经批准的依赖组合。
+SDK 精确版本与 `uv.lock` 是有意保留的兼容边界；脚本不声称安装上游最新 SDK。
 
-## 步骤
+## 原生安装
+
+修改应用代码前，让运行中的任务完成，按[数据与备份](data-and-backup_zh.md)
+备份状态，保留本地修改并记录当前版本。仅以快进方式更新代码：
 
 ```bash
-cd ~/muselab            # 你的仓库
-git pull                # 拉取最新 muselab 代码
+cd ~/muselab
+git status --short
+git rev-parse HEAD
+git pull --ff-only
 bash scripts/upgrade.sh
 ```
 
-它做的事：
+脚本在私有的 `.venv-builds/` 候选目录中安装冻结依赖，使用临时工作区和会话
+目录运行单元／集成测试。只有通过验证的候选环境才会替换 `.venv`。安装或
+测试失败时，原环境保持不变，具体原因保存在私有日志中。
+`bash scripts/upgrade.sh --check` 只验证候选环境，不启用它。
 
-1. 升级 Python 的 `claude-agent-sdk`（`uv lock --upgrade-package …` 后 `uv sync --frozen`）。
-2. 升级 `claude` CLI（`npm install -g @anthropic-ai/claude-code@latest`）。
-3. 跑测试套件（`uv run pytest tests/ -q`）作为冒烟测试。
+SDK 捆绑的 Claude CLI 随候选环境一起安装。脚本不修改系统独立安装的
+`claude`、依赖文件、`.env` 或用户数据。维护者先同步更新 SDK／CLI pin 并
+通过兼容性检查，再发布版本；系统独立 CLI 的升级是另一项明确操作。
 
-若测试**失败**，脚本中止并回滚 Python 依赖（`git checkout uv.lock pyproject.toml && uv sync`）—— 多数情况意味着新版 SDK 改了 muselab 依赖的 API。查看打印的日志并提 issue。
+## 重启与恢复
 
-## 升级之后
-
-脚本**不会**重启服务，也不会提交 lockfile 改动 —— 它会打印出确切命令。重启以让新的 SDK/CLI 生效：
+验证后，在没有运行任务时重启确切的应用服务。标准用户级安装示例：
 
 ```bash
-# Linux（systemd --user）
+# Linux 用户服务；自定义部署可能使用不同 unit 或 scope。
 systemctl --user restart muselab
-
-# macOS（launchd）
+# macOS
 launchctl kickstart -k gui/$UID/com.muselab
 ```
 
-若你的仓库纳入了 git，检查并提交依赖升级：
+确认应用健康并重新打开页面以加载匹配的前端。脚本成功后会打印保留的旧环境
+路径。请保留 `.venv-builds/`，当前 `.venv` 会指向其中的候选环境。
+若随后出现运行时问题，先停止确切服务，保留本地修改并恢复匹配的代码版本，
+再将 `.venv` 切回保留的旧环境后重启。不要用会丢弃既有修改的命令恢复依赖文件。
+
+这套流程暂存和切换的是环境，不会回滚代码、用户文件或数据迁移。
+持久化状态见[数据与备份](data-and-backup_zh.md)。
+
+## Docker：按安装来源升级
+
+**首次升级到持久配置布局：先迁移，再替换容器。** 旧镜像把网页配置和第三方会话正文放在未挂载路径，直接 recreate 会丢失它们。先按[迁移指南](docker-state-migration_zh.md)停止准确的旧容器、导出并迁移；确认完成后再执行以下命令。迁移工具不会停止、删除或重建任何容器。
+
+使用源码构建的 `docker-compose.yml`：
 
 ```bash
-git diff uv.lock
-git add uv.lock pyproject.toml && git commit -m "chore: bump claude-agent-sdk"
+git pull --ff-only
+docker compose build --pull
+docker compose up -d
 ```
 
-## 保留的内容
-
-升级不会删除 `.env`、配置的会话元数据目录或工作区数据。重跑对应平台的安装脚本
-会保留 `.env` 已有值，仅在缺少 `MUSELAB_SESSIONS_DIR` 时补入当前 checkout 的绝对
-`sessions/` 路径。被锁定的 `claude` CLI 版本在 `scripts/versions.env`（并在
-Dockerfile 里镜像一份）；`upgrade.sh` 会把你带到最新。没有 schema 迁移步骤——
-JSON 状态文件向前兼容，少数确实存在的迁移（如 VAPID 密钥格式）在后端启动时自动执行。
-
-## Docker
-
-拉新镜像并重建容器：
+使用独立的预构建镜像配置时，需要可复现版本可在 `.env` 中将 `MUSELAB_IMAGE`
+设为具体 release 或 SHA tag：
 
 ```bash
-docker compose pull && docker compose up -d
+# .env 示例：MUSELAB_IMAGE=ghcr.io/hesorchen/muselab:sha-<revision>
+docker compose -f docker-compose.image.yml pull
+docker compose -f docker-compose.image.yml up -d
 ```
 
-宿主机工作区和 `.env` 是 bind-mount 挂载的，重建后依然保留。
+同一安装应始终使用相同的 Compose 文件、项目目录和数据挂载。替换前记录旧
+镜像 tag／digest；回退时使用旧镜像和同一组挂载。新布局的工作区、Claude 状态、会话、网页配置与第三方正文保留在宿主机挂载中。Compose 的 `.env` 是初始环境，网页修改写入 `sessions/config/.env` 并在重启时优先读取。回退到旧布局镜像时，必须保留迁移备份并按旧路径恢复，不能只切换镜像。UID／GID 兼容方式见[快速开始](quickstart_zh.md)。

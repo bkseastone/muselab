@@ -116,9 +116,9 @@ make run
 | 目标 | 命令 | 说明 |
 |------|------|------|
 | `make run` | `uv run uvicorn … --reload` | 带热重载的开发服务器 |
-| `make test` | `uv run pytest -v` | 全量测试，详细输出 |
-| `make test-fast` | `uv run pytest -x --tb=short` | 首个失败即停止 |
-| `make lint` | `uv run python -m compileall -q backend tests` | 仅语法检查；CI 使用 `ruff check` |
+| `make test` | `uv run pytest -n auto --dist=worksteal -v` | 全量测试，详细输出 |
+| `make test-fast` | `uv run pytest -n auto --dist=worksteal -x --tb=short` | 首个失败即停止 |
+| `make lint` | `ruff`＋项目 lint＋自有 JS 语法检查 | 后端、前端与编码检查 |
 
 ---
 
@@ -152,7 +152,7 @@ make run
 
 ### E2E（Playwright）
 
-`tests/e2e/` 使用 Playwright + Chromium，不包含在默认的 `pytest tests/` 中。需设置 `RUN_E2E=1` 并单独安装 Chromium。当前覆盖多标签页生命周期、文件预览、聊天渲染性能与移动端终端交互。
+`tests/e2e/` 使用 Playwright + Chromium，默认会被 `pytest tests/` 收集后跳过。需设置 `RUN_E2E=1` 并单独安装 Chromium。当前覆盖多标签页生命周期、文件预览、聊天渲染性能与移动端终端交互。
 
 ---
 
@@ -162,32 +162,25 @@ make run
 
 触发条件：推送到 `main`、版本 tag `v*.*.*`、向 `main` 发起 PR。
 
-| Job | Runner | 是否阻塞 | 内容 |
-|-----|--------|---------|------|
-| `test` | ubuntu-latest（py 3.12 + 3.13）、macos-latest（py 3.12）| 是 | `uv sync --frozen` → `pytest tests/ -v`；Linux py 3.12 上生成覆盖率报告（非阻塞，临时 `pytest-cov`）|
-| `lint` | ubuntu-latest | 是 | `ruff check backend/ tests/` + `bash scripts/lint.sh` |
-| `frontend-lint` | ubuntu-latest（Node 20）| 是 | `node --check` 检查 `app.js`、`sw.js`、`constants.js`、`i18n/index.js`；JSON 验证 `manifest.webmanifest` |
-| `security` | ubuntu-latest | 否 | 对冻结锁文件执行 `pip-audit` |
-| `e2e` | ubuntu-latest | 否 | Playwright/Chromium，通过 `pytest-rerunfailures` 重试 2 次 |
-| `docker` | ubuntu-latest | 是（push job）| PR：单架构构建，不推送。main/tag：多架构构建并推送至 `ghcr.io` |
-
-CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、`MUSELAB_ROOT=${{ github.workspace }}/.ci-workspace`。
-
-### install-test.yml
-
-路径过滤覆盖安装脚本、`pyproject.toml`、`uv.lock`、`Dockerfile`、`docker-compose.yml`。在四个 OS 镜像上端到端运行真实安装程序：
-
-| Job | Runner | 说明 |
+| Job | Runner | 内容 |
 |-----|--------|------|
-| `linux` | ubuntu-22.04、ubuntu-24.04 | `MUSELAB_NONINTERACTIVE=1 MUSELAB_SKIP_SERVICE=1 MUSELAB_NO_BROWSER=1`；轮询 `/api/health` 30 秒 |
-| `macos` | macos-13（Intel，`continue-on-error`）、macos-14（ARM，必须通过）| 任务超时 20 分钟 |
-| `docker-run` | ubuntu-latest | 本地构建，运行容器，轮询 `/api/health`，确认 Docker `HEALTHCHECK` 在 90 秒内达到 `healthy` |
+| `test` | Ubuntu Python 3.12／3.13，macOS Python 3.12 | 冻结依赖与 xdist 单元／集成测试；额外覆盖率报告为非阻塞信息 |
+| `lint` | Ubuntu | Ruff 与项目 lint |
+| `frontend-lint` | Ubuntu、Node 20 | `scripts/check-frontend.sh` 检查自有 JS／MJS 与 manifest |
+| `security` | Ubuntu | 冻结依赖的 pip-audit，失败阻塞 |
+| `e2e-core` | Ubuntu | 快速核心浏览器契约，失败阻塞 |
+| `e2e` | Ubuntu | 完整 Chromium 回归，最多重试两次，最终失败阻塞 |
+| `docker-smoke` | Ubuntu | 构建并加载单架构镜像，以隔离状态启动；检查 health、首页、静态脚本与容器 HEALTHCHECK |
+| `docker` | Ubuntu，仅 main／tag | 依赖以上全部 job 成功，再发布多架构 GHCR 镜像 |
 
-故障产物上传时明确排除 `.env`，防止 `MUSELAB_TOKEN` 泄露。
+仓库当前只有 `ci.yml`。没有额外的 `install-test.yml` 或四系统真实安装矩阵。
+容器启动检查与安装脚本的隔离测试有明确范围，不能代替每个系统上的完整安装验证。
+所有 fixture 使用合成认证信息与临时数据，不上传真实 `.env`。
 
 ### Release
 
-推送匹配 `v*.*.*` 的 git tag。`ci.yml` 中的 `docker` job 会自动将带完整语义化版本 tag 矩阵的多架构镜像发布到 `ghcr.io/hesorchen/muselab`。Changelog 和 GitHub Release 由维护者手动处理。
+推送匹配 `v*.*.*` 的 tag 可触发发布流程；`docker` 必须等待质量检查和实际容器
+启动检查通过后才会更新镜像 tag。Changelog 和 GitHub Release 仍由维护者处理。
 
 ### Dependabot
 
@@ -203,7 +196,7 @@ CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、
 
 | 包 | 约束 | 原因 |
 |----|------|------|
-| `claude-agent-sdk` | `>=0.2.120,<0.3` | 上限是刻意设置的：muselab 依赖 SDK 工具拒绝列表与 JSONL 转录格式的特定假设，跨次版本升级必须显式验证。|
+| `claude-agent-sdk` | `==0.2.152` | 精确固定：SDK、捆绑 CLI、工具策略和会话格式一起验证。|
 | `starlette` | `>=1.3.1` | 显式使用已修复安全问题的版本。|
 | `pyjwt[crypto]` | `>=2.13.0` | 固定在 mcp 传递依赖 2.12.1 之上（PYSEC-2026-175/177/178/179）。|
 
@@ -212,8 +205,10 @@ CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、
 | 命令 | 使用场景 |
 |------|---------|
 | `uv sync --frozen` | 所有安装脚本、CI、Docker 构建——确保从 `uv.lock` 精确复现 |
-| `uv lock --upgrade-package claude-agent-sdk` | `scripts/upgrade.sh`——仅升级指定包，不触动其他依赖 |
+| `uv lock --upgrade-package claude-agent-sdk` | 维护者修改 SDK 精确 pin 后的操作；普通升级使用冻结锁文件 |
 | `uv run --with <pkg>` | CI 临时工具（`pytest-cov`、`pip-audit`），不修改冻结锁文件 |
 | `uv run uvicorn …` | 开发服务器与 systemd `ExecStart` |
 
 `uv` 二进制版本固定在 Dockerfile 中，保证镜像重新构建可复现；准确版本以 `Dockerfile` 为准。
+
+新增工作台交互与验证边界见[工作台界面](workbench-ui_zh.md)和[任务交付与 SDK 兼容性](task-delivery-sdk_zh.md)。

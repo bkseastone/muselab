@@ -9,7 +9,7 @@ Thank you for considering a contribution. muselab is intentionally small
 git clone https://github.com/hesorchen/muselab && cd muselab
 uv sync                                   # install Python deps
 cp .env.example .env                      # then fill MUSELAB_TOKEN + MUSELAB_ROOT
-uv run uvicorn backend.main:app --reload  # dev server on :8765
+uv run uvicorn backend.main:app --reload --port 8765  # dev server on :8765
 make test                                 # parallel unit/integration suite
 ```
 

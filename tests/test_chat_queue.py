@@ -73,15 +73,16 @@ def test_dequeue_empty_queue_returns_none(app_module):
     assert sess.dequeue_message("s-empty") is None
 
 
-def test_dequeue_paused_returns_none(app_module):
-    """A paused queue must not yield items to the drain even if non-empty."""
+def test_explicit_pause_holds_existing_items_not_later_input(app_module):
+    """Manual holds never become a persistent session-wide send lock."""
     sess = _sess(app_module)
     sid = "s-paused"
     sess.enqueue_message(sid, "waiting")
     sess.set_queue_paused(sid, True)
     assert sess.dequeue_message(sid) is None
-    # Item still present — pause holds it, doesn't drop it.
-    assert len(sess.get_queue(sid)["items"]) == 1
+    sess.enqueue_message(sid, "new manual input")
+    assert sess.dequeue_message(sid)["text"] == "new manual input"
+    assert sess.get_queue(sid)["inflight"] is not None
 
 
 def test_release_claim_restores_to_front(app_module):
@@ -124,7 +125,7 @@ def test_bound_claim_is_not_released_by_wrong_turn(app_module):
     assert sess.ack_queue_message(sid, item["id"], "turn-other") is False
 
 
-def test_recover_bound_inflight_restores_once_but_pauses(app_module):
+def test_recover_bound_inflight_restores_once_for_item_review(app_module):
     sess = _sess(app_module)
     sid = "s-recover-inflight"
     item = sess.enqueue_message(sid, "recover once")["item"]
@@ -133,28 +134,26 @@ def test_recover_bound_inflight_restores_once_but_pauses(app_module):
     first = sess.recover_queue_inflight(sid)
     second = sess.recover_queue_inflight(sid)
     assert first["inflight"] is None
-    assert first["paused"] is True
+    assert first["paused"] is False
+    assert first["items"][0]["queue_issue"] == "delivery_unknown"
+    assert sess.claim_queue_message(sid) is None
     assert [row["id"] for row in first["items"]] == [item["id"]]
     assert [row["id"] for row in second["items"]] == [item["id"]]
 
 
-def test_recover_unbound_inflight_restores_paused_for_user_review(app_module):
+def test_recover_unbound_inflight_remains_runnable(app_module):
     sess = _sess(app_module)
     sid = "s-recover-unbound"
     item = sess.enqueue_message(sid, "safe retry")["item"]
     sess.claim_queue_message(sid)
     recovered = sess.recover_queue_inflight(sid)
-    assert recovered["paused"] is True
+    assert recovered["paused"] is False
+    assert not recovered["items"][0].get("queue_issue")
     assert [row["id"] for row in recovered["items"]] == [item["id"]]
 
 
-def test_restart_recovery_pauses_waiting_queue_without_inflight(app_module):
-    """A direct turn can die while follow-ups are still only waiting items.
-
-    There is no queue inflight record in that case, so startup recovery must
-    pause the queue itself instead of assuming the absent claim means the
-    preceding turn completed successfully.
-    """
+def test_restart_recovery_keeps_unstarted_followups_runnable(app_module):
+    """Failure of an earlier direct turn does not cancel unstarted followers."""
     sess = _sess(app_module)
     sid = "s-recover-waiting"
     item = sess.enqueue_message(sid, "review after restart")["item"]
@@ -162,7 +161,7 @@ def test_restart_recovery_pauses_waiting_queue_without_inflight(app_module):
     recovered = sess.recover_queue_inflight(sid)
 
     assert recovered["inflight"] is None
-    assert recovered["paused"] is True
+    assert recovered["paused"] is False
     assert [row["id"] for row in recovered["items"]] == [item["id"]]
 
 
@@ -324,10 +323,10 @@ def test_enqueue_never_overwrites_corrupt_queue(app_module):
 
 
 @pytest.mark.asyncio
-async def test_lifespan_recovery_never_schedules_surviving_queue(
+async def test_lifespan_recovery_schedules_unstarted_queue(
     app_module, monkeypatch,
 ):
-    """Startup exposes paused work; only the explicit Resume API may drain it."""
+    """Resume unstarted work after completing all durable startup recovery."""
     from backend import activity, chat, main, runtime_lifecycle, terminal
 
     sess = _sess(app_module)
@@ -364,8 +363,8 @@ async def test_lifespan_recovery_never_schedules_surviving_queue(
     async with main._lifespan(main.app):
         pass
 
-    assert scheduled == []
-    assert sess.get_queue(sid)["paused"] is True
+    assert scheduled == [sid]
+    assert sess.get_queue(sid)["paused"] is False
 
 
 @pytest.mark.asyncio
@@ -379,7 +378,11 @@ async def test_startup_recovery_continues_after_write_failure_then_fails_closed(
     bad_sid = "s-startup-write-fails"
     good_sid = "s-startup-still-recovers"
     sess.enqueue_message(bad_sid, "must not disappear")
-    sess.enqueue_message(good_sid, "must still be paused")
+    sess.enqueue_message(good_sid, "must still be recovered")
+    for sid in (bad_sid, good_sid):
+        legacy = sess.get_queue(sid)
+        legacy.pop("policy_version")
+        sess._queue_path(sid).write_text(json.dumps(legacy), encoding="utf-8")
     original_atomic_write = sess.atomic_write_text
     bad_path = sess._queue_path(bad_sid)
 
@@ -400,10 +403,13 @@ async def test_startup_recovery_continues_after_write_failure_then_fails_closed(
         await main._recover_message_queues_at_startup(sess)
 
     # The failed queue remains unchanged on disk, while the later queue was
-    # still visited and durably paused. The aggregate error makes lifespan
+    # still visited and durably migrated. The aggregate error makes lifespan
     # refuse to expose either one to automatic draining.
     assert sess.get_queue(bad_sid)["paused"] is False
-    assert sess.get_queue(good_sid)["paused"] is True
+    assert sess.get_queue(good_sid)["paused"] is False
+    assert sess.get_queue(good_sid)["policy_version"] == 2
+    assert json.loads(sess._queue_path(good_sid).read_text())["policy_version"] == 2
+    assert "policy_version" not in json.loads(bad_path.read_text())
 
 
 @pytest.mark.asyncio
@@ -628,7 +634,7 @@ def test_reorder_appends_missing_ids_defensively(app_module):
     assert result[1:] == [ids[0], ids[1]]
 
 
-def test_set_queue_paused_toggles(app_module):
+def test_set_queue_paused_toggles_explicit_item_holds(app_module):
     sess = _sess(app_module)
     sid = "s-toggle"
     sess.enqueue_message(sid, "m")
@@ -1044,7 +1050,7 @@ def test_queue_endpoint_pause_toggle(
 
     # Resuming deliberately invokes the headless drain. Keep this endpoint
     # test hermetic: spawning a real Claude SDK subprocess is out of scope.
-    monkeypatch.setattr(chat, "_maybe_drain_queue", fake_drain)
+    monkeypatch.setattr(chat, "_schedule_queue_drain", drains.append)
     sid = _mint_session(client, auth)
     client.post(f"/api/chat/sessions/{sid}/queue", headers=auth,
                 json={"text": "m"})
@@ -1061,7 +1067,7 @@ def test_queue_endpoint_pause_toggle(
                     json={"paused": False})
     assert r.status_code == 200
     assert r.json()["paused"] is False
-    assert drains == [sid]
+    assert drains and set(drains) == {sid}
 
 
 def test_queue_endpoint_requires_auth(client):
@@ -1585,15 +1591,17 @@ async def test_turn_error_cancels_unsettled_adjustment_without_trapping_it(
         assert broadcast.steering_write_events == {}
         assert write_finished.is_set()
         recovered = sess.get_queue(sid)
-        assert recovered["paused"] is True
+        assert recovered["paused"] is False
+        assert recovered["items"][0]["queue_issue"] == "delivery_unknown"
         assert recovered["items"][0]["steering_state"] == "cancelled"
         assert published and published[-1]["event"] == "queue_steering"
 
-        # The row is no longer an unclaimable active adjustment. An explicit
-        # Resume can retry it as an ordinary turn; Delete/Clear can also remove
-        # it without a nonexistent live CLI cancellation receipt.
+        # A legacy whole-queue Resume cannot replay an uncertain command.
+        # Delete/Edit remain available without a nonexistent live CLI owner.
         sess.set_queue_paused(sid, False)
-        assert sess.claim_queue_message(sid)["id"] == queued["id"]
+        assert sess.claim_queue_message(sid) is None
+        follower = sess.enqueue_message(sid, "independent input")["item"]
+        assert sess.claim_queue_message(sid)["id"] == follower["id"]
     finally:
         broadcast.close()
 
@@ -1853,7 +1861,8 @@ async def test_bound_start_failure_releases_and_pauses_exact_claim(
 
     queue = sess.get_queue(sid)
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "failed"
     assert [row["id"] for row in queue["items"]] == [queued["id"]]
 
 
@@ -2018,7 +2027,8 @@ async def test_drain_pauses_missing_attachments_without_sending_text(
     queue = sess.get_queue(sid)
     assert starts == []
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "attachment_unavailable"
     assert [row["id"] for row in queue["items"]] == [queued["id"]]
     assert queue["items"][0]["text"] == "keep this recoverable"
     public = chat.get_queue_api(sid, chat.Response())
@@ -2121,7 +2131,8 @@ async def test_drain_rechecks_and_atomically_rolls_back_attachment_after_slow_st
     queue = sess.get_queue(sid)
     assert queried == []
     assert queue["inflight"] is None
-    assert queue["paused"] is True
+    assert queue["paused"] is False
+    assert queue["items"][0]["queue_issue"] == "failed"
     assert [row["id"] for row in queue["items"]] == [queued["id"]]
     assert queue["items"][0]["image_ids"] == f"{retained_aid},{aid}"
     # All-or-none means the valid sibling was not partially consumed when the
@@ -2216,7 +2227,8 @@ async def test_queued_required_attachment_write_failure_retries_same_id(
 
     failed = sess.get_queue(sid)
     assert queried == []
-    assert failed["paused"] is True
+    assert failed["paused"] is False
+    assert failed["items"][0]["queue_issue"] == "failed"
     assert failed["inflight"] is None
     assert [row["id"] for row in failed["items"]] == [queued["id"]]
     assert chat._image_store.get(aid) is entry
@@ -2224,6 +2236,17 @@ async def test_queued_required_attachment_write_failure_retries_same_id(
 
     fail_writes = False
     sess.set_queue_paused(sid, False)
+    await chat._maybe_drain_queue(sid)
+    assert queried == []
+    # Explicitly editing and sending again creates a new message identity.
+    # Clearing the old pause flag alone must never replay a failed command.
+    retry = failed["items"][0]
+    sess.remove_queue_item(sid, retry["id"])
+    replacement = sess.enqueue_message(
+        sid, retry["text"], image_ids=retry["image_ids"],
+        permission=retry.get("permission", "default"),
+    )["item"]
+    assert replacement["id"] != retry["id"]
     await chat._maybe_drain_queue(sid)
     broadcast = chat._active_turns[sid]
     assert broadcast.task is not None
@@ -2235,3 +2258,50 @@ async def test_queued_required_attachment_write_failure_retries_same_id(
     assert succeeded["inflight"] is None
     assert aid not in chat._image_store
     assert aid not in chat._staged_attachment_claims
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('finish_during_recall', [False, True])
+async def test_steering_recall_precedes_sdk_write_and_falls_back_if_owner_finishes(
+        app_module, monkeypatch, finish_during_recall):
+    from backend import chat
+    sess = _sess(app_module)
+    sid = sess.create_session()['id']
+    writes = []
+    recalled = []
+
+    class SteeringClient:
+        async def query_steering(self, prompt, *, session_id, command_uuid):
+            assert recalled == [prompt]
+            writes.append(prompt)
+            output = await chat.mem0.build_recall_hook(sid, prepared_only=True)(
+                {'prompt': prompt}, None, None)
+            assert output['hookSpecificOutput']['additionalContext'] == 'synthetic memory'
+
+    monkeypatch.setattr(chat, 'MuseLabSDKClient', SteeringClient)
+    monkeypatch.setattr(chat.mem0, 'enabled', lambda: True)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    chat._active_turns[sid] = broadcast
+
+    async def recall(query, _session_id):
+        # Slow memory work must not join the 10-second SDK delivery deadline.
+        assert not broadcast.steering_write_events
+        recalled.append(query)
+        if finish_during_recall:
+            broadcast.steering_closed = True
+        return 'synthetic memory'
+
+    monkeypatch.setattr(chat.mem0, 'search_context', recall)
+    try:
+        response = await chat.enqueue_api(sid, chat.QueueEnqueueReq(
+            text='synthetic follow-up', delivery='adjust', active_turn_id=broadcast.turn_id),
+            chat.BackgroundTasks())
+        assert recalled == ['synthetic follow-up']
+        assert response['effective_delivery'] == ('queue' if finish_during_recall else 'adjust')
+        assert writes == ([] if finish_during_recall else ['synthetic follow-up'])
+        assert sid not in chat.mem0._prepared_recalls
+    finally:
+        chat._active_turns.pop(sid, None)
+        chat.mem0.clear_prepared_recall(sid, broadcast.turn_id)

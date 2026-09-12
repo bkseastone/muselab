@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import ctypes
 import errno
@@ -17,11 +17,13 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Literal
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
+from . import observability as obs
 from .auth import require_token, require_token_query
 from .capability_tickets import tickets
 from .private_storage import (
@@ -31,6 +33,7 @@ from .private_storage import (
     private_path_kind,
 )
 from .settings import ROOT, atomic_write_text, env_int
+from .spreadsheet_safety import validate_xlsx_archive
 from .workspaces import (
     registry as workspace_registry,
     resolve_workspace_root as _workspace_root,
@@ -2666,6 +2669,7 @@ MAX_LIST_ENTRIES = 500  # safety cap so huge dirs (.git/objects) don't freeze th
 def list_dir(
     path: str = "",
     show_hidden: bool = False,
+    sort: Literal["name", "mtime_desc", "mtime_asc"] = "name",
     root: Path = Depends(_workspace_root),
 ) -> dict:
     target = safe_resolve(path, root=root)
@@ -2713,8 +2717,16 @@ def list_dir(
                         is_dir = child.is_dir()
                     except OSError:
                         continue
+                    if sort != "name":
+                        try:
+                            modified = child.stat().st_mtime_ns
+                        except OSError:
+                            continue
+                        order = modified if sort == "mtime_asc" else -modified
+                    else:
+                        order = 0
                     yield (
-                        (not is_dir, child.name.lower(), child.name),
+                        (not is_dir, order, child.name.lower(), child.name),
                         child,
                         is_dir,
                     )
@@ -2772,11 +2784,12 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
     except ImportError:
         raise HTTPException(status_code=500,
                             detail="openpyxl not installed — run `uv sync`")
+    validate_xlsx_archive(target)
     try:
         wb = openpyxl.load_workbook(target, read_only=True, data_only=True)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=422,
-                            detail=f"failed to parse xlsx: {type(e).__name__}: {e}")
+                            detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
     try:
         sheets: list[dict] = []
         sheet_names = wb.sheetnames
@@ -2785,8 +2798,12 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
             ws = wb[sheet_name]
             rows: list[list[str]] = []
             rows_truncated = False
-            cols_truncated = False
-            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+            cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
+            for r_idx, row in enumerate(ws.iter_rows(
+                max_row=min(ws.max_row or XLSX_MAX_ROWS + 1, XLSX_MAX_ROWS + 1),
+                max_col=min(ws.max_column or XLSX_MAX_COLS, XLSX_MAX_COLS),
+                values_only=True,
+            )):
                 if r_idx >= XLSX_MAX_ROWS:
                     rows_truncated = True
                     break
@@ -2950,6 +2967,11 @@ def csv_preview(
                     if cached_total is not None and len(rows) >= limit:
                         break
             total_rows = cached_total if cached_total is not None else row_idx
+    except _csv.Error:
+        raise HTTPException(
+            status_code=422,
+            detail="CSV could not be parsed or a field exceeds the parser size limit",
+        ) from None
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"failed to read: {e}")
 
@@ -3064,7 +3086,9 @@ SANDBOXED_INLINE_SUFFIX = {".html", ".htm", ".svg"}
 
 # HTML-preview bridge. The iframe has an opaque sandbox origin, so the parent
 # cannot inspect its document scroll position or intercept image clicks. This
-# script is injected only for preview=1 and uses postMessage for both jobs;
+# bridge is injected only for preview=1; the element-annotation helper uses
+# the same opaque frame boundary and sends bounded descriptions, never commands.
+# It uses postMessage for scroll/image coordination;
 # neither feature requires relaxing the sandbox. The parent validates
 # event.source against its own preview iframe, while this child accepts restore
 # messages only from its parent. CSP permits this inline bridge.
@@ -3102,6 +3126,7 @@ _PREVIEW_HTML_BRIDGE = (
     "if(!src)return;e.preventDefault();"
     "try{parent.postMessage({__muselab:'preview-img',src:src,alt:img.alt||''},'*');}"
     "catch(_e){}},true);})();</script>"
+    '<script src="/static/modules/html-annotation-frame.js" defer></script>'
 )
 # Cap the in-memory read used for injection. Bigger HTML (e.g. reports with
 # megabytes of base64 images) falls back to streaming untouched — it won't
@@ -3230,6 +3255,7 @@ def _inject_preview_html_bridge(target: Path) -> str | None:
 def raw_file(
     path: str = Query(...),
     preview: bool = Query(False),
+    ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
 ):
     """Stream a raw file using a path-bound preview ticket or legacy token.
@@ -3239,6 +3265,19 @@ def raw_file(
     target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
+    # A legacy token URL must never become the executing document's URL:
+    # even an opaque sandbox can read location.search and issue HTTPS images.
+    # Redirect all legacy resource requests to an exact-file short-lived ticket.
+    if not _preview_ticket_ok(ticket, path, root):
+        from urllib.parse import urlencode
+        issued = mint_preview_ticket(PreviewTicketReq(path=path), root=root)
+        query = {"path": path, "workspace": str(root), "ticket": issued["ticket"]}
+        if preview:
+            query["preview"] = "1"
+        return RedirectResponse(
+            "/api/files/raw?" + urlencode(query), status_code=303,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
     suffix = target.suffix.lower()
     # `no-cache` (NOT no-store) — let browsers cache but force a conditional
     # GET (If-None-Match / If-Modified-Since) every time. FileResponse still
@@ -3268,7 +3307,8 @@ def raw_file(
         # opaque origin even when the file is opened TOP-LEVEL (URL pasted into
         # the address bar): scripts still run, but cannot act as our origin —
         # /api/* fetches become cross-origin (CORS-blocked), cookies/storage
-        # are unavailable, so the query token can't be replayed against the API.
+        # are unavailable. Resource tickets limit what its own URL authorizes;
+        # the sandbox alone cannot protect a credential in location.search.
         # Previously only the frontend iframe's sandbox attribute provided this
         # isolation, which a top-level open silently bypassed.
         sandbox_headers = {
@@ -3374,8 +3414,8 @@ def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
         return {"ok": True, "size": target.stat().st_size}
 
 
-# Default 100 MB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
-MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 100, min_value=1) * 1024 * 1024
+# Default 1 GiB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
+MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 1024, min_value=1) * 1024 * 1024
 # Filename extensions that are likely to be hostile or pointless to host in
 # a local workspace. Block at upload (cleaner than after-the-fact cleanup).
 UPLOAD_BLOCKED_SUFFIX = {
@@ -3385,16 +3425,150 @@ UPLOAD_BLOCKED_SUFFIX = {
 }
 
 
+@router.get("/upload-limits", dependencies=[Depends(require_token)])
+def upload_limits() -> dict:
+    """Expose the configured cap so oversized files fail before transfer."""
+    return {"max_file_bytes": MAX_UPLOAD_BYTES}
+
+
+# Two-phase browser uploads keep an aborted HTTP request from committing a
+# file whose body the server already received. Legacy uploads remain immediate.
+_PENDING_UPLOADS: dict[tuple[str, str, str], dict] = {}
+_PENDING_UPLOAD_LOCK = threading.Lock()
+_PENDING_UPLOAD_TTL = 600
+_PENDING_UPLOAD_CAP = 1024
+
+
+@asynccontextmanager
+async def _pending_upload_registry():
+    # Commit/expiry hold the same registry lock while doing disk I/O. Never
+    # wait for them on the event loop. A plain Lock allows acquisition in the
+    # worker and release by the request owner; none of these scopes re-enter.
+    acquired = False
+
+    def acquire():
+        nonlocal acquired
+        _PENDING_UPLOAD_LOCK.acquire()
+        acquired = True
+
+    try:
+        await obs.to_thread_io("files.upload_registry_wait", "", acquire, owned=True)
+    except BaseException:
+        if acquired:
+            _PENDING_UPLOAD_LOCK.release()
+        raise
+    try:
+        yield
+    finally:
+        _PENDING_UPLOAD_LOCK.release()
+
+
+class UploadControlReq(BaseModel):
+    upload_id: str
+    path: str = ""
+
+
+def _upload_key(upload_id: str, path: str, root: Path) -> tuple[str, str, str]:
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        raise HTTPException(400, "invalid upload id")
+    directory = safe_resolve(path, root=root)
+    _guard_not_trash(directory, root)
+    return str(root), str(directory), upload_id
+
+
+def _expire_pending_upload(key, record):
+    with _PENDING_UPLOAD_LOCK:
+        if _PENDING_UPLOADS.get(key) is not record:
+            return
+        _PENDING_UPLOADS.pop(key)
+        if record.get("tmp"):
+            record["tmp"].unlink(missing_ok=True)
+
+
+def _new_pending_upload(key, **fields):
+    # Called on the request event loop while holding the registry lock.
+    if len(_PENDING_UPLOADS) >= _PENDING_UPLOAD_CAP:
+        raise HTTPException(503, "too many pending uploads")
+    record = dict(fields)
+    _PENDING_UPLOADS[key] = record
+    loop = asyncio.get_running_loop()
+    record["expiry"] = loop.call_later(
+        _PENDING_UPLOAD_TTL,
+        lambda: loop.run_in_executor(None, _expire_pending_upload, key, record),
+    )
+    return record
+
+
+
+async def cleanup_pending_uploads():
+    async with _pending_upload_registry():
+        records = list(_PENDING_UPLOADS.values())
+        _PENDING_UPLOADS.clear()
+        for record in records:
+            record["cancelled"] = True
+            record["expiry"].cancel()
+    def cleanup():
+        for record in records:
+            if record.get("tmp"):
+                record["tmp"].unlink(missing_ok=True)
+    await asyncio.to_thread(cleanup)
+
+
+@router.post("/upload/cancel", dependencies=[Depends(require_token)])
+async def cancel_upload(req: UploadControlReq, root: Path = Depends(_workspace_root)) -> dict:
+    key = await obs.to_thread_io(
+        "files.upload_resolve", "", _upload_key, req.upload_id, req.path, root)
+    async with _pending_upload_registry():
+        record = _PENDING_UPLOADS.get(key)
+        if record is None:
+            # A cancel may beat multipart parsing. Keep a tombstone so a
+            # later upload with the same id cannot stage or commit its body.
+            record = _new_pending_upload(key, cancelled=True)
+        record["cancelled"] = True
+        tmp = record.get("tmp")
+    if tmp:
+        await asyncio.to_thread(tmp.unlink, missing_ok=True)
+    return {"ok": True}
+
+
+@router.post("/upload/commit", dependencies=[Depends(require_token)])
+async def commit_upload(req: UploadControlReq, root: Path = Depends(_workspace_root)) -> dict:
+    key = await obs.to_thread_io(
+        "files.upload_resolve", "", _upload_key, req.upload_id, req.path, root)
+
+    def commit():
+        with _PENDING_UPLOAD_LOCK:
+            record = _PENDING_UPLOADS.get(key)
+            if not record or record.get("cancelled") or not record.get("ready"):
+                raise HTTPException(409, "upload is cancelled, expired, or not ready")
+            # Revalidate after staging; a directory may have been moved meanwhile.
+            if safe_resolve(record["path"], root=root) != record["dest"]:
+                raise HTTPException(409, "upload destination changed")
+            try:
+                trashed = record["finalize"]()
+                return {"ok": True, "path": record["path"], "size": record["size"],
+                        "replaced_trash_id": (trashed or {}).get("trash_id")}
+            finally:
+                _PENDING_UPLOADS.pop(key, None)
+                record["tmp"].unlink(missing_ok=True)
+    return await obs.to_thread_io("files.upload_commit", "", commit, owned=True)
+
+
 @router.post("/upload", dependencies=[Depends(require_token)])
 async def upload(
     path: str = Form(""),
     file: UploadFile = File(...),
+    upload_id: str = Form(""),
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    target_dir = safe_resolve(path, root=root)
-    _guard_not_trash(target_dir, root)
-    if not target_dir.exists() or not target_dir.is_dir():
-        raise HTTPException(status_code=400, detail="target dir invalid")
+    def resolve_directory():
+        directory = safe_resolve(path, root=root)
+        _guard_not_trash(directory, root)
+        if not directory.is_dir():
+            raise HTTPException(status_code=400, detail="target dir invalid")
+        return directory
+
+    target_dir = await obs.to_thread_io("files.upload_resolve", "", resolve_directory)
     safe_name = Path(file.filename or "upload.bin").name
     # Path("." ).name and Path("..").name are both "" — those filenames
     # produced an empty safe_name → `target_dir / ""` == target_dir, and
@@ -3416,14 +3590,29 @@ async def upload(
     # leaves a partial file at the intended path.
     import uuid as _uuid
     tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
+    pending = None
+    if upload_id:
+        key = await obs.to_thread_io(
+            "files.upload_resolve", "", _upload_key, upload_id, path, root)
+        async with _pending_upload_registry():
+            if key in _PENDING_UPLOADS:
+                raise HTTPException(409, "upload id already used or cancelled")
+            pending = _new_pending_upload(key, tmp=tmp_path, cancelled=False)
     written = 0
+    sink = None
+
+    def open_sink():
+        nonlocal sink
+        sink = tmp_path.open("wb")
+
     try:
-        with tmp_path.open("wb") as f:
+        try:
+            await obs.to_thread_io("files.upload_open", "", open_sink, owned=True)
             while chunk := await file.read(1024 * 1024):
                 written += len(chunk)
+                if pending and pending.get("cancelled"):
+                    raise HTTPException(409, "upload cancelled")
                 if written > MAX_UPLOAD_BYTES:
-                    f.close()
-                    tmp_path.unlink(missing_ok=True)
                     raise HTTPException(
                         status_code=413,
                         detail=f"upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB cap",
@@ -3431,7 +3620,13 @@ async def upload(
                 # Off-load the blocking disk write so a large multi-MB upload
                 # doesn't stall the event loop chunk-by-chunk. (perf: RED —
                 # files.py upload sync write)
-                await asyncio.to_thread(f.write, chunk)
+                await obs.to_thread_io(
+                    "files.upload_write", "", sink.write, chunk, owned=True)
+        finally:
+            # Opening/writing must finish before close, including cancellation.
+            # Closing can flush buffered bytes, so it is blocking I/O too.
+            if sink is not None:
+                await obs.to_thread_io("files.upload_close", "", sink.close, owned=True)
         # Overwrite protection: a same-name upload used to silently clobber the
         # existing file via rename() — no 409, no trash, no undo — which
         # contradicts /rename's 409 guard and the whole soft-delete design.
@@ -3463,17 +3658,29 @@ async def upload(
                 _rename_noreplace(tmp_path, dest)
                 _fsync_rename(tmp_path.parent, dest.parent)
                 return trashed
-        trashed = await asyncio.to_thread(_finalize)
-    except HTTPException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
+        if pending is not None:
+            async with _pending_upload_registry():
+                if pending.get("cancelled") or _PENDING_UPLOADS.get(key) is not pending:
+                    raise HTTPException(409, "upload cancelled or expired")
+                pending.update(ready=True, finalize=_finalize, dest=dest, size=written,
+                               path=(_logical_relative_path(path) / safe_name).as_posix())
+            return {"ok": True, "pending": True, "path": pending["path"], "size": written}
+        trashed = await obs.to_thread_io(
+            "files.upload_finalize", "", _finalize, owned=True)
+    except BaseException:
+        if pending:
+            async with _pending_upload_registry():
+                pending["cancelled"] = True
+                if _PENDING_UPLOADS.get(key) is pending:
+                    _PENDING_UPLOADS.pop(key)
+                    pending["expiry"].cancel()
+        await obs.to_thread_io(
+            "files.upload_cleanup", "", tmp_path.unlink, missing_ok=True, owned=True)
         raise
     return {
         "ok": True,
         "path": (_logical_relative_path(path) / safe_name).as_posix(),
-        "size": dest.stat().st_size,
+        "size": written,
         # Non-null when an existing same-name file was moved to trash so the
         # frontend can surface "replaced (old version in trash)".
         "replaced_trash_id": (trashed or {}).get("trash_id"),

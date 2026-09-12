@@ -10,6 +10,8 @@ cd "$REPO"
 # with install-linux.sh. Keep in lockstep with Dockerfile.
 # shellcheck source=scripts/versions.env
 . "$REPO/scripts/versions.env"
+# shellcheck source=scripts/installer-safety.sh
+. "$REPO/scripts/installer-safety.sh"
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
@@ -35,8 +37,13 @@ ask() {
 # Detect that case and reattach stdin to the controlling terminal. The
 # `[[ ! -t 0 ]]` guard makes this a no-op when the script is run directly
 # (e.g. `bash scripts/install-macos.sh`), so no behavior change there.
-if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]] && [[ -c /dev/tty ]]; then
-  exec </dev/tty
+if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]]; then
+  if ( : </dev/tty ) 2>/dev/null; then
+    exec </dev/tty
+  else
+    err "Interactive install requires a terminal; use MUSELAB_NONINTERACTIVE=1 for unattended installation."
+    exit 1
+  fi
 fi
 
 bold "muselab — macOS installer"
@@ -57,6 +64,12 @@ fi
 if [[ $EUID -eq 0 ]]; then
   err "Don't run this with sudo / as root."
   echo "      muselab runs as a user LaunchAgent (no root needed)."
+  exit 1
+fi
+
+if ! command -v xcrun >/dev/null 2>&1 || ! xcrun --find swiftc >/dev/null 2>&1; then
+  err "Swift compiler not found. Install the Xcode Command Line Tools first:"
+  echo "      xcode-select --install"
   exit 1
 fi
 
@@ -110,17 +123,16 @@ fi
 
 # uvx ships with uv → almost always present once uv is installed
 if command -v uvx >/dev/null 2>&1; then
-  ok "uvx present — uv-based MCP servers (fetch, git, time, …) available"
+  ok "uvx present — optional uv-based MCP connectors can be configured"
 else
-  warn "uvx not found — uv-based MCP presets (fetch, git, time) won't run"
+  warn "uvx not found — optional uv-based MCP connectors require it"
 fi
 
 # Auto-install Node LTS + claude CLI when missing. macOS prefers Homebrew
 # if present (most users have it for uv anyway); falls back to fnm so the
 # install never blocks on "you need to brew install X first".
-# Skipping these used to leave Muse in a "running but Claude 401s + default
-# MCP presets silent-fail" state — with this block the one-line install is
-# really end-to-end.
+# The standalone CLI supports subscription login. Node also supports optional
+# npm-based MCP connectors. API-key use runs through the SDK-bundled CLI.
 NEED_CLAUDE_LOGIN=0
 INSTALL_NODE=0
 INSTALL_CLAUDE=0
@@ -132,9 +144,8 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
   bold "Optional auto-install / 可选自动安装"
   (( INSTALL_NODE   )) && echo "  - Node LTS (brew if present, else fnm — both user-scoped, no sudo)"
   (( INSTALL_CLAUDE )) && echo "  - Anthropic claude CLI (npm install -g, ~10s)"
-  echo "  Why: powers the default MCP presets (memory / sequential-thinking /"
-  echo "  filesystem) + lets you reuse a Claude Pro / Max subscription."
-  echo "  原因：默认 MCP 预设和复用 Claude Pro/Max 订阅都需要它们。"
+  echo "  Why: enables standalone CLI subscription login and optional npm-based MCP connectors."
+  echo "  原因：支持独立 CLI 的订阅登录，以及按需配置的 npm MCP 连接器。"
   REPLY="$(ask 'Install now / 现在装? [Y/n]:' 'Y')"
   if [[ "$REPLY" =~ ^[Yy] ]]; then
     if (( INSTALL_NODE )); then
@@ -176,7 +187,7 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
       warn "skipped claude CLI install — no npm (Node install failed?)"
     fi
   else
-    warn "Skipped. Without Node+claude CLI: Anthropic models 401, default MCP presets disabled."
+    warn "Skipped. Subscription login requires the standalone CLI; optional npm MCP connectors require Node."
     warn "  To install later:  brew install node  (or fnm install --lts)"
     warn "                     npm install -g @anthropic-ai/claude-code && claude login"
   fi
@@ -247,37 +258,23 @@ else
   # Smart port check: detect "port held by previous muselab LaunchAgent" and
   # offer one-click cleanup instead of forcing manual kill.
   if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    HOLDER_PID="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
-    HOLDER_NAME=""
-    if [[ -n "$HOLDER_PID" ]]; then
-      HOLDER_NAME="$(ps -p "$HOLDER_PID" -o comm= 2>/dev/null | xargs basename 2>/dev/null)"
-    fi
-    HAS_OLD_AGENT=""
-    if launchctl list 2>/dev/null | grep -q com.muselab; then HAS_OLD_AGENT=1; fi
-
-    # Holder-name match is best-effort: macOS reports framework Python as
-    # "Python"/"python3.12" etc., so match case-insensitively by prefix.
-    # But the decisive signal is a loaded com.muselab agent — if that's
-    # present the port holder IS our stale instance regardless of comm name.
-    HOLDER_IS_PY=""
-    shopt -s nocasematch
-    [[ "$HOLDER_NAME" =~ ^(python|uv) ]] && HOLDER_IS_PY=1
-    shopt -u nocasematch
-
-    if [[ -n "$HAS_OLD_AGENT" ]] && { [[ -n "$HOLDER_IS_PY" ]] || [[ -n "$HOLDER_PID" ]]; }; then
+    HOLDER_PIDS="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+    HOLDER_PID="$(printf '%s\n' "$HOLDER_PIDS" | head -1)"
+    HOLDER_NAME="$(ps -p "$HOLDER_PID" -o comm= 2>/dev/null || true)"
+    if muselab_port_is_owned macos "$REPO" "$HOLDER_PIDS"; then
       warn "Port $PORT is held by an existing muselab install (PID $HOLDER_PID, $HOLDER_NAME)"
       warn "  端口被已有的 muselab 占着 — 可以一键清理后继续"
       REPLY="$(ask 'Clean it up and continue / 清理后继续? [Y/n]:' 'Y')"
       if [[ "$REPLY" =~ ^[Yy] ]]; then
-        launchctl unload "$HOME/Library/LaunchAgents/com.muselab.plist" 2>/dev/null || true
-        kill -TERM "$HOLDER_PID" 2>/dev/null || true
+        if ! muselab_port_is_owned macos "$REPO" "$HOLDER_PIDS"; then
+          err "Port ownership changed; no service was stopped. Re-run to inspect the conflict."
+          exit 1
+        fi
+        # Stop only the verified service. Never signal a cached arbitrary PID.
+        launchctl bootout "gui/$(id -u)/com.muselab"
         sleep 2
         if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-          kill -KILL "$HOLDER_PID" 2>/dev/null || true
-          sleep 1
-        fi
-        if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-          err "Cleanup didn't free port — kill manually then re-run."
+          err "Port is still occupied. Inspect its owner or choose another port; no process was killed directly."
           exit 1
         fi
         ok "cleaned up — port $PORT now free"
@@ -355,11 +352,6 @@ fi
 # The menu-bar helper is a tiny native AppKit program. Build it during every
 # install (including CI's service-skip mode) so macOS compiler regressions are
 # caught before the LaunchAgent is written.
-if ! command -v xcrun >/dev/null 2>&1 || ! xcrun --find swiftc >/dev/null 2>&1; then
-  err "Swift compiler not found. Install the Xcode Command Line Tools first:"
-  echo "      xcode-select --install"
-  exit 1
-fi
 STATUSBAR_BUILD_DIR="$REPO/build/macos"
 STATUSBAR_BUILD="$STATUSBAR_BUILD_DIR/MuseLabStatusBar"
 mkdir -p "$STATUSBAR_BUILD_DIR"
@@ -396,15 +388,14 @@ else
   UV_DIR="$(dirname "$UV")"
   PATH_DIRS="$UV_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-  sed -e "s|{{REPO_PATH}}|$REPO|g" \
-      -e "s|{{UV_PATH}}|$UV|g" \
-      -e "s|{{PATH_DIRS}}|$PATH_DIRS|g" \
-      -e "s|{{HOME_DIR}}|$HOME|g" \
-      scripts/templates/com.muselab.plist.tmpl > "$PLIST"
-  sed -e "s|{{STATUS_BAR_BINARY}}|$STATUSBAR_BINARY|g" \
-      -e "s|{{ENV_PATH}}|$REPO/.env|g" \
-      -e "s|{{HOME_DIR}}|$HOME|g" \
-      scripts/templates/com.muselab.statusbar.plist.tmpl > "$STATUSBAR_PLIST"
+  "$UV" run --frozen python scripts/render-service.py plist \
+    scripts/templates/com.muselab.plist.tmpl "$PLIST" \
+    --set "REPO_PATH=$REPO" --set "UV_PATH=$UV" \
+    --set "PATH_DIRS=$PATH_DIRS" --set "HOME_DIR=$HOME"
+  "$UV" run --frozen python scripts/render-service.py plist \
+    scripts/templates/com.muselab.statusbar.plist.tmpl "$STATUSBAR_PLIST" \
+    --set "STATUS_BAR_BINARY=$STATUSBAR_BINARY" --set "ENV_PATH=$REPO/.env" \
+    --set "HOME_DIR=$HOME"
   ok "backend plist: $PLIST"
   ok "status bar plist: $STATUSBAR_PLIST"
 

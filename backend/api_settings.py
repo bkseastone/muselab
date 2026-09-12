@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,6 +21,8 @@ from claude_agent_sdk.types import PermissionMode
 from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
+from . import context_limits
+from .config_paths import ENV_PATH, MCP_CONFIG_PATH
 from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
 # by main.py for the CLI version probe at /api/meta. Both modules import
@@ -26,23 +30,15 @@ from .hook_settings import router as hook_settings_router
 # existing call sites in this file continue to work unchanged.
 from .settings import locate_executable as _locate_executable
 
-MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 router.include_router(hook_settings_router)
+_SERVICE_STARTED = time.monotonic()
+_SERVICE_INSTANCE_ID = uuid.uuid4().hex
 
-# Path to the .env file we read/write at runtime. Defaults to the repo
-# root's `.env`. The MUSELAB_ENV_PATH override is critical for test
-# isolation — without it, tests/test_regressions.py calling
-# PUT /api/settings would clobber the developer's real .env (every CI
-# run silently overwrote the DEEPSEEK_API_KEY with "sk-test-key-12345"
-# until 2026-05-24 when this guard was added). Production setups
-# never need to set the env var; it's a test-only escape hatch.
-ENV_PATH = Path(os.environ.get(
-    "MUSELAB_ENV_PATH",
-    str(Path(__file__).resolve().parent.parent / ".env"),
-))
+# Runtime config paths are shared with startup loading and the SDK MCP view.
+# Explicit overrides also keep API tests away from a developer's real files.
 
 # Providers exposed in the settings UI. Derived from the EFFECTIVE catalog
 # (endpoints.catalog() = built-ins + user overrides + custom providers) so a
@@ -125,7 +121,7 @@ class SettingsIn(BaseModel):
 # is atomic, but two concurrent writers (e.g. two browser tabs saving
 # different settings) would each read the same baseline and the second
 # replace would silently drop the first writer's keys.
-_ENV_WRITE_LOCK = threading.Lock()
+_ENV_WRITE_LOCK = threading.RLock()
 
 
 def _write_env(updates: dict[str, str]) -> None:
@@ -145,6 +141,7 @@ def _write_env(updates: dict[str, str]) -> None:
         for k, v in updates.items()
     }
     with _ENV_WRITE_LOCK:
+        ENV_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lines: list[str] = []
         if ENV_PATH.exists():
             lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
@@ -273,6 +270,8 @@ def get_settings() -> dict:
         })
     return {
         "providers": providers,
+        "context_limits": context_limits.configured_limits(),
+        "context_groups": context_limits.provider_groups(),
         "defaults": {
             # Model: prefer MUSELAB_DEFAULT_MODEL, fall back to MUSELAB_MODEL,
             # then to the canonical default. The two-key dance exists because
@@ -427,6 +426,32 @@ def put_settings(req: SettingsIn) -> dict:
 
 # ====== Provider catalog management ======
 #
+class ContextLimitIn(BaseModel):
+    scope: Literal["providers", "models"]
+    key: str = Field(min_length=1, max_length=256,
+                     pattern=r"^[A-Za-z0-9][A-Za-z0-9._:+-]*$")
+    tokens: int | None = Field(default=None, strict=True, ge=1024, le=10_000_000)
+
+
+@router.put("/context-limits", dependencies=[Depends(require_token)])
+def put_context_limit(req: ContextLimitIn) -> dict:
+    groups = context_limits.provider_groups()
+    allowed = ({item["id"] for item in groups} if req.scope == "providers"
+               else {model for item in groups for model in item["models"]})
+    with _ENV_WRITE_LOCK:
+        limits = context_limits.configured_limits()
+        if req.key not in allowed and not (
+            req.tokens is None and req.key in limits[req.scope]
+        ):
+            raise HTTPException(422, "unknown provider or model")
+        if req.tokens is None:
+            limits[req.scope].pop(req.key, None)
+        else:
+            limits[req.scope][req.key] = req.tokens
+        _write_env({context_limits.ENV_KEY: json.dumps(limits, separators=(",", ":"))})
+    return {"ok": True, "context_limits": limits}
+
+
 # The effective provider list = built-in defaults + user overrides, all owned
 # by endpoints.py (persisted in provider_overrides.json). These routes are the
 # write side of the Settings provider editor: create / edit / delete / restore.
@@ -749,6 +774,7 @@ def _load_mcp_merged() -> dict[str, dict]:
 
 
 def _save_mcp(cfg: dict) -> None:
+    MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix="mcp.", suffix=".json",
                                 dir=str(MCP_CONFIG_PATH.parent))
     try:
@@ -971,34 +997,37 @@ async def reconnect_mcp_server(name: str) -> dict:
         live = list(_chat._clients.items())
     if not live:
         return {"ok": True, "reconnected": [], "errors": [], "note": "no live client"}
-    for key, client in live:
-        try:
-            await client.reconnect_mcp_server(name)
-            reconnected.append(f"{key[0]}@{key[1]}")
-        except Exception as e:
-            errors.append(f"{key}: {type(e).__name__}: {e}")
-    return {"ok": True, "reconnected": reconnected, "errors": errors}
+    from .mcp_probes import probe_clients
+    pending = []
+    for item in await probe_clients(live, "reconnect_mcp_server", name):
+        key = item["key"]
+        label = f"{key[0]}@{key[1]}"
+        if "error" in item:
+            errors.append(f"{label}: {item['error']}")
+            if item.get("pending"):
+                pending.append(label)
+        else:
+            reconnected.append(label)
+    return {"ok": True, "reconnected": reconnected, "errors": errors,
+            "pending": pending}
 
 
 @router.get("/mcp/status", dependencies=[Depends(require_token)])
 async def mcp_status() -> dict:
-    """Aggregate MCP server status from every live SDK client (each may have
-    its own connection state). Returns per-client breakdown so the UI can
-    show which session's MCP is borked when reconnect is needed."""
+    """Return independent live-client results within a short shared deadline."""
     from . import chat as _chat
+    from .mcp_probes import probe_clients
     async with _chat._lock:
         live = list(_chat._clients.items())
-    out: list[dict] = []
-    for key, client in live:
-        # Cache key is (sid, model, effort) — 3-tuple since 2026-05-21.
-        # Unpacking into 2 vars would crash with ValueError; index instead.
-        sid, model = key[0], key[1]
-        try:
-            status = await client.get_mcp_status()
-            out.append({"session_id": sid, "model": model, "status": status})
-        except Exception as e:
-            out.append({"session_id": sid, "model": model,
-                         "error": f"{type(e).__name__}: {e}"})
+    out = []
+    for item in await probe_clients(live, "get_mcp_status"):
+        key = item["key"]
+        row = {"session_id": key[0], "model": key[1]}
+        if "error" in item:
+            row.update(error=item["error"], pending=item.get("pending", False))
+        else:
+            row["status"] = item["result"]
+        out.append(row)
     return {"clients": out}
 
 
@@ -1521,7 +1550,22 @@ async def restart_service() -> dict:
     Sends the 200 response first, then schedules the actual restart after a
     short delay so the HTTP response has time to flush to the client."""
     asyncio.create_task(_do_restart())
-    return {"ok": True, "restarting": True}
+    return {"ok": True, "restarting": True, "instance_id": _SERVICE_INSTANCE_ID}
+
+
+@router.get("/service", dependencies=[Depends(require_token)])
+async def service_status() -> dict:
+    """Cheap in-memory status; no filesystem, subprocess or private payload."""
+    from . import chat, chat_runtime, runtime_buffer
+    return {
+        "diagnostics": {"runtime_buffers": runtime_buffer.diagnostics(
+            streams=len(chat_runtime.SESSION_STREAMS))},
+        "instance_id": _SERVICE_INSTANCE_ID,
+        "uptime_seconds": round(time.monotonic() - _SERVICE_STARTED, 1),
+        "active_turns": sum(not bc.done for bc in tuple(chat._active_turns.values())),
+        "background_tasks": sum(
+            len(tasks) for tasks in tuple(chat._sessions_with_inflight_tasks.values())),
+    }
 
 
 async def _do_restart() -> None:

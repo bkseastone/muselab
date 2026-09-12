@@ -349,22 +349,37 @@ def full_session_msgs(
 
 
 def read_tail_lines(path: Path, n: int, block: int = 65536) -> list[str]:
-    """Return the last ``n`` non-empty lines with O(tail) file I/O."""
+    """Read the last ``n`` non-empty lines in linear time and tail-sized I/O.
+
+    Count completed non-empty lines across block boundaries without repeatedly
+    copying or scanning the accumulated tail. A trailing newline is a delimiter,
+    not a line that consumes one of the requested results.
+    """
+    if n <= 0:
+        return []
+    if block <= 0:
+        raise ValueError("tail block size must be positive")
+    chunks: list[bytes] = []
+    found = 0
+    pending_nonempty = False
     with path.open("rb") as handle:
         handle.seek(0, os.SEEK_END)
         pos = handle.tell()
-        data = b""
-        while pos > 0 and data.count(b"\n") <= n:
+        while pos > 0 and found < n:
             read = min(block, pos)
             pos -= read
             handle.seek(pos)
-            data = handle.read(read) + data
-        lines = data.split(b"\n")
-        return [
-            line.decode("utf-8", "replace")
-            for line in lines[-n:]
-            if line.strip()
-        ]
+            chunk = handle.read(read)
+            chunks.append(chunk)
+            parts = chunk.split(b"\n")
+            for segment in reversed(parts[1:]):
+                if pending_nonempty or segment.strip():
+                    found += 1
+                pending_nonempty = False
+            pending_nonempty = pending_nonempty or bool(parts[0].strip())
+    data = b"".join(reversed(chunks))
+    lines = [line for line in data.split(b"\n") if line.strip()]
+    return [line.decode("utf-8", "replace") for line in lines[-n:]]
 
 
 def recent_turn_uuids(

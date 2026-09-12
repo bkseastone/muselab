@@ -1,0 +1,2 @@
+# Preserve exact upstream/generated vendor bytes; SHA256 inventory validates them.
+frontend/vendor/** -whitespace

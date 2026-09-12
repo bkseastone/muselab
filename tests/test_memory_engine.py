@@ -1,5 +1,6 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -527,7 +528,7 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
         authority="confirmed", confidence=1.0)
     event_loop_thread = threading.get_ident()
     io_threads = {}
-    original_hydrate = instance.store.memories_by_ids
+    original_hydrate = instance._resolve_recall_store().memories_by_ids
     original_log = instance.store.log_recall
 
     def tracked_hydrate(memory_ids):
@@ -538,7 +539,7 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
         io_threads["log"] = threading.get_ident()
         return original_log(*args, **kwargs)
 
-    monkeypatch.setattr(instance.store, "memories_by_ids", tracked_hydrate)
+    monkeypatch.setattr(instance._resolve_recall_store(), "memories_by_ids", tracked_hydrate)
     monkeypatch.setattr(instance.store, "log_recall", tracked_log)
 
     class FakeEmbedding:
@@ -713,10 +714,10 @@ def test_recall_bounds_the_text_sent_to_the_embedder(tmp_path, monkeypatch):
     assert seen[0].endswith(question)
 
 
-def test_default_soft_timeout_exceeds_a_single_embedding_call():
+def test_recall_timeout_defaults_to_unlimited():
     """Guards the budget against regressing below one embedding round-trip."""
     from backend.memory_config import RetrievalConfig
-    assert RetrievalConfig().soft_timeout_ms >= 1000
+    assert RetrievalConfig().soft_timeout_ms == 0
 
 
 def test_transcript_reconciliation_stops_at_next_real_user_turn(
@@ -804,7 +805,15 @@ def _run_worker_job(tmp_path, monkeypatch, failures, *, kind="reindex_memory"):
     monkeypatch.setattr(instance.store, "finish_job", finish_and_advance)
     _run(instance._worker())
     job = next(row for row in instance.store.list_jobs() if row["id"] == job_id)
-    return calls, job, events
+    starts = [fields for event, fields in events if event == "memory.job_start"]
+    outcomes = [(event, fields) for event, fields in events if event == "memory.job"]
+    assert len(starts) == len(outcomes)
+    assert len({fields["job_ref"] for _, fields in outcomes}) == 1
+    for start, (_, finish) in zip(starts, outcomes):
+        assert start["job_ref"] == finish["job_ref"]
+        assert len(start["job_ref"]) == 12
+        assert start["attempt"] == finish["attempt"]
+    return calls, job, outcomes
 
 
 @pytest.mark.parametrize(("exc", "retryable", "category", "status"), [
@@ -932,3 +941,513 @@ def test_reindex_all_queues_one_batch_job(tmp_path, monkeypatch):
     assert len(jobs) == 1
     assert jobs[0]["kind"] == "reindex_memories"
     assert len(jobs[0]["payload"]["memory_ids"]) == 5
+
+
+@pytest.fixture
+def recall_case(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    instance = module.MemoryEngine(module.MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    cfg.retrieval.soft_timeout_ms = 400
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    memory = instance.store.create_memory(
+        "default", "preference", "喜欢清淡饮食，晚餐少油少盐",
+        authority="confirmed", confidence=1.0)
+
+    class Embedding:
+        def __init__(self, config):
+            pass
+
+        async def embed(self, texts):
+            return [[1.0, 0.0, 0.0]]
+
+    class Vector:
+        async def search(self, *args, **kwargs):
+            return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(module, "EmbeddingProvider", Embedding)
+    vector = Vector()
+    monkeypatch.setattr(module, "vector_store", lambda config: vector)
+    return instance, cfg, memory, vector
+
+
+def test_recall_reads_wal_while_writer_holds_transaction(recall_case):
+    instance, cfg, memory, _ = recall_case
+    entered = threading.Event()
+
+    def slow_write(store):
+        with store._lock, store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            entered.set()
+            time.sleep(3.1)
+            conn.commit()
+
+    async def scenario():
+        writer = asyncio.create_task(instance._store_call(slow_write))
+        await asyncio.to_thread(entered.wait, 1)
+        assert entered.is_set()
+        started = time.perf_counter()
+        rows = await instance.recall("清淡饮食", "writer-busy")
+        assert rows[0]["id"] == memory["id"]
+        assert time.perf_counter() - started < 0.4
+        assert not writer.done()
+        await writer
+        await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["dense_error", "dense_timeout", "lexical_error"])
+def test_recall_channel_failover_keeps_hydrated_results(recall_case, monkeypatch, failure):
+    instance, _, memory, vector = recall_case
+
+    async def broken_dense(*args, **kwargs):
+        if failure == "dense_timeout":
+            await asyncio.sleep(2)
+        raise httpx.ReadTimeout("unavailable")
+
+    def broken_lexical(*args, **kwargs):
+        raise sqlite3.OperationalError("unavailable")
+
+    if failure.startswith("dense"):
+        monkeypatch.setattr(vector, "search", broken_dense)
+    else:
+        monkeypatch.setattr(instance._resolve_recall_store(), "lexical_search", broken_lexical)
+
+    async def scenario():
+        # Exact Chinese lexical matching, or a synonym query answered by the
+        # dense fixture when lexical is unavailable.
+        query = "清淡饮食" if failure.startswith("dense") else "晚饭想吃低脂低钠的菜"
+        rows = await instance.recall(query, "failover")
+        trace = instance.pop_recall_trace("failover")
+        assert rows[0]["id"] == memory["id"]
+        assert trace["count"] == 1
+        assert trace["status"] == "partial"
+        assert trace["hydrate_status"] == "ok"
+        await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("slow_stage", ["recent", "hydrate"])
+def test_recall_database_wait_is_inside_entry_deadline(recall_case, monkeypatch, slow_stage):
+    instance, cfg, _, _ = recall_case
+    cfg.retrieval.soft_timeout_ms = 100
+    store = instance._resolve_recall_store()
+    method = "recent_evidence" if slow_stage == "recent" else "memories_with_stats_by_ids"
+    original = getattr(store, method)
+
+    def slow(*args, **kwargs):
+        time.sleep(0.25)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, method, slow)
+
+    async def scenario():
+        started = time.perf_counter()
+        assert await instance.recall("清淡饮食", "db-timeout") == []
+        elapsed = time.perf_counter() - started
+        trace = instance.pop_recall_trace("db-timeout")
+        assert elapsed < 0.2
+        assert trace[f"{slow_stage}_status"] == "timeout"
+        assert trace["status"] == "timeout"
+        assert trace["latency_ms"] < 200
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_rerank_timeout_preserves_results_and_hook_receipt(recall_case, monkeypatch):
+    from backend import memory_client as client, memory_engine as module
+    instance, cfg, memory, _ = recall_case
+    cfg.rerank.enabled = True
+    events = []
+
+    class SlowReranker:
+        def __init__(self, config):
+            pass
+
+        async def rerank(self, *args):
+            await asyncio.sleep(2)
+
+    monkeypatch.setattr(module, "Reranker", SlowReranker)
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(client, "native_enabled", lambda: True)
+    monkeypatch.setattr(module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    monkeypatch.setattr(client, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    async def scenario():
+        response = await client.build_recall_hook("receipt")(
+            {"prompt": "晚餐怎么安排"}, None, None)
+        assert client._sanitize(memory["content"]) in response["hookSpecificOutput"]["additionalContext"]
+        trace = client.pop_recall_trace("receipt")
+        assert trace["count"] == 1 and trace["injected"] is True
+        assert trace["status"] == "partial"
+        assert trace["rerank_status"] == "timeout"
+        finish = next(fields for event, fields in events if event == "memory.recall_finish")
+        hook = next(fields for event, fields in events if event == "memory.recall_hook_finish")
+        assert finish["recall_id"] == hook["recall_id"] == trace["id"]
+        assert finish["count"] == hook["count"] == 1
+        assert memory["content"] not in str(events)
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_recall_cancel_records_cancelled_receipt(recall_case, monkeypatch):
+    from backend import memory_client as client, memory_engine as module
+    instance, cfg, _, vector = recall_case
+    cfg.retrieval.soft_timeout_ms = 0
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(client, "native_enabled", lambda: True)
+    entered = asyncio.Event()
+
+    async def slow(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(vector, "search", slow)
+
+    async def scenario():
+        task = asyncio.create_task(client.prepare_recall("cancelled", "turn", "晚餐"))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        trace = instance.pop_recall_trace("cancelled")
+        assert trace["status"] == "cancelled"
+        assert trace["injected"] is False
+        assert trace["dense_status"] == "cancelled"
+        assert "cancelled" not in client._prepared_recalls
+        await instance.stop()
+
+    _run(scenario())
+
+
+def test_read_lane_cancels_expired_queued_work(recall_case):
+    instance, _, _, _ = recall_case
+    entered = threading.Event()
+    release = threading.Event()
+    executed = []
+
+    def blocking_read(store):
+        entered.set()
+        release.wait(1)
+
+    async def scenario():
+        first = asyncio.create_task(instance._recall_store_call(blocking_read))
+        await asyncio.to_thread(entered.wait, 1)
+        pending = asyncio.create_task(instance._recall_store_call(
+            lambda store: executed.append(True)))
+        await asyncio.sleep(0.01)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        release.set()
+        await first
+        await instance.stop()
+        assert not executed
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("timeout_ms", [0, 30_000, 120_000])
+def test_recall_budget_can_exceed_hook_watchdog(timeout_ms):
+    from backend.memory_config import RetrievalConfig
+    assert RetrievalConfig(soft_timeout_ms=timeout_ms).soft_timeout_ms == timeout_ms
+
+
+def test_ui_read_interrupts_expensive_sql_and_next_request_recovers(tmp_path):
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    instance.UI_READ_TIMEOUT_S = 0.08
+
+    def expensive(store):
+        with store._connect() as conn:
+            return conn.execute("""
+                WITH RECURSIVE numbers(x) AS (
+                  SELECT 1 UNION ALL SELECT x + 1 FROM numbers WHERE x < 100000000
+                ) SELECT sum(x) FROM numbers
+            """).fetchone()[0]
+
+    async def scenario():
+        started = time.perf_counter()
+        try:
+            with pytest.raises(TimeoutError):
+                await instance._read_store_call(expensive)
+            instance.UI_READ_TIMEOUT_S = 1
+            result = await instance._read_store_call(
+                lambda store: store.browse_memories("default"))
+            assert result == ([], 0)
+            assert time.perf_counter() - started < 0.8
+        finally:
+            await instance.stop()
+
+    asyncio.run(scenario())
+
+
+def test_first_ui_read_initializes_existing_empty_registry(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+
+    path = tmp_path / "registry.sqlite3"
+    # An existing file alone does not prove the current schema was initialized.
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA user_version=0")
+    monkeypatch.setattr(module, "database_path", lambda: path)
+    instance = module.MemoryEngine()
+
+    async def scenario():
+        try:
+            assert await instance._read_store_call(
+                lambda store: store.browse_memories("default")) == ([], 0)
+            assert instance._ui_store._read_only
+            assert instance._store is not instance._ui_store
+        finally:
+            await instance.stop()
+
+    asyncio.run(scenario())
+
+
+def test_expired_lexical_sql_releases_recall_actor_for_dense_hydration(recall_case, monkeypatch):
+    """Timing out the waiter must also stop SQL ahead of dense hydration."""
+    instance, cfg, memory, _ = recall_case
+    store = instance._resolve_recall_store()
+    interrupts = []
+
+    def expensive_lexical(*args, **kwargs):
+        with store._connect() as conn:
+            # A guard bounds the pre-fix failure; it is not the query budget.
+            guard = threading.Timer(1.0, conn.interrupt)
+            guard.start()
+            try:
+                conn.execute("""WITH RECURSIVE n(x) AS (
+                    VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000
+                ) SELECT sum(x) FROM n""").fetchone()
+            except sqlite3.OperationalError as exc:
+                interrupts.append(getattr(exc, "sqlite_errorcode", None))
+                raise
+            finally:
+                guard.cancel()
+        return []
+
+    monkeypatch.setattr(store, "lexical_search", expensive_lexical)
+
+    async def scenario():
+        try:
+            rows = await instance.recall("synthetic query", "sql-budget")
+            trace = instance.pop_recall_trace("sql-budget")
+            assert [row["id"] for row in rows] == [memory["id"]]
+            assert trace["status"] == "partial"
+            assert trace["lexical_status"] == "timeout"
+            assert trace["hydrate_status"] == "ok"
+            assert interrupts == [sqlite3.SQLITE_INTERRUPT]
+        finally:
+            await instance.stop()
+
+    _run(scenario())
+
+
+def test_slow_dense_search_does_not_delay_healthy_lexical_hydration(recall_case, monkeypatch):
+    instance, _, memory, vector = recall_case
+    store = instance._resolve_recall_store()
+    original = store.memories_with_stats_by_ids
+
+    async def slow_dense(*args, **kwargs):
+        await asyncio.sleep(2)
+
+    def slow_hydration(*args, **kwargs):
+        # Fits the 400ms recall budget, but not the old final 80ms reservation.
+        time.sleep(.12)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(vector, "search", slow_dense)
+    monkeypatch.setattr(store, "memories_with_stats_by_ids", slow_hydration)
+
+    async def scenario():
+        try:
+            rows = await instance.recall("清淡饮食", "early-hydration")
+            assert [row['id'] for row in rows] == [memory['id']]
+            trace = instance.pop_recall_trace("early-hydration")
+            assert trace['status'] == 'partial'
+            assert trace['hydrate_status'] == 'ok'
+        finally:
+            await instance.stop()
+    _run(scenario())
+
+
+@pytest.mark.parametrize("timeout_ms", [0, 1200])
+def test_recall_waits_for_every_stage_without_reserved_sub_budgets(
+        recall_case, monkeypatch, timeout_ms):
+    from backend import memory_engine as module
+    instance, cfg, memory, vector = recall_case
+    cfg.retrieval.soft_timeout_ms = timeout_ms
+    cfg.rerank.enabled = True
+    store = instance._resolve_recall_store()
+    original_recent = store.recent_evidence
+    original_search = vector.search
+    events = []
+
+    def slow_recent(*args, **kwargs):
+        # The old hidden 200ms cap discarded this contextual evidence.
+        time.sleep(.24)
+        return original_recent(*args, **kwargs)
+
+    async def slow_dense(*args, **kwargs):
+        await asyncio.sleep(.12)
+        return await original_search(*args, **kwargs)
+
+    class Reranker:
+        def __init__(self, config): pass
+
+        async def rerank(self, query, documents):
+            await asyncio.sleep(.12)
+            return [(i, 1.0) for i in range(len(documents))]
+
+    monkeypatch.setattr(store, "recent_evidence", slow_recent)
+    monkeypatch.setattr(vector, "search", slow_dense)
+    monkeypatch.setattr(module, "Reranker", Reranker)
+    monkeypatch.setattr(module, "perf_event", lambda name, **fields: events.append((name, fields)))
+
+    async def scenario():
+        try:
+            rows = await asyncio.wait_for(instance.recall("清淡饮食", "all-stages"), 2)
+            assert [row["id"] for row in rows] == [memory["id"]]
+            trace = instance.pop_recall_trace("all-stages")
+            assert trace["status"] == "ok"
+            assert all(trace[f"{stage}_status"] == "ok" for stage in
+                       ("recent", "dense", "lexical", "hydrate", "rerank"))
+            assert "清淡饮食" not in str(events)
+            assert next(fields for name, fields in events if name == "memory.recall_finish")["timeout_ms"] == timeout_ms
+        finally:
+            await instance.stop()
+
+    _run(scenario())
+
+
+def test_unlimited_recall_sql_is_interruptible_and_lane_recovers(recall_case):
+    instance, _, _, _ = recall_case
+    entered = threading.Event()
+    interrupted = threading.Event()
+
+    def expensive(store):
+        with store._connect() as conn:
+            entered.set()
+            try:
+                return conn.execute("""WITH RECURSIVE n(x) AS (
+                    VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000
+                ) SELECT sum(x) FROM n""").fetchone()
+            finally:
+                interrupted.set()
+
+    async def scenario():
+        try:
+            task = asyncio.create_task(instance._recall_store_call(expensive))
+            assert await asyncio.to_thread(entered.wait, 1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert await asyncio.to_thread(interrupted.wait, .5)
+            result = await asyncio.wait_for(instance._recall_store_call(
+                lambda store: store.recent_evidence("default", "s")), .5)
+            assert result == []
+        finally:
+            await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize('timeout_ms', [0, 200])
+def test_recall_retries_lexical_lock_contention_instead_of_returning_empty(
+        recall_case, monkeypatch, timeout_ms):
+    instance, cfg, memory, _ = recall_case
+    cfg.retrieval.soft_timeout_ms = timeout_ms
+    store = instance._resolve_recall_store()
+    original = store._connect
+    attempts = []
+
+    class Connection:
+        def __init__(self): self.context = original()
+
+        def __enter__(self):
+            self.connection = self.context.__enter__()
+            return self
+
+        def __exit__(self, *args): return self.context.__exit__(*args)
+
+        def execute(self, sql, *args):
+            if 'memory_fts MATCH' in sql:
+                attempts.append(True)
+                if len(attempts) < 3:
+                    error = sqlite3.OperationalError('synthetic lock contention')
+                    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                    raise error
+            return self.connection.execute(sql, *args)
+
+    monkeypatch.setattr(store, '_connect', Connection)
+
+    async def scenario():
+        try:
+            rows = await asyncio.wait_for(instance.recall('清淡饮食', 'busy-read'), 1)
+            assert len(attempts) == 3
+            assert [row['id'] for row in rows] == [memory['id']]
+            assert instance.pop_recall_trace('busy-read')['lexical_status'] == 'ok'
+        finally:
+            await instance.stop()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("final_limit,max_chars", [(1, 3000), (6, 3000), (15, 3000), (20, 3000), (15, 500)])
+def test_prepared_recall_injects_configured_limit_and_reports_actual_count(
+    recall_case, monkeypatch, final_limit, max_chars,
+):
+    from backend import memory_client as client, memory_engine as module
+
+    instance, cfg, _, vector = recall_case
+    cfg.retrieval.final_limit = final_limit
+    cfg.retrieval.max_context_chars = max_chars
+    cfg.retrieval.soft_timeout_ms = 0
+    memories = [instance.store.create_memory(
+        "default", "fact", f"Synthetic project {index} uses workspace fixture-{index}." + " Long complete fact." * 100,
+        authority="confirmed", confidence=1.0,
+    ) for index in range(20)]
+
+    async def search(*args, **kwargs):
+        return [{"id": row["id"], "channel": "dense"} for row in memories]
+
+    monkeypatch.setattr(vector, "search", search)
+    monkeypatch.setattr(module, "engine", instance)
+    monkeypatch.setattr(client, "native_enabled", lambda: True)
+    events = []
+    monkeypatch.setattr(client, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    async def scenario():
+        sid = f"configured-limit-{final_limit}-{max_chars}"
+        prompt = "Retrieve the synthetic projects"
+        await client.prepare_recall(sid, "turn", prompt)
+        response = await client.build_recall_hook(sid, prepared_only=True)(
+            {"prompt": prompt}, None, None)
+        block = response["hookSpecificOutput"]["additionalContext"]
+        facts = json.loads(next(line for line in block.splitlines()
+                                if line.startswith('{"facts":')))['facts']
+        trace = client.pop_recall_trace(sid)
+        assert len(facts) == final_limit
+        assert all(len(fact) > 400 for fact in facts)
+        assert trace["matched_count"] == final_limit
+        assert trace["count"] == len(trace["items"]) == len(facts)
+        assert trace["injected"] is True
+        rendering = next(fields for event, fields in events if event == "memory.recall_context")
+        assert rendering["count"] == len(facts)
+        assert rendering["final_limit"] == final_limit
+        assert rendering["context_limited"] is False
+        assert rendering["max_context_chars"] == 0
+        assert "Synthetic project" not in str(events)
+        expected_ids = {row["id"] for row in memories if row["content"] in facts}
+        assert {row["id"] for row in trace["items"]} == expected_ids
+        assert await client.build_recall_hook(sid, prepared_only=True)(
+            {"prompt": prompt}, None, None) == {}
+        await instance.stop()
+
+    _run(scenario())

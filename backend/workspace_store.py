@@ -51,6 +51,22 @@ _IGNORED_SUBTREES = frozenset({
     "share_space",
     "content_agent_freshdoc",
 })
+
+
+def _env_subtree_names(env_name: str) -> frozenset[str]:
+    """Return a trimmed, de-duplicated set of names from a CSV env var."""
+    raw = os.environ.get(env_name, "")
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+# Operators can extend the built-in list (or add prefix families for
+# timestamped snapshot/backup trees) via env, so a workspace rooted at a large
+# directory (e.g. $HOME) can keep bulk data/cache/env trees out of
+# workspace-state.sqlite3 without patching the source.
+_IGNORED_SUBTREES |= _env_subtree_names("MUSELAB_IGNORED_SUBTREES")
+# Snapshot/backup directories often carry a per-export timestamp suffix, so
+# they cannot be matched by exact name; prune whole families by prefix instead.
+_IGNORED_SUBTREE_PREFIXES = _env_subtree_names("MUSELAB_IGNORED_SUBTREE_PREFIXES")
 # A pathological workspace must yield the worker back instead of monopolizing a
 # thread indefinitely. Partial scans merge only observed rows and never infer
 # deletions; a later pass can still establish an authoritative full snapshot.
@@ -105,10 +121,17 @@ def _parent_path(path: str) -> str:
     return path.rpartition("/")[0]
 
 
+def _is_ignored_name(name: str) -> bool:
+    """Return whether a directory name is pruned (exact or prefix match)."""
+    if name in _IGNORED_SUBTREES:
+        return True
+    return any(name.startswith(prefix) for prefix in _IGNORED_SUBTREE_PREFIXES)
+
+
 def is_ignored_descendant(path: str | Path) -> bool:
     """Return whether a path sits below an intentionally opaque subtree."""
     return any(
-        part in _IGNORED_SUBTREES
+        _is_ignored_name(part)
         for part in Path(path).parts[:-1]
     )
 
@@ -212,7 +235,7 @@ def scan_workspace(
                     if (
                         is_dir
                         and not is_symlink
-                        and child.name not in _IGNORED_SUBTREES
+                        and not _is_ignored_name(child.name)
                     ):
                         stack.append((Path(child.path), logical, 0, None))
             if not prefix_verified:
@@ -312,6 +335,14 @@ def workspace_scan_worker(connection: Any, cancel_event: Any) -> None:
         return
     finally:
         connection.close()
+
+
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
 
 
 class WorkspaceStore:
@@ -635,7 +666,7 @@ class WorkspaceStore:
             relative = Path(row["path"])
             if (
                 not relative.parts
-                or relative.name in _IGNORED_SUBTREES
+                or _is_ignored_name(relative.name)
                 or is_ignored_descendant(relative)
             ):
                 continue
@@ -671,7 +702,9 @@ class WorkspaceStore:
         scan_report: dict[str, Any] = report if report is not None else {}
         # Filesystem walking may happen in a separate process. The workspace lock
         # serializes only durable application and native watcher transactions.
+        lock_started = time.monotonic()
         with self._workspace_lock(workspace_id):
+            scan_report["store_lock_wait_ms"] = round((time.monotonic() - lock_started) * 1000)
             if snapshot is None:
                 snapshot = scan_workspace(
                     root,
@@ -696,7 +729,10 @@ class WorkspaceStore:
             with self._connect() as db:
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
+                transaction_started = time.monotonic()
                 db.execute("BEGIN IMMEDIATE")
+                scan_report["transaction_wait_ms"] = round((time.monotonic() - transaction_started) * 1000)
+                apply_started = time.monotonic()
                 state = db.execute(
                     """
                     SELECT initialized, current_seq, path
@@ -834,7 +870,10 @@ class WorkspaceStore:
                 self._prune(db, workspace_id, seq)
                 if cancel_event is not None and cancel_event.is_set():
                     raise WorkspaceScanCancelled("workspace scan cancelled")
+                scan_report["transaction_apply_ms"] = round((time.monotonic() - apply_started) * 1000)
+                commit_started = time.monotonic()
                 db.commit()
+                scan_report["commit_ms"] = round((time.monotonic() - commit_started) * 1000)
                 if return_payload:
                     return {
                         "cursor": seq,
@@ -949,7 +988,7 @@ class WorkspaceStore:
                     "added" not in kinds_by_path[path]
                     or not is_dir
                     or is_symlink
-                    or Path(path).name in _IGNORED_SUBTREES
+                    or _is_ignored_name(Path(path).name)
                 ):
                     continue
 
@@ -1354,6 +1393,7 @@ class WorkspaceStore:
             self.path,
             timeout=30,
             isolation_level=None,
+            factory=_ClosingConnection,
         )
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")

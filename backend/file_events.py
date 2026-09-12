@@ -24,7 +24,7 @@ from watchfiles import Change, awatch
 from .auth import require_token
 from .capability_tickets import tickets
 from .files import INTERNAL_DIR_NAME, TRASH_DIR_NAME
-from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id
+from .observability import elapsed_ms, is_slow, monotonic, perf_event, short_id, to_thread_io
 from .workspace_store import (
     _SCAN_MAX_FILES,
     _SCAN_MAX_SECONDS,
@@ -50,7 +50,9 @@ _RECONCILE_RETRY_MAX_S = 30.0
 _MAX_WATCHED_ROOTS = 16
 _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
+_RECONCILE_MAX_STALE_SCANS = 3
 _SCAN_CANCEL_GRACE_S = 0.25
+_SCAN_EXCHANGE_TIMEOUT_S = max(30.0, _SCAN_MAX_SECONDS * 3)
 _PARTIAL_RECONCILE_YIELD_S = 0.01
 _NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
@@ -1378,13 +1380,12 @@ class FileWatchManager:
             if connection is not None:
                 connection.close()
             return
-        if connection is not None and process.is_alive():
-            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
-                connection.send(None)
-        await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        # The scanner only reads files. Once cooperative cancellation failed,
+        # terminate it without sending into a potentially full IPC pipe on the
+        # event loop (the worker may be stuck in a filesystem call).
         if process.is_alive():
             process.terminate()
-            await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
+        await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
         if process.is_alive():
             process.kill()
             await asyncio.to_thread(process.join, _SCAN_CANCEL_GRACE_S)
@@ -1416,10 +1417,13 @@ class FileWatchManager:
         """Run one bounded scan in the reusable spawned worker."""
         if state.reconcile_cancel.is_set():
             raise WorkspaceScanCancelled("workspace scan cancelled")
+        queued = monotonic()
         async with self._scan_worker_lock:
+            entered = monotonic()
             if state.reconcile_cancel.is_set():
                 raise WorkspaceScanCancelled("workspace scan cancelled")
-            self._ensure_scan_worker_locked()
+            await to_thread_io(
+                "files.scan_worker_start", "", self._ensure_scan_worker_locked, owned=True)
             self._scan_cancel.clear()
             request = (
                 str(state.root),
@@ -1436,7 +1440,13 @@ class FileWatchManager:
                 done, _ = await asyncio.wait(
                     {exchange, cancelled},
                     return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_SCAN_EXCHANGE_TIMEOUT_S,
                 )
+                if not done:
+                    await self._cancel_scan_exchange(exchange)
+                    # No response means no authoritative snapshot. Preserve the
+                    # last-good index and let the existing backoff retry later.
+                    raise WorkspaceScanIncomplete("workspace scan worker deadline exceeded")
                 if cancelled in done:
                     await self._cancel_scan_exchange(exchange)
                     raise WorkspaceScanCancelled("workspace scan cancelled")
@@ -1455,6 +1465,11 @@ class FileWatchManager:
                 await self._stop_scan_worker_locked()
                 await asyncio.gather(cancelled, return_exceptions=True)
                 raise
+            finally:
+                _perf_event(
+                    "files.scan", workspace=short_id(state.workspace_id),
+                    queue_ms=elapsed_ms(queued, entered), duration_ms=elapsed_ms(entered),
+                )
 
             status, rows, report, progress = response
             state.scan_progress = progress if isinstance(progress, dict) else {}
@@ -1552,7 +1567,14 @@ class FileWatchManager:
             "mutation_lock_wait_ms": 0,
             "scan_slot_wait_ms": 0,
             "scan_ms": 0,
+            "stale_scans": 0,
             "replay_ms": 0,
+            "manager_lock_wait_ms": 0,
+            "store_apply_ms": 0,
+            "store_lock_wait_ms": 0,
+            "transaction_wait_ms": 0,
+            "transaction_apply_ms": 0,
+            "commit_ms": 0,
             "scanned_files": 0,
             "snapshot_files": 0,
             "changes": 0,
@@ -1607,7 +1629,14 @@ class FileWatchManager:
                 scan_slot_wait_ms=metrics["scan_slot_wait_ms"],
                 mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
                 scan_ms=metrics["scan_ms"],
+                stale_scans=metrics["stale_scans"],
                 replay_ms=metrics["replay_ms"],
+                manager_lock_wait_ms=metrics["manager_lock_wait_ms"],
+                store_apply_ms=metrics["store_apply_ms"],
+                store_lock_wait_ms=metrics["store_lock_wait_ms"],
+                transaction_wait_ms=metrics["transaction_wait_ms"],
+                transaction_apply_ms=metrics["transaction_apply_ms"],
+                commit_ms=metrics["commit_ms"],
                 scanned_files=metrics["scanned_files"],
                 snapshot_files=metrics["snapshot_files"],
                 changes=metrics["changes"],
@@ -1726,13 +1755,18 @@ class FileWatchManager:
                     ) + elapsed_ms(mutation_lock_started)
                     apply_started = monotonic()
                     try:
-                        # Lifecycle/watch changes own the manager lock; native
-                        # batches own mutation_lock. Hold both through the store's
-                        # atomic cursor/root check and payload construction.
+                        # Only state validation belongs under the global lock.
+                        # Per-workspace mutation_lock still serializes writers;
+                        # deletion sets reconcile_cancel and awaits this task.
+                        manager_wait_started = monotonic()
                         async with self._lock:
-                            if not self._applicability_matches_locked(state, token):
-                                stale_snapshot = True
-                            else:
+                            metrics["manager_lock_wait_ms"] = int(
+                                metrics["manager_lock_wait_ms"]
+                            ) + elapsed_ms(manager_wait_started)
+                            stale_snapshot = not self._applicability_matches_locked(state, token)
+                        if not stale_snapshot:
+                            store_started = monotonic()
+                            try:
                                 result = await asyncio.to_thread(
                                     self.store.apply_reconcile_snapshot,
                                     token.workspace_id,
@@ -1744,6 +1778,19 @@ class FileWatchManager:
                                     primary=state.primary,
                                     cancel_event=state.reconcile_cancel,
                                 )
+                            finally:
+                                for key in ("store_lock_wait_ms", "transaction_wait_ms",
+                                            "transaction_apply_ms", "commit_ms"):
+                                    metrics[key] = int(metrics[key]) + int(scan_report.get(key, 0))
+                                metrics["store_apply_ms"] = int(
+                                    metrics["store_apply_ms"]
+                                ) + elapsed_ms(store_started)
+                            # Watch/lifecycle changes can run while SQLite works.
+                            # Never broadcast a retired generation's payload.
+                            async with self._lock:
+                                stale_snapshot = not self._applicability_matches_locked(state, token)
+                            if state.reconcile_cancel.is_set():
+                                raise WorkspaceScanCancelled("workspace lifecycle changed")
                     finally:
                         metrics["replay_ms"] = int(
                             metrics["replay_ms"]
@@ -1763,6 +1810,12 @@ class FileWatchManager:
                 # A token change invalidates accumulated resume state; a new
                 # applicability window must establish its own complete snapshot.
                 state.scan_progress.clear()
+                metrics["stale_scans"] = int(metrics["stale_scans"]) + 1
+                if metrics["stale_scans"] >= _RECONCILE_MAX_STALE_SCANS:
+                    # Busy workspaces can invalidate every snapshot. Retain
+                    # the last-good index and let the existing retry backoff
+                    # yield disk/CPU time instead of looping through full walks.
+                    raise WorkspaceScanIncomplete("workspace changed during repeated scans")
                 continue
             break
         state.initialized = True

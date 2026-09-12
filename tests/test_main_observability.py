@@ -356,4 +356,24 @@ def test_severe_loop_watchdog_attributes_privacy_safe_site_and_rate_limits(
     )
     assert "/home/" not in repr(events)
     assert "prompt" not in repr(events)
+    assert len(events[0][1]["callers"]) <= 160
     assert events[1][1]["lag_ms"] == 65000
+
+
+def test_history_perf_keeps_receive_parse_and_cancel_reason_private(app_module, client, monkeypatch):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append(fields))
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    payload = {"status": "cancelled", "mode": "quiet", "visibility": "hidden",
+               "cancel_reason": "anchor_missing", "receive_ms": 400,
+               "parse_ms": 2, "first_reveal_ms": 20}
+    assert client.post("/api/log/client-perf", headers=headers, json=payload).status_code == 200
+    assert events[0]["receive_ms"] == 400
+    assert events[0]["parse_ms"] == 2
+    assert events[0]["visibility"] == "hidden"
+    assert events[0]["cancel_reason"] == "anchor_missing"
+    for field in ("visibility", "cancel_reason"):
+        assert client.post("/api/log/client-perf", headers=headers,
+                           json={**payload, field: "private detail"}).status_code == 422
+    assert len(events) == 1

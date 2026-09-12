@@ -58,7 +58,7 @@
     return record;
   }
 
-  function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
+  async function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
     targetRing.push(rec);
     if (targetRing.length > RING_MAX) targetRing.shift();
     try { console[consoleMethod](label, rec); } catch (_) { /* noop */ }
@@ -72,6 +72,23 @@
       // reverse proxies may retain request bodies before MuseLab sees them.
       const wireRecord = _clientErrorWireRecord(rec);
       if (!wireRecord) return;
+      if (window.crypto?.subtle) {
+        for (const [field, value] of [["reason_fp", rec.message], ["trace_fp", rec.stack]]) {
+          if (!value) continue;
+          const bytes = new TextEncoder().encode(String(value).slice(0, 4096));
+          const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+          wireRecord[field] = Array.from(new Uint8Array(digest), byte =>
+            byte.toString(16).padStart(2, "0")).join("").slice(0, 24);
+        }
+      }
+      const appFrame = String(rec.stack || "").match(/(?:\/|^)app\.js(?:\?[^\s:)]*)?:(\d+):(\d+)/);
+      if (appFrame) {
+        wireRecord.app_line = Number(appFrame[1]);
+        wireRecord.app_column = Number(appFrame[2]);
+      }
+      const script = document.querySelector('script[src*="/app.js"]');
+      const revision = script ? new URL(script.src, location.href).searchParams.get("v") : "";
+      if (/^[a-f0-9]{8,64}$/.test(revision || "")) wireRecord.asset_revision = revision;
       const body = JSON.stringify(wireRecord);
       const ok = navigator.sendBeacon &&
                  navigator.sendBeacon("/api/log/client-error",
@@ -183,6 +200,7 @@ const _diffOpsCache = new WeakMap();   // raw msg -> ops[]
 const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
 const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
 const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
+const _toolPathTextCache = new WeakMap(); // raw msg -> escaped path-link fragments
 const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
 // Keyed by the per-tab state proxy. A structural transcript update normally
 // shifts many keyed Alpine rows at once; rebuilding this lookup once keeps each
@@ -365,6 +383,7 @@ class ChatMuxSessionChannel extends EventTarget {
 
 function portal() {
   return {
+    ...window.museTaskDelivery(),
     // ===== auth =====
     authed: false, tokenInput: "", token: "", loginErr: "",
     // 冰霜人机验证：画布像素由 modules/frost-gate.mjs 命令式管理；这几个响应式
@@ -385,6 +404,9 @@ function portal() {
     connState: "ok",
     _connFails: 0,
     _connHeartbeat: null,
+    _healthAbort: null,
+    _healthGeneration: 0,
+    _healthLifecycleBound: false,
     _presenceTimer: null,
     _presenceVisibilityHandler: null,
     _presencePagehideHandler: null,
@@ -472,8 +494,10 @@ function portal() {
     // directory context uploads and OS-file drops all feed the same batch.
     fileUploadProgress: {
       visible: false, known: false, percent: 0,
-      totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0,
+      totalFiles: 0, completedFiles: 0, failedFiles: 0, activeFiles: 0, items: [],
     },
+    _fileUploadLimitPromise: null,
+    _fileUploadAborters: new Map(),
     _fileUploadBatch: null,
     _fileUploadTransferSeq: 0,
     _fileUploadHideTimer: null,
@@ -573,7 +597,7 @@ function portal() {
     // contexts are sandboxed/browser-owned.
     previewQuote: {
       show: false, mode: "actions", source: "", role: "", sessionId: "",
-      messageId: "", text: "", path: "", question: "", followup: "",
+      messageId: "", text: "", path: "", workspace: "", question: "", followup: "",
       x: 0, y: 0, width: 560, height: 520,
       above: false, truncated: false, sending: false,
       askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
@@ -604,6 +628,9 @@ function portal() {
     // Path-bound, short-lived credentials for script-capable HTML iframes.
     // Kept in memory only; never persisted alongside the long-lived API token.
     _previewTickets: {},
+    _previewTicketExpires: {},
+    _previewTicketRequests: new Map(),
+    _previewTicketRetryAt: new Map(),
     _previewViewSaveTimer: null,
     _previewViewRestoreTimers: [],
     _previewRestoringPath: "",
@@ -1104,6 +1131,8 @@ function portal() {
     // RPCs and falls back to local JSONL; neither path reads OAuth credentials
     // or sends a model request. The Gateway may use a different account.
     codexLimit: { windows: {}, updated_at: 0, ok: false },
+    codexLimitLoading: false,
+    codexLimitError: "",
     codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
@@ -1155,6 +1184,7 @@ function portal() {
     leftWidth: 340,
     previewWidth: 440,
     showHidden: false,
+    fileSort: "name",
     // ===== Trash =====
     // Files /delete moves into <ROOT>/.muselab-dustbin/ instead of unlink
     // (see backend/files.py). The trash UI lives as a docked icon at the
@@ -1223,6 +1253,25 @@ function portal() {
     // duplicating on accidental repeated Ctrl+V.
     fileClipboard: { path: "", name: "" },
 
+    browserMetrics: {fcpMs:null, readyMs:null, monitorStartedMs:null, longTasksSupported:false, longTasks:0, longTaskMs:0, turns:[]},
+    browserMetricTime(value) { return Number.isFinite(value) ? Math.round(value) + " ms" : "—"; },
+    async loadBrowserMetrics() {
+      if (!this._browserMetricsPromise) this._browserMetricsPromise = import("/static/modules/browser-metrics.mjs")
+        .then(({createBrowserMetrics}) => { this._browserMetrics = createBrowserMetrics(this); return this._browserMetrics; })
+        .catch(() => { this._browserMetricsPromise = null; return null; });
+      const metrics = await this._browserMetricsPromise;
+      metrics?.publish();
+      return metrics;
+    },
+    htmlAnnotation: { active:false, loading:false, selection:null, comment:"", error:"" },
+    async toggleHtmlAnnotation() {
+      if (!this._htmlAnnotationController) {
+        const { createHtmlAnnotation } = await import("/static/modules/html-annotation.mjs");
+        this._htmlAnnotationController = createHtmlAnnotation(this);
+      }
+      if (this.htmlAnnotation.active || this.htmlAnnotation.loading) this._htmlAnnotationController.stop();
+      else this._htmlAnnotationController.start();
+    },
     // ===== settings =====
     // Keyboard cheat-sheet modal — toggled by `?` keypress outside any
     // input. Discoverability tool: muselab has 10+ shortcuts and no one
@@ -1232,6 +1281,11 @@ function portal() {
     settings: {
       show: false,
       providers: [],
+      contextGroups: [],
+      contextLimits: { providers: {}, models: {} },
+      contextDraft: { provider: "ducc", model: "", tokens: "" },
+      contextSaving: false,
+      contextError: "",
       draftKeys: {},
       draftDefaults: { model: "", permission: "", busy_send_mode: "adjust" },
       // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
@@ -1289,7 +1343,7 @@ function portal() {
           rerank: { enabled: false, base_url: "", api_key: "",
             model: "", timeout_seconds: 3 },
           retrieval: { dense_candidates: 20, lexical_candidates: 20,
-            final_limit: 6, max_context_chars: 3000, soft_timeout_ms: 250 },
+            final_limit: 6, max_context_chars: 0, soft_timeout_ms: 0 },
           consolidation: { episode_turns: 6, episode_idle_minutes: 30,
             dreamer_enabled: true, verifier_enabled: true,
             skill_learning_enabled: true, min_reflection_episodes: 2,
@@ -1297,6 +1351,11 @@ function portal() {
         },
         status: null, probeResult: null, tab: "items", items: [],
         selected: null, query: "", kind: "", itemStatus: "",
+        listLoading: false, listLoaded: false, listError: "",
+        configError: "", statusError: "", configLoaded: false,
+        configLoading: false, statusLoading: false,
+        sort: "auto", direction: "desc", offset: 0, pageSize: 50, total: 0,
+        listGeneration: 0, listCache: {}, advanced: false,
       },
       // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
       versions: null,
@@ -1304,6 +1363,8 @@ function portal() {
       upgradeRunning: false,
       upgradeResult: null,
       restarting: false,    // true while restart is in progress
+      loading: false, error: "", surface: "settings",
+      service: null, serviceLoading: false, serviceError: "", restartStatus: "",
       // Mobile-only: iOS-style 2-level menu state. null = top-level
       // menu list shown; "lang" / "provider" / ... = that section's
       // detail page shown. Desktop ignores this entirely (every
@@ -1410,7 +1471,9 @@ function portal() {
         en: "Create an app in Baidu Qianfan console to get an API key (for ERNIE models). Note: IAM auth, not plain sk-xxx format.",
       },
       CODEX_GATEWAY_API_KEY: {
-        url: "docs/codex-gateway.md",
+        url: "https://github.com/hesorchen/muselab/blob/main/docs/codex-gateway.md",
+        urlZh: "https://github.com/hesorchen/muselab/blob/main/docs/codex-gateway_zh.md",
+        docs: true,
         zh: "连接你本机 127.0.0.1 上的 Codex Gateway。muselab 不保存 Codex OAuth 凭据，也不直接调用 OpenAI 原生接口。",
         en: "Connect your local Codex Gateway on 127.0.0.1. muselab does not store Codex OAuth credentials or call OpenAI-native APIs directly.",
       },
@@ -1485,7 +1548,7 @@ function portal() {
         else if (top === "scheduler") this.closeScheduler();
         else if (top === "session-todo") this.closeSessionTodoBoard();
         else if (top === "activity") this.closeActivityCenter();
-        else if (top === "settings") this.settings.show = false;
+        else if (top === "settings") this.closeSettings();
         else if (top === "image-gen") this.closeImageGen();
         else if (top === "cheatsheet") this.cheatSheet.show = false;
         else if (top === "workspace-browser") this.closeWorkspaceBrowser();
@@ -1617,7 +1680,7 @@ function portal() {
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
-        if (this.settings.show) { this.settings.show = false; return; }
+        if (this.settings.show) { this.closeSettings(); return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
         if (this.previewQuote.show) { this.dismissPreviewQuote(true); return; }
         // 退出编辑 — guard against silently discarding unsaved edits when ESC
@@ -1728,6 +1791,10 @@ function portal() {
       this._initArtifacts();
       this._initStreamSelectionGuard();
       this._initPreviewSelection();
+      this._initAnchoredPopups();
+      const startBrowserMetrics = () => { void this.loadBrowserMetrics(); };
+      if (window.requestIdleCallback) window.requestIdleCallback(startBrowserMetrics, {timeout:3000});
+      else setTimeout(startBrowserMetrics, 1500);
       this._initAriaLabelMirror();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
@@ -1996,6 +2063,7 @@ function portal() {
       } else {
         // No token saved → skip splash, jump straight to login.
         this.appReady = true;
+        performance.mark("muselab-app-ready");
       }
     },
 
@@ -2177,94 +2245,129 @@ function portal() {
       this._syncMobileKeyboardViewport();
     },
 
-    // Attach iOS-style pull-to-refresh to a scrollable element. Mobile
-    // only — skips immediately on devices with no touch (matchMedia
-    // `pointer: coarse` would also wrap iPad pencil; we gate on
-    // `hover: hover` instead, which is true for mouse / trackpad).
-    //
-    // Usage: <ul x-init="_attachPTR($el, () => reloadX())">. The
-    // helper inserts an indicator element above the scroller, listens
-    // to touchstart/move/end, applies a damped translateY while the
-    // user is pulling, and calls onRefresh() when released past 60px.
-    // Indicator stays visible during refresh, snaps back when the
-    // promise resolves (so the user sees progress).
+    // Keep small anchored surfaces attached as panes, fonts and the visible
+    // viewport change. Observers only watch surfaces that are currently open.
+    _initAnchoredPopups() {
+      if (this._anchoredPopupsBound) return;
+      this._anchoredPopupsBound = true;
+      const specs = [
+        [".workbench-more-actions", ".workbench-more > summary", () => !!document.querySelector(".workbench-more[open]"), { width: 230, align: "end" }],
+        ["#history-picker-pop", "#history-picker-trigger", () => this.sessionPickerOpen, { width: 320, maxHeight: 320 }],
+        [".tab-picker-pop", ".tab-picker-btn", () => this.editorTabPickerOpen, { width: 280, maxHeight: 320 }],
+        [".ctx-breakdown-pop", ".chat-toolbar-ring", () => this.ctxBreakdown.show, { width: 340, maxHeight: 520, align: "end", above: true }],
+      ];
+      let active = [], frame = 0;
+      const position = () => {
+        frame = 0;
+        for (const item of active) this._positionAnchoredPopup(...item);
+      };
+      const schedule = (event) => {
+        // Scrolling inside the popup must not move it or reset its scroll.
+        if (event?.type === "scroll" && event.target instanceof Node
+            && active.some(([, pop]) => pop.contains(event.target))) return;
+        if (active.length && !frame) frame = requestAnimationFrame(position);
+      };
+      const observer = window.ResizeObserver ? new ResizeObserver(schedule) : null;
+      const sync = () => this.$nextTick(() => {
+        observer?.disconnect();
+        active = [];
+        for (const [selector, anchorSelector, isOpen, options] of specs) {
+          const popup = document.querySelector(selector);
+          const anchor = document.querySelector(anchorSelector);
+          if (!isOpen() || !popup || !anchor || !popup.getClientRects().length) continue;
+          active.push([anchor, popup, options]);
+          observer?.observe(popup);
+          observer?.observe(anchor);
+          const pane = anchor.closest(".pane");
+          if (pane) observer?.observe(pane);
+        }
+        schedule();
+      });
+      for (const key of ["sessionPickerOpen", "editorTabPickerOpen", "ctxBreakdown.show", "mobileTab", "desktopFullPane"]) this.$watch(key, sync);
+      document.addEventListener("toggle", event => {
+        if (event.target.matches?.(".workbench-more")) sync();
+      }, true);
+      document.addEventListener("scroll", schedule, true);
+      window.addEventListener("resize", schedule);
+      window.visualViewport?.addEventListener("resize", schedule);
+      window.visualViewport?.addEventListener("scroll", schedule);
+      sync();
+    },
+    _positionAnchoredPopup(anchor, popup, options) {
+      if (!popup.isConnected || !anchor.isConnected || !popup.getClientRects().length) return;
+      const vv = window.visualViewport;
+      const pad = 8, gap = 6;
+      const pane = anchor.closest(".pane")?.getBoundingClientRect();
+      // Panes clip their descendants, and mobile navigation sits outside them.
+      // Fit within both the visual viewport and the owning pane's visible area.
+      const minX = Math.max(vv?.offsetLeft || 0, pane?.left || 0) + pad;
+      const minY = Math.max(vv?.offsetTop || 0, pane?.top || 0) + pad;
+      const right = Math.min((vv?.offsetLeft || 0) + (vv?.width || window.innerWidth), pane?.right ?? Infinity) - pad;
+      const bottom = Math.min((vv?.offsetTop || 0) + (vv?.height || window.innerHeight), pane?.bottom ?? Infinity) - pad;
+      const a = anchor.getBoundingClientRect();
+      if (!a.width || !a.height || a.bottom < minY || a.top > bottom || a.right < minX || a.left > right) {
+        popup.style.visibility = "hidden";
+        return;
+      }
+      Object.assign(popup.style, {
+        position: "fixed", top: "0px", left: "0px", right: "auto", bottom: "auto",
+        transform: "none", boxSizing: "border-box", overflowY: "auto",
+        width: `${Math.max(1, Math.min(options.width, right - minX))}px`,
+      });
+      // Measure content at its final width, retaining the current height limit
+      // so repositioning does not temporarily expand a scrolled menu and reset it.
+      const origin = popup.getBoundingClientRect();
+      const css = getComputedStyle(popup);
+      const borders = parseFloat(css.borderTopWidth) + parseFloat(css.borderBottomWidth);
+      const cap = Math.max(1, Math.min(options.maxHeight || 520, bottom - minY));
+      const wanted = Math.min(cap, Math.max(origin.height, popup.scrollHeight + borders));
+      const aboveRoom = Math.max(0, a.top - minY - gap);
+      const belowRoom = Math.max(0, bottom - a.bottom - gap);
+      const above = options.above
+        ? aboveRoom >= wanted || aboveRoom >= belowRoom
+        : belowRoom < wanted && aboveRoom > belowRoom;
+      popup.style.maxHeight = `${Math.max(1, Math.min(cap, above ? aboveRoom : belowRoom))}px`;
+      const rect = popup.getBoundingClientRect();
+      const x = Math.max(minX, Math.min(options.align === "end" ? a.right - rect.width : a.left, right - rect.width));
+      const y = Math.max(minY, Math.min(above ? a.top - gap - rect.height : a.bottom + gap, bottom - rect.height));
+      // A transformed containing block can offset fixed coordinates. Subtract
+      // its measured origin instead of adding safe-area offsets a second time.
+      popup.style.left = `${x - origin.left}px`;
+      popup.style.top = `${y - origin.top}px`;
+      popup.style.visibility = "visible";
+    },
+
+    // Attach iOS-style pull-to-refresh to the file tree.
+    // Pull-to-refresh shares reloadTree's loading state and refresh-button
+    // animation; it does not add a second status overlay above the file list.
     _attachPTR(el, onRefresh) {
       if (!el || typeof onRefresh !== "function") return;
       if (window.matchMedia && window.matchMedia("(hover: hover)").matches) return;
-      // Insert indicator just above the scroller (inside the same flex
-      // parent so layout doesn't shift). pointer-events:none — pulling
-      // the indicator itself shouldn't intercept the user's gesture.
-      const ind = document.createElement("div");
-      ind.className = "ptr-indicator";
-      ind.innerHTML = "<span class='ptr-icon'>↓</span><span class='ptr-text'></span>";
-      const txt = ind.querySelector(".ptr-text");
-      const icon = ind.querySelector(".ptr-icon");
-      el.parentElement.insertBefore(ind, el);
-      const THRESHOLD = 60;
+      const THRESHOLD = 120;
       let startY = 0, currentY = 0, pulling = false, refreshing = false;
-      const setLabel = (state) => {
-        const zh = this.lang === "zh";
-        if (state === "pull")    txt.textContent = zh ? "下拉刷新" : "Pull to refresh";
-        else if (state === "release") txt.textContent = zh ? "释放刷新" : "Release to refresh";
-        else if (state === "loading") txt.textContent = zh ? "刷新中…" : "Refreshing…";
-      };
       el.addEventListener("touchstart", (e) => {
-        if (refreshing) return;
-        if (el.scrollTop > 0) return;
-        startY = e.touches[0].clientY;
-        currentY = startY;
+        pulling = false;
+        if (refreshing || el.scrollTop > 0 || e.touches.length !== 1) return;
+        startY = currentY = e.touches[0].clientY;
         pulling = true;
       }, { passive: true });
       el.addEventListener("touchmove", (e) => {
         if (!pulling || refreshing) return;
+        if (e.touches.length !== 1 || el.scrollTop > 0) { pulling = false; return; }
         currentY = e.touches[0].clientY;
-        const dy = currentY - startY;
-        if (dy <= 0) {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-          return;
-        }
-        // Prevent page-level overscroll while the user is actively
-        // pulling — without this, iOS Safari bounces the whole page.
-        // Only block when we're genuinely pulling (dy > a few px).
-        if (dy > 4 && el.scrollTop === 0 && e.cancelable) e.preventDefault();
-        const damped = Math.min(dy * 0.5, 90);
-        ind.style.transform = `translateY(${damped}px)`;
-        ind.style.opacity = String(Math.min(1, damped / 40));
-        icon.style.transform = damped >= THRESHOLD ? "rotate(180deg)" : "";
-        setLabel(damped >= THRESHOLD ? "release" : "pull");
+        // Keep a downward pull at the top from bouncing the whole iOS page.
+        if (currentY - startY > 4 && e.cancelable) e.preventDefault();
       }, { passive: false });
       el.addEventListener("touchend", async () => {
         if (!pulling || refreshing) return;
         pulling = false;
-        const dy = currentY - startY;
-        if (dy * 0.5 >= THRESHOLD) {
-          refreshing = true;
-          ind.style.transform = `translateY(50px)`;
-          ind.style.opacity = "1";
-          icon.style.transform = "";
-          ind.classList.add("ptr-spinning");
-          setLabel("loading");
-          try { await onRefresh(); }
-          catch (e) { /* swallow — the refresh fn's own toast handles err */ }
-          finally {
-            ind.classList.remove("ptr-spinning");
-            ind.style.transform = "";
-            ind.style.opacity = "0";
-            refreshing = false;
-          }
-        } else {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-        }
+        if (currentY - startY < THRESHOLD) return;
+        refreshing = true;
+        try { await onRefresh(); }
+        catch (_) { /* reloadTree owns error feedback. */ }
+        finally { refreshing = false; }
       }, { passive: true });
-      el.addEventListener("touchcancel", () => {
-        pulling = false;
-        if (!refreshing) {
-          ind.style.transform = "";
-          ind.style.opacity = "0";
-        }
-      });
+      el.addEventListener("touchcancel", () => { pulling = false; });
     },
 
     async _openStartupActivityDeeplink() {
@@ -2352,19 +2455,8 @@ function portal() {
       // (the already-open-tab case is handled via the SW postMessage above).
       this._openStartupActivityDeeplink();
       this.initSessions().then(() => this._openStartupSessionDeeplink());
-      // First-run hint — surface key shortcuts so the user doesn't have to
-      // hunt for them. Flagged in localStorage so it only fires once. Short
-      // delay lets the splash clear first.
-      if (!localStorage.getItem("muselab_seen_help")) {
-        setTimeout(() => {
-          this.toast(
-            this.lang === "zh"
-              ? "Tip：⌘K 命令面板 · @ 引用文件或目录 · ↑ 回滚上一条"
-              : "Tip: ⌘K command palette · @ to reference files or folders · ↑ to recall last message",
-            "info", 7000);
-          this._setLS("muselab_seen_help", "1");
-        }, 1500);
-      }
+      // Shortcuts remain discoverable in the command button and empty preview.
+      // Boot success needs no extra toast over the first useful interaction.
       // Same preview-file restore that login() does — covers the
       // already-authed boot path (page refresh with saved token).
       if (this._pendingPreviewSelected && this.previewSurface !== "terminal") {
@@ -2496,6 +2588,7 @@ function portal() {
     _markReady() {
       if (this.appReady) return;
       this.appReady = true;
+      performance.mark("muselab-app-ready");
       clearTimeout(this._splashHintTimer);
       clearTimeout(this._splashHardTimeout);
       this.splashHint = "";
@@ -2578,9 +2671,23 @@ function portal() {
 
     // 10s heartbeat — pings /api/meta. If 2 consecutive fails, flag reconnecting;
     // when one comes back, flash "reconnected" then auto-clear.
+    _cancelHealthRequest() {
+      ++this._healthGeneration;
+      if (this._healthAbort) this._healthAbort.abort();
+      this._healthAbort = null;
+    },
     _startHeartbeat() {
+      this._cancelHealthRequest();
       if (this._connHeartbeat) clearInterval(this._connHeartbeat);
       this._connHeartbeat = setInterval(() => this._pingHealth(), 10_000);
+      if (!this._healthLifecycleBound) {
+        this._healthLifecycleBound = true;
+        window.addEventListener("pagehide", () => this._cancelHealthRequest());
+        window.addEventListener("pageshow", () => { void this._pingHealth(); });
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") this._cancelHealthRequest();
+        });
+      }
     },
 
     // Presence heartbeat — tells the backend "this device is at the
@@ -2669,9 +2776,19 @@ function portal() {
       // gap on return.
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") return;
+      if (this._healthAbort) return;
+      const controller = new AbortController();
+      const generation = this._healthGeneration;
+      this._healthAbort = controller;
       try {
-        const r = await fetch("/api/meta", { headers: this.hdr() });
-        if (!r.ok) throw new Error("status " + r.status);
+        let meta;
+        await this._fetchWithDeadline("/api/meta", {
+          headers: this.hdr(), signal: controller.signal,
+        }, this.REQUEST_DEADLINE_MS, async response => {
+          if (!response.ok) throw new Error("status " + response.status);
+          meta = await response.json();
+        });
+        if (generation !== this._healthGeneration || controller.signal.aborted) return;
         // Stale-JS detector. Mobile Safari frequently resumes a
         // backgrounded PWA tab without re-fetching HTML, so the page
         // keeps running last week's app.js against today's API. When
@@ -2682,7 +2799,6 @@ function portal() {
         // is mid-stream or the meta tag is missing (old HTML still
         // cached, no placeholder).
         try {
-          const meta = await r.clone().json();
           this.terminalEnabled = !!(meta && meta.terminal_enabled);
           const remoteVer = meta && meta.asset_version;
           if (remoteVer && !this._appVersionReloadFired) {
@@ -2724,11 +2840,14 @@ function portal() {
         // bell badge live without forcing the user to open the drawer.
         this.fetchSchedulerUnread();
       } catch (e) {
+        if (generation !== this._healthGeneration || controller.signal.aborted) return;
         this._connFails++;
         if (this._connFails >= 2) this.connState = "reconnecting";
         // Splash → if we never managed to ready up, force ready so user sees
         // the banner (otherwise they stare at splash with no feedback).
         if (!this.appReady) this._markReady();
+      } finally {
+        if (this._healthAbort === controller) this._healthAbort = null;
       }
     },
 
@@ -3004,16 +3123,38 @@ function portal() {
         m.setAttribute("content", themeColor);
       });
     },
+    _colorContrast(first, second) {
+      const luminance = hex => {
+        const rgb = this._hex2rgb(hex);
+        const linear = value => {
+          const v = value / 255;
+          return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+        };
+        return 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+      };
+      const a = luminance(first), b = luminance(second);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    },
     applyAccent() {
-      // 主色 + 派生色（hover / soft 半透明 / 文字色用浅化 mix 实现）
       const r = document.documentElement.style;
       const isLight = this.theme === "light" || this.theme === "eyecare";
-      r.setProperty("--c-accent", this.accent);
-      r.setProperty("--c-accent-hover", this._shade(this.accent, isLight ? -15 : 12));
-      r.setProperty("--c-accent-soft", this._withAlpha(this.accent, isLight ? 0.10 : 0.14));
-      r.setProperty("--c-accent-fg", isLight
-        ? this._shade(this.accent, -25)
-        : this._shade(this.accent, 25));
+      const accent = /^#[0-9a-f]{6}$/i.test(this.accent) ? this.accent : "#6093ff";
+      const surface = getComputedStyle(document.documentElement)
+        .getPropertyValue("--c-bg-3").trim() || (isLight ? "#e6e9ee" : "#232830");
+      let text = accent;
+      for (let mix = 5; mix <= 100 && this._colorContrast(text, surface) < 5; mix += 5) {
+        text = this._shade(accent, isLight ? -mix : mix);
+      }
+      const button = isLight ? text : accent;
+      const onAccent = this._colorContrast(button, "#ffffff") >= this._colorContrast(button, "#000000")
+        ? "#ffffff" : "#000000";
+      r.setProperty("--c-accent", accent);
+      r.setProperty("--c-accent-hover", this._shade(accent, isLight ? -15 : 12));
+      r.setProperty("--c-accent-soft", this._withAlpha(accent, isLight ? 0.10 : 0.14));
+      r.setProperty("--c-accent-fg", text);
+      r.setProperty("--c-btn-primary-bg", button);
+      r.setProperty("--c-btn-primary-hover", this._shade(button, isLight ? -10 : 8));
+      r.setProperty("--c-on-accent", onAccent);
     },
     setAccent(color) {
       this.accent = color;
@@ -3074,7 +3215,7 @@ function portal() {
         if (Number.isInteger(i) && i >= 0 && i < this.MASCOTS.length) {
           this.mascotIdx = i;
           this.applyFavicon();
-          setTimeout(() => this.greetMascot(this.mascotLabel()), 400);
+          setTimeout(() => this.greetMascot(), 400);
           return;
         }
       }
@@ -3088,7 +3229,7 @@ function portal() {
       this.mascotIdx = Math.abs(h) % this.MASCOTS.length;
       try { localStorage.setItem("muselab_mascot_idx", String(this.mascotIdx)); } catch {}
       this.applyFavicon();
-      setTimeout(() => this.greetMascot(this.mascotLabel()), 400);
+      setTimeout(() => this.greetMascot(), 400);
     },
     mascot() { return this.MASCOTS[this.mascotIdx]; },
     mascotHref() { return "#m-" + this.mascot().id; },
@@ -3220,6 +3361,7 @@ function portal() {
       this.eyecareLevel = next;
       this._setLS("muselab_eyecare_level", String(next));
       this.applyTheme();
+      this.applyAccent();
       if (this._terminal) this._terminal.options.theme = this._terminalTheme();
     },
 
@@ -4789,6 +4931,12 @@ function portal() {
       tmp.innerHTML = html;
       let changed = false;
       for (const img of tmp.querySelectorAll("img[src]")) {
+        const resourcePath = img.getAttribute("data-muselab-resource-path");
+        if (resourcePath) {
+          img.setAttribute("src", this.rawUrl(resourcePath));
+          changed = true;
+          continue;
+        }
         let src = img.getAttribute("src") || "";
         // Skip scheme: (http/https/data/blob/…), protocol-relative //, root-
         // absolute / (covers /api/files/raw), and #anchors — only relatives left.
@@ -4803,6 +4951,7 @@ function portal() {
         }
         const resolved = segs.join("/");
         if (!resolved) continue;
+        img.setAttribute("data-muselab-resource-path", resolved);
         img.setAttribute("src", this.rawUrl(resolved));
         if (!img.getAttribute("loading")) img.setAttribute("loading", "lazy");
         changed = true;
@@ -4821,6 +4970,53 @@ function portal() {
       const path = inp.file_path || inp.notebook_path || "";
       return this._normalizeWorkspacePath(path);
     },
+    // Tool summaries/stdout are plain text, never Markdown or executable
+    // HTML. Link only path-shaped tokens and route clicks through the same
+    // workspace preview handler used by Read/Edit. Bound scanning and memoize
+    // per message so streaming unrelated rows does not repeatedly parse output.
+    toolTextHtml(m, text, slot = "summary") {
+      const source = String(text || "");
+      const root = this.currentWorkspacePath()
+        || (this.contextInfo || {}).workspace_root
+        || (this.contextInfo || {}).archive_root || "";
+      const raw = _rawMsg(m);
+      let cache = _toolPathTextCache.get(raw);
+      const hit = cache && cache[slot];
+      if (hit && hit.source === source && hit.root === root) return hit.html;
+      const tokens = /"[^"\r\n]+"|'[^'\r\n]+'|[^\s"'`<>|;&()[\]{}]+/gu;
+      const pathShape = /^([\p{L}\p{N}_@./~+ ()-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
+      let html = "", end = 0, linked = 0;
+      for (const match of source.slice(0, 65536).matchAll(tokens)) {
+        let candidate = match[0], start = match.index;
+        if (candidate.startsWith('"') || candidate.startsWith("'")) {
+          candidate = candidate.slice(1, -1);
+          start += 1;
+        }
+        const assignment = candidate.indexOf("=");
+        if (assignment >= 0) {
+          start += assignment + 1;
+          candidate = candidate.slice(assignment + 1);
+        }
+        candidate = candidate.replace(/[,.]+$/, "");
+        if (!candidate || candidate.length > 512 || candidate.startsWith("//")
+            || (candidate.includes("@") && !candidate.includes("/"))) continue;
+        const parsed = candidate.match(pathShape);
+        if (!parsed) continue;
+        const path = this._normalizeWorkspacePath(parsed[1]);
+        if (!path) continue;
+        html += this.escape(source.slice(end, start));
+        html += `<a class="file-link" href="#" data-path="${this.escape(path)}"`
+          + (parsed[2] ? ` data-line="${parsed[2]}"` : "")
+          + `>${this.escape(candidate)}</a>`;
+        end = start + candidate.length;
+        if (++linked >= 64) break;
+      }
+      html += this.escape(source.slice(end));
+      if (!cache) { cache = {}; _toolPathTextCache.set(raw, cache); }
+      cache[slot] = { source, root, html };
+      return html;
+    },
+
     // Render mcp__<server>__<tool> nicely: drop the mcp__ prefix, replace __ with " · "
     renderToolName(name) {
       if (!name) return "";
@@ -4945,6 +5141,9 @@ function portal() {
     // their final rich render is cached only after a terminal/tool boundary.
     mdRender(text) {
       if (!text) return "";
+      // A dependency outage must fail closed without caching its fallback:
+      // restoring the sanitizer should immediately restore rich rendering.
+      if (!window.DOMPurify) return "<pre>" + this.escape(text) + "</pre>";
       const cache = this._mdCache || (this._mdCache = new Map());
       const hit = cache.get(text);
       if (hit !== undefined) {
@@ -5193,7 +5392,7 @@ function portal() {
       } catch (e) {
         raw = "<pre>" + this.escape(text) + "</pre>";
       }
-      if (!window.DOMPurify) return this._unmaskMath(raw, _mathStore);
+      if (!window.DOMPurify) return "<pre>" + this.escape(text) + "</pre>";
       let safe = window.DOMPurify.sanitize(raw, {
         USE_PROFILES: { html: true, mathMl: true },          // KaTeX may emit MathML
         FORBID_TAGS: ["style", "iframe", "form", "object", "embed"],
@@ -5823,7 +6022,11 @@ function portal() {
         });
         if (!r.ok) {
           const p = await r.json().catch(() => ({}));
-          throw new Error(p.detail || this.t("login.err"));
+          const error = new Error(p.detail || this.t("login.err"));
+          // 携带 status/retryAfter，让下方 catch 能按状态分级提示。
+          error.status = r.status;
+          error.retryAfter = r.headers.get("Retry-After");
+          throw error;
         }
         // 登录成功：先拆冰霜画布（清定时器/监听），再翻转 authed，让
         // <template x-if="!authed"> 把登录块从 DOM 移除。
@@ -5862,7 +6065,25 @@ function portal() {
         // manual refresh. Shared with _bootApp; safe to call once here.
         this._startLiveConnections();
       } catch (e) {
-        this.loginErr = e.message;
+        const zh = this.lang === "zh";
+        if (e.status === 429) {
+          const seconds = Number(e.retryAfter);
+          this.loginErr = Number.isFinite(seconds) && seconds > 0 && seconds <= 3600
+            ? (zh ? `请求过于频繁，请在 ${Math.ceil(seconds)} 秒后重试。` : `Too many requests. Try again in ${Math.ceil(seconds)} seconds.`)
+            : (zh ? "请求过于频繁，请稍后重试。" : "Too many requests. Please try again later.");
+        } else if (e.status === 400) {
+          // 冰霜 proof 校验失败（服务器 detail 为中文提示，这里统一走 i18n）。
+          this.loginErr = zh ? "请先完成页面验证。" : "Please complete the page verification first.";
+        } else if (e.status === 401 || e.status === 403) {
+          this.loginErr = zh ? "访问令牌无效，请检查后重试。" : "Invalid access token. Check it and try again.";
+        } else if (e.status >= 500) {
+          this.loginErr = zh ? "服务暂时不可用，请稍后重试。" : "The service is temporarily unavailable. Please try again later.";
+        } else if (e.status) {
+          // 其他带 status 的错误：展示服务器 detail（/api/login 的中文提示）。
+          this.loginErr = e.message;
+        } else {
+          this.loginErr = zh ? "暂时无法连接服务，请检查网络后重试。" : "Unable to connect. Check your network and try again.";
+        }
         // proof 单次有效且失败已计入服务端 rate-limit；重置画布 + 重新取
         // challenge，让用户重新擦霜再试。
         this._frostChallengePromise = null;
@@ -5987,7 +6208,7 @@ function portal() {
       return error;
     },
     async _fetchWithDeadline(
-      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS,
+      url, options = {}, deadlineMs = this.REQUEST_DEADLINE_MS, consumeResponse = null,
     ) {
       const upstream = options.signal;
       if (upstream && upstream.aborted) throw this._abortError();
@@ -6014,7 +6235,12 @@ function portal() {
       try {
         // Keep the explicit race even though native fetch observes AbortSignal:
         // test doubles and embedded WebViews are not always abort-cooperative.
-        return await Promise.race([fetch(url, fetchOptions), control]);
+        const operation = (async () => {
+          const response = await fetch(url, fetchOptions);
+          if (consumeResponse) await consumeResponse(response);
+          return response;
+        })();
+        return await Promise.race([operation, control]);
       } finally {
         settled = true;
         clearTimeout(timer);
@@ -6264,6 +6490,7 @@ function portal() {
     },
     _commitChatRecoveryDraft(id, text) {
       if (!id || typeof text !== "string" || !text) return;
+      if (this.tabState[id]?._uncertainSubmission) return;
       const record = this._chatDraftRecord(id);
       if (record.pending === text) {
         record.pending = "";
@@ -7138,6 +7365,7 @@ function portal() {
         leftOpen: this.leftOpen, previewOpen: this.previewOpen,
         leftWidth: this.leftWidth, previewWidth: this.previewWidth,
         showHidden: this.showHidden,
+        fileSort: this.fileSort,
         openFilesCollapsed: this.openFilesCollapsed,
         openFilesHeight: this.openFilesHeight,
         // Mobile-only: remember which of the 3 tabs (files / preview / chat)
@@ -7214,6 +7442,7 @@ function portal() {
         if (typeof p.previewWidth === "number") this.previewWidth = p.previewWidth;
         else if (typeof p.rightWidth === "number") this.previewWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
+        if (["name", "mtime_desc", "mtime_asc"].includes(p.fileSort)) this.fileSort = p.fileSort;
         if (p.currentId) this.currentId = p.currentId;
         // The standalone key is authoritative. p.openTabIds is accepted only as
         // a one-time migration source for users upgrading from schema <= 9.
@@ -7328,14 +7557,22 @@ function portal() {
     },
 
     async fetchCodexRateLimit(opts = {}) {
+      if (this.codexLimitLoading) return;
+      this.codexLimitLoading = true;
+      this.codexLimitError = "";
       try {
         const qs = opts.refresh ? "?refresh=1" : "";
         const r = await fetch(`/api/chat/codex-rate-limit${qs}`, {
           headers: this.hdr(),
           cache: "no-store",
+          signal: AbortSignal.timeout(35000),
         });
-        if (r.ok) {
-          const d = await r.json();
+        if (!r.ok) throw new Error("quota_http_failed");
+        const d = await r.json();
+        // Keep the newest known snapshot after a failed refresh. Session logs
+        // may predate a previous successful account read in this browser.
+        const failed = d.refresh?.ok === false || !d.ok;
+        if (!failed || (d.updated_at || 0) > (this.codexLimit.updated_at || 0)) {
           this.codexLimit = {
             ...d,
             windows: d.windows || {},
@@ -7343,11 +7580,33 @@ function portal() {
             ok: !!d.ok,
             provider_authoritative: !!d.provider_authoritative,
           };
-          this.codexBadge = this.codexLimit.provider_authoritative
-            ? this.limitBadgeFromWindows(this.codexLimit.windows)
-            : null;
         }
-      } catch {}
+        if (failed) {
+          this.codexLimit.stale = true;
+          this.codexLimit.account_authoritative = false;
+          this.codexLimitError = d.refresh?.reason || d.reason || "codex_account_rpc_failed";
+        }
+        this.codexBadge = !failed && !this.codexLimit.stale && this.codexLimit.provider_authoritative
+          ? this.limitBadgeFromWindows(this.codexLimit.windows)
+          : null;
+      } catch {
+        this.codexLimitError = "codex_quota_network_failed";
+        this.codexLimit.stale = true;
+        this.codexLimit.account_authoritative = false;
+        this.codexBadge = null;
+      } finally {
+        this.codexLimitLoading = false;
+      }
+    },
+    codexLimitStatusText() {
+      if (this.codexLimitLoading) return this.t("set.cost.codex_quota_loading");
+      const keys = {
+        codex_auth_required: "set.cost.codex_quota_auth",
+        codex_not_found: "set.cost.codex_quota_cli_missing",
+        codex_account_rpc_unsupported: "set.cost.codex_quota_unsupported",
+      };
+      if (this.codexLimitError) return this.t(keys[this.codexLimitError] || "set.cost.codex_quota_failed");
+      return "";
     },
 
     // Pull the current Pro/Max rate-limit snapshot. SSE pushes live deltas
@@ -8812,6 +9071,22 @@ function portal() {
         st._queueMutating = {};
       }
       if (st._queueAdmission === undefined) st._queueAdmission = null;
+      this._restoreOutgoing(id, st);
+      if (!st._submissionRecoveryChecked) {
+        st._submissionRecoveryChecked = true;
+        try {
+          const record = JSON.parse(localStorage.getItem("muselab_submission_" + id) || "null");
+          if (record?.requestId && ["turn", "queue"].includes(record.kind)) {
+            st._uncertainSubmission = record;
+            st._submissionRecoveredDraft = true;
+            st._queueAdmission = {
+              id: "q-" + record.requestId, _submitToken: record.requestId,
+              displayText: record.input || "", _admissionPending: true, _uncertain: true,
+            };
+            setTimeout(() => this.reconcileSubmission(id), 0);
+          }
+        } catch (_) {}
+      }
       return st;
     },
     _sessionSyncNeedsVisibility(reason) {
@@ -8827,6 +9102,7 @@ function portal() {
       const now = Date.now();
       for (const [sid, st] of Object.entries(this.tabState || {})) {
         const sync = st && st.sessionSync;
+        if (sid === this.currentId && st?._uncertainSubmission) this.reconcileSubmission(sid);
         if (!sync) continue;
         for (const request of Object.values(sync.pending || {})) {
           if (this._sessionSyncNeedsVisibility(request.reason)) {
@@ -9028,6 +9304,7 @@ function portal() {
       }
     },
     _disposeSessionSync(st) {
+      if (st?._outgoingTimer) clearTimeout(st._outgoingTimer);
       if (!st || !st.sessionSync) return;
       const sync = st.sessionSync;
       const inFlight = sync.inFlight;
@@ -9069,7 +9346,7 @@ function portal() {
       const st = this.tabState[sid];
       return !!(this.isTabStreaming(sid)
         || (st && (st.compacting || st.backgroundActive || st._draining
-          || (st.pendingQueue && st.pendingQueue.length))));
+          || this.queuePendingItems(st).length)));
     },
     composerClaimed(sid = this.currentId) {
       const st = sid && this.tabState && this.tabState[sid];
@@ -9088,9 +9365,6 @@ function portal() {
       }
       const st = this.tabState && this.tabState[sid];
       if (!st) return zh ? "正在准备会话" : "Preparing the session";
-      if (st._stoppingTurnId) {
-        return zh ? "正在中断上一条任务" : "Stopping the previous turn";
-      }
       if (st._permissionChangePending) return this.t("perm.switching");
       if (this.runtimeSettingsPending(sid)) {
         return zh ? "正在保存运行设置" : "Saving runtime settings";
@@ -9142,7 +9416,7 @@ function portal() {
       // advertise ordinary FIFO immediately instead of briefly promising an
       // adjustment that the queue endpoint must downgrade after the POST.
       if (!st || !turnId || attachmentIntent || st.compacting
-          || st.backgroundActive || st._draining || st.parentTurnId
+          || (!st.streaming && (st.backgroundActive || st._draining)) || st.parentTurnId
           || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
       }
@@ -9201,7 +9475,7 @@ function portal() {
     },
     _pendingQueueAllowsAdjustment(st, activeTurnId = "") {
       if (!st || st._queueAdmission) return false;
-      const pending = Array.isArray(st.pendingQueue) ? st.pendingQueue : [];
+      const pending = this.queuePendingItems(st);
       if (!pending.length) return true;
       const turnId = String(activeTurnId || "");
       // Multiple native `priority=next` commands may target the same immutable
@@ -9254,7 +9528,7 @@ function portal() {
       // answer. A migrated/draining queue also remains FIFO: never launch a
       // direct turn in the short child handoff gap.
       if (st && (st.streaming || st.compacting || st.backgroundActive
-          || st._draining || (st.pendingQueue && st.pendingQueue.length))) {
+          || this.queuePendingItems(st).length)) {
         return true;
       }
       const session = (this.sessions || []).find(s => s.id === sid);
@@ -9263,7 +9537,8 @@ function portal() {
       // nevertheless retains its background watcher state and must probe the
       // source instead of treating the missing row as idle; otherwise a
       // second device can try to start a foreground turn on the old CLI.
-      if ((!session || !session.active) && !(st && st.backgroundActive)) {
+      if ((!session || !session.active)
+          && !(st && (st.backgroundActive || st._draining))) {
         return false;
       }
       // session.active is a polled cache and can remain true for one response
@@ -9282,6 +9557,13 @@ function portal() {
         const status = await r.json();
         if (this.tabState[sid] !== st) return true;
         const active = !!status.active;
+        if (status.finishing && !status.background && !status.scheduled
+            && !Number(status.background_tasks_pending)
+            && !this.queuePendingItems(st).length) {
+          // Let direct admission wait for this terminal owner. The public
+          // active flag remains true so replay and ownership stay intact.
+          return false;
+        }
         if (status.background) {
           this._setBackgroundTaskActive(
             sid, active, status.started_at, status.background_tasks_pending);
@@ -9373,26 +9655,69 @@ function portal() {
     // refreshes it via _syncQueueFromServer on load / tab-activate / after any
     // turn or mutation. Every mutation below hits an endpoint then re-syncs.
     queueDeliveryLabel(item) {
+      if (item?._outgoingRecord) return this.outgoingLabel(item._outgoingRecord);
+      if (item?.held) return this.lang === "zh" ? "已暂停" : "Paused";
+      if (item?._uncertain) return this.lang === "zh" ? "等待连接，自动恢复" : "Waiting for connection";
+      if (item?._admissionPending) return this.lang === "zh" ? "正在提交" : "Submitting";
+      const issue = this.queueItemIssue(item);
+      if (issue === "cancelled") return this.lang === "zh" ? "已取消" : "Cancelled";
+      if (issue === "attachment_unavailable") return this.lang === "zh" ? "附件不可用" : "Attachment unavailable";
+      if (issue === "failed") return this.lang === "zh" ? "发送或执行失败" : "Send or execution failed";
+      if (issue) return this.lang === "zh" ? "送达状态待确认" : "Delivery needs review";
       const state = String(item && item.deliveryStatus || "");
       const delivery = this._normalizeBusySendMode(
         item && item.delivery,
         "queue",
       );
-      if (delivery !== "adjust" || state === "fallback"
-          || state === "cancelled") {
+      if (delivery !== "adjust" || state === "fallback") {
         return this.lang === "zh" ? "排队中" : "Queued";
       }
       if (state === "started") {
         return this.lang === "zh" ? "已交给当前任务" : "Handed to current task";
       }
       return this.lang === "zh"
-        ? "等待当前工具完成" : "Waiting for current tool";
+        ? "等待本轮接收输入" : "Waiting for this turn to accept input";
+    },
+    queueItemIssue(item) {
+      return String(item?.queueIssue || (item?.deliveryStatus === "cancelled" ? "cancelled" : ""));
+    },
+    queuePendingItems(st = this.activeSessionPane()) {
+      return (st?.pendingQueue || []).filter(item => !this.queueItemIssue(item) && !item.held);
+    },
+    queueOutboxLabel(st = this.activeSessionPane()) {
+      const items = this.queueDisplayItems(st);
+      const review = items.filter(item => this.queueItemIssue(item)).length;
+      const pending = items.length - review;
+      return this.lang === "zh"
+        ? ["待发送 " + pending, ...(review ? ["需处理 " + review] : [])].join(" · ")
+        : ["Pending " + pending, ...(review ? ["Needs review " + review] : [])].join(" · ");
+    },
+    queueItemLabel(item, st = this.activeSessionPane()) {
+      const label = this.queueDeliveryLabel(item);
+      if (this.queueItemIssue(item)) return label;
+      const pending = this.queueDisplayItems(st).filter(row => !this.queueItemIssue(row));
+      const index = pending.findIndex(row => row.id === item.id);
+      return index < 0 ? label : label + " " + (index + 1) + " / " + pending.length;
     },
     queueDisplayItems(st = this.activeSessionPane()) {
       const durable = Array.isArray(st && st.pendingQueue)
         ? st.pendingQueue : [];
       const admission = st && st._queueAdmission;
-      return admission ? [...durable, admission] : durable;
+      // Direct sends already have a stable inline bubble. The private
+      // admission record is for cancellation/recovery, not queue UI.
+      const waiting = durable.filter(item => this.queueItemIssue(item)
+        || !this._findQueueSteeringMessage(st, item.id, item.commandUuid));
+      const showAdmission = admission
+        && (!admission._directSubmission || admission._uncertain)
+        && !waiting.some(item => item.id === admission.id);
+      const local = this._outgoingRecords(st).filter(record =>
+        !waiting.some(row => row.id === "q-" + record.requestId)
+        && !(st.messages || []).some(m => m._clientMessageId === record.requestId)
+      ).map(record => this._outgoingRow(record));
+      const includeAdmission = showAdmission
+        && !local.some(row => row.id === admission.id)
+        && !this._outgoingRecords(st).some(record => "q-" + record.requestId === admission.id);
+      return [...waiting, ...local, ...(includeAdmission ? [admission] : [])];
     },
     _findQueueSteeringMessage(st, itemId, commandUuid) {
       if (!st) return null;
@@ -9466,6 +9791,13 @@ function portal() {
       const itemId = String(payload && payload.item_id || "");
       const state = String(payload && payload.state || "");
       if (!st || !itemId || !state) return false;
+      const retained = (st.pendingQueue || []).find(q => q.id === itemId);
+      // Old queued/started events cannot resurrect a cancelled command.
+      // Only an authoritative completion receipt can settle a review record.
+      if (retained && this.queueItemIssue(retained) && state !== "completed") {
+        if (state === "cancelled") this._syncQueueFromServer(sid);
+        return false;
+      }
       if (state === "started" || state === "completed") {
         const context = this._queueSteeringPromotionContext(sid, payload);
         const promoted = this._promoteQueueSteeringMessage(context);
@@ -9493,7 +9825,10 @@ function portal() {
       );
       item.deliveryStatus = state;
       if (state === "fallback") item.delivery = "queue";
-      if (state === "cancelled") st._queuePaused = true;
+      if (state === "cancelled") {
+        item.queueIssue = String(payload.queue_issue || "cancelled");
+        this._syncQueueFromServer(sid);
+      }
       // Replace the array so Alpine updates the status text immediately even
       // when the item object originated from the POST acceptance mirror.
       st.pendingQueue = [...st.pendingQueue];
@@ -9519,6 +9854,7 @@ function portal() {
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
       st._queueRevision = revision;
+      const previousItems = new Map((st.pendingQueue || []).map(item => [item.id, item]));
       const pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
@@ -9526,13 +9862,12 @@ function portal() {
         // <img> cannot add X-Auth-Token, so each image gets a short-lived,
         // id-bound resource ticket below. Expired ids (available:false) are
         // counted so the bubble can show "附件已过期".
+        const previous = previousItems.get(it.id);
         const atts = it.attachments || [];
         const images = atts
           .filter(a => a.available && a.kind === "image")
-          .map(a => ({
-            id: a.id, mime: a.mime || "",
-            src: "",
-          }));
+          .map(a => (previous?.images || []).find(im => im.id === a.id)
+            || { id: a.id, mime: a.mime || "", src: "" });
         const docs = atts
           .filter(a => a.available && a.kind !== "image")
           .map(a => ({
@@ -9557,35 +9892,43 @@ function portal() {
           delivery: this._normalizeBusySendMode(it.delivery, "queue"),
           deliveryStatus: String(it.steering_state
             || (it.delivery === "adjust" ? "pending" : "queued")),
+          queueIssue: String(it.queue_issue || ""),
+          held: !!it.held,
           commandUuid: String(it.command_uuid || ""),
           targetTurnId: String(it.target_turn_id || ""),
           enqueuedAt: it.enqueued_at || Date.now(),
         };
-      }).filter(item => !this._findQueueSteeringMessage(
+      }).filter(item => this.queueItemIssue(item) || !this._findQueueSteeringMessage(
         st, item.id, item.commandUuid));
-      st.pendingQueue = pendingQueue;
-      Promise.all(pendingQueue.flatMap(item =>
-        item.images.map(async im => {
+      st.pendingQueue = pendingQueue.map(item => {
+        const previous = previousItems.get(item.id);
+        if (previous && JSON.stringify(previous) === JSON.stringify(item)) return previous;
+        return item;
+      });
+      const appliedQueue = st.pendingQueue;
+      Promise.all(appliedQueue.flatMap(item =>
+        item.images.filter(im => !im.src && !im._minting).map(async im => {
+          im._minting = true;
           try {
             im.src = await this._mintChatResourceUrl("queued-image", {
               attachment_id: im.id,
             });
           } catch (_) {
             im.unavailable = true;
-          }
+          } finally { delete im._minting; }
         }))).then(() => {
         if (this.tabState[sid] !== st || st._queueAppliedSeq !== seq) return;
-        for (const item of pendingQueue) {
-          const failed = item.images.filter(im => !im.src).length;
-          item.images = item.images.filter(im => im.src);
-          item.expiredCount += failed;
-        }
-        st.pendingQueue = [...pendingQueue];
+        // A failed thumbnail ticket is not proof the durable attachment
+        // expired. Retain its identity and allow a later sync to retry it.
+        // A live owner may have promoted a row during thumbnail loading.
+        // Never reinstall the older captured array.
+        st.pendingQueue = [...st.pendingQueue];
       });
-      st._queuePaused = !!data.paused;
+      st._queuePaused = pendingQueue.some(item => item.held);
+      return true;
     },
     _currentQueueLen() {
-      return this.activeSessionPane().pendingQueue.length;
+      return this.queuePendingItems().length;
     },
     queueActionBusy(sid, key) {
       const st = sid && this.tabState[sid];
@@ -9615,6 +9958,350 @@ function portal() {
       } finally {
         if (this.tabState[sid] === st) this._setQueueActionBusy(st, key, false);
       }
+    },
+    _outgoingRecords(st) {
+      return Array.isArray(st?._outgoing) ? st._outgoing : [];
+    },
+    _persistOutgoing(sid, st) {
+      return this._setLS("muselab_outgoing_" + sid, JSON.stringify(this._outgoingRecords(st)));
+    },
+    _restoreOutgoing(sid, st) {
+      if (st._outgoingLoaded) return;
+      st._outgoingLoaded = true;
+      try {
+        const saved = JSON.parse(localStorage.getItem("muselab_outgoing_" + sid) || "[]");
+        st._outgoing = Array.isArray(saved) ? saved.filter(r => r?.requestId && ["turn", "queue"].includes(r.kind)) : [];
+      } catch (_) { st._outgoing = []; }
+      const legacy = st._uncertainSubmission;
+      if (legacy && !st._outgoing.some(r => r.requestId === legacy.requestId)) {
+        st._outgoing.push({ ...legacy, legacy: true, status: "waiting" });
+      }
+      if (st._outgoing.length) this._scheduleOutgoing(sid, 0);
+      if (!this._outgoingOnlineHook) {
+        this._outgoingOnlineHook = true;
+        window.addEventListener("online", () => {
+          for (const id of Object.keys(this.tabState || {})) this._scheduleOutgoing(id, 0);
+        });
+      }
+    },
+    _scheduleOutgoing(sid, delay = 3000) {
+      const st = this.tabState[sid];
+      if (!st || !this._outgoingRecords(st).length) return;
+      clearTimeout(st._outgoingTimer);
+      st._outgoingTimer = setTimeout(() => this._pumpOutgoing(sid), delay);
+    },
+    outgoingLabel(record) {
+      const zh = this.lang === "zh";
+      if (record?.cancelRequested) return zh ? "正在取消" : "Cancelling";
+      if (record?.held) return zh ? "已暂停" : "Paused";
+      if (record?.status === "failed") return zh ? "未能发送，内容已保留" : "Not sent; message retained";
+      if (record?.status === "waiting") return zh ? "等待连接，自动恢复" : "Waiting for connection";
+      return zh ? "正在发送" : "Sending";
+    },
+    outgoingForMessage(st, message) {
+      return this._outgoingRecords(st).find(r => r.requestId === message?._clientMessageId);
+    },
+    _outgoingRow(record) {
+      return { id: "q-" + record.requestId, _submitToken: record.requestId,
+        _localSubmission: true, _admissionPending: true,
+        displayText: record.input || "", pendingQuotes: record.pendingQuotes || [],
+        images: record.pendingImages || [], docs: record.pendingDocs || [],
+        _outgoingRecord: record };
+    },
+    _removeOutgoing(sid, st, record) {
+      st._outgoing = this._outgoingRecords(st).filter(r => r.requestId !== record.requestId);
+      if (st._uncertainSubmission?.requestId === record.requestId) {
+        st._uncertainSubmission = null;
+        this._setLS("muselab_submission_" + sid, "null");
+      }
+      if (st._queueAdmission?._submitToken === record.requestId) st._queueAdmission = null;
+      if (st._submissionPayloads) delete st._submissionPayloads[record.requestId];
+      this._persistOutgoing(sid, st);
+    },
+    async _postSubmission(sid, requestId, kind, payload, signal) {
+      const st = this.tabState[sid];
+      if (st) {
+        st._submissionPayloads ||= {};
+        st._submissionPayloads[requestId] = { payload, kind, sentAt: Date.now() };
+      }
+      const url = kind === "turn" ? "/api/chat/turns/start"
+        : "/api/chat/sessions/" + encodeURIComponent(sid) + "/queue";
+      return await this._fetchWithDeadline(url, {
+        method: "POST", signal,
+        headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+        body: JSON.stringify(payload),
+      }, 12000);
+    },
+    _submitWhileBusy(sid, st) {
+      if (this.composerDisabledReason(sid)) return false;
+      const draft = st.draft;
+      const requestId = this._uuid();
+      const input = String(draft.input || "");
+      const images = (draft.pendingImages || []).map(im => ({ ...im }));
+      const docs = (draft.pendingDocs || []).map(doc => ({ ...doc }));
+      const quotes = (draft.pendingQuotes || []).map(quote => ({ ...quote }));
+      const meta = (this.sessions || []).find(s => s.id === sid);
+      const permission = this._normalizePermissionMode(sid === this.currentId ? this.permission : meta?.permission, "default");
+      const record = { requestId, kind: "queue", input, ownerSid: sid, status: "ready",
+        admissionOwner: st._stoppingTurnId ? "" : String(st._composerSubmitToken || ""),
+        pendingImages: images, pendingDocs: docs, pendingQuotes: quotes,
+        payload: { client_message_id: requestId, text: this._composerPromptText(input, quotes),
+          display_text: input, selection_quotes: quotes,
+          image_ids: [...images, ...docs].map(a => a.id).join(","),
+          permission, plan_return_permission: permission === "plan" ? (meta?.plan_return_permission || "") : "",
+          delivery: st._stoppingTurnId ? "queue" : this._busySendDelivery(sid),
+          active_turn_id: st._stoppingTurnId ? "" : String(st.activeTurnId || "") } };
+      st._outgoing = [...this._outgoingRecords(st), record];
+      // Never acknowledge local acceptance before its recoverable copy exists.
+      if (!this._persistOutgoing(sid, st)) {
+        st._outgoing = st._outgoing.filter(r => r.requestId !== requestId);
+        this.toast(this.lang === "zh" ? "本机存储不可用，消息仍在输入框中" : "Local storage unavailable; draft retained", "error", 3500);
+        return false;
+      }
+      draft.input = "";
+      draft.pendingImages = []; draft.pendingDocs = []; draft.pendingQuotes = [];
+      this._persistChatDraft(sid, "");
+      if (sid === this.currentId) this._activateComposerState(sid);
+      this._scheduleOutgoing(sid, 0);
+      return true;
+    },
+    async cancelOutgoing(sid, requestId) {
+      const st = this.tabState[sid];
+      const record = this._outgoingRecords(st).find(r => r.requestId === requestId);
+      if (!record) {
+        if (st?._queueAdmission?._submitToken === requestId) {
+          st._cancelledSubmitToken = requestId;
+          const kind = st._queueAdmission._directSubmission ? "turn" : "queue";
+          this._rememberCancelIntent(sid, requestId, kind);
+          if (kind === "turn") st._streamStartController?.abort();
+        }
+        return;
+      }
+      if (!record.sentAt && !record.legacy && record.status === "ready") {
+        this._removeOutgoing(sid, st, record);
+        return;
+      }
+      record.cancelRequested = true;
+      record.held = false;
+      this._persistOutgoing(sid, st);
+      this._scheduleOutgoing(sid, 0);
+    },
+    _rememberCancelIntent(sid, requestId, kind, pauseIds = []) {
+      const st = this.tabState[sid];
+      if (!st || !requestId) return;
+      const input = st._queueAdmission?.displayText
+        || this._outgoingRecords(st).find(r => r.requestId === requestId)?.input || "";
+      this._rememberUncertainSubmission(sid, requestId, kind, input);
+      const record = this._outgoingRecords(st).find(r => r.requestId === requestId);
+      record.cancelRequested = true;
+      record.pauseIds = pauseIds;
+      this._persistOutgoing(sid, st);
+      this._scheduleOutgoing(sid, 0);
+    },
+    async _pumpOutgoing(sid) {
+      const st = this.tabState[sid];
+      if (!st || st._outgoingPumping) return;
+      // Preserve click order through the first direct admission, without locking
+      // the composer. All subsequent input has already been saved separately.
+      if (st._composerSubmitToken && !this._outgoingRecords(st).some(r => r.cancelRequested)) {
+        this._scheduleOutgoing(sid, 500); return;
+      }
+      st._outgoingPumping = true;
+      try {
+        for (const record of [...this._outgoingRecords(st)]) {
+          if (this.tabState[sid] !== st) return;
+          if (!this._outgoingRecords(st).some(r => r.requestId === record.requestId)) continue;
+          if (st._composerSubmitToken && !record.cancelRequested) continue;
+          if ((record.held || record.status === "failed") && !record.cancelRequested) continue;
+          const ownerSid = record.ownerSid || sid;
+          try {
+            let receipt;
+            if (record.cancelRequested) {
+              const r = await this._fetchWithDeadline(
+                "/api/chat/sessions/" + encodeURIComponent(ownerSid) + "/submissions/"
+                  + encodeURIComponent(record.requestId) + "/cancel?kind=" + record.kind
+                  + "&pause_item_ids=" + encodeURIComponent((record.pauseIds || []).join(",")),
+                { method: "POST", headers: this.hdr() }, 8000);
+              if (!r.ok) throw new Error("cancel unavailable");
+              receipt = await r.json();
+            } else {
+              receipt = record.status === "ready" ? { state: "not_found" }
+                : await this._submissionReceipt(ownerSid, record.requestId, record.kind);
+              if (receipt.state === "not_found" && record.payload) {
+                if (!record.sentAt && record.admissionOwner
+                    && st._streamOwnerToken === record.admissionOwner
+                    && this._busySendDelivery(sid, st.activeTurnId, !!record.payload.image_ids) === "adjust") {
+                  record.payload.delivery = "adjust";
+                  record.payload.active_turn_id = String(st.activeTurnId);
+                }
+                record.sentAt ||= Date.now();
+                record.status = "sending";
+                this._persistOutgoing(sid, st);
+                const r = await this._postSubmission(ownerSid, record.requestId, record.kind, record.payload);
+                if (r.ok) receipt = { state: "accepted", result: await r.json() };
+                else if (r.status < 500 && ![409, 425].includes(r.status)) receipt = { state: "failed" };
+                else receipt = await this._submissionReceipt(ownerSid, record.requestId, record.kind);
+              }
+            }
+            if (this.tabState[sid] !== st) return;
+            // Cancel may be clicked while the POST/receipt above was in flight.
+            if (record.cancelRequested && receipt.state !== "cancelled") continue;
+            if (receipt.state === "cancelled") {
+              const bubble = (st.messages || []).find(m => m._clientMessageId === record.requestId);
+              const wasAdmitted = !!(receipt.result?.turn_id || bubble?._turnId);
+              if (record.kind === "turn" && !wasAdmitted) {
+                // Stop before admission is an unsend: restore the original
+                // draft without replacing newer input typed during recovery.
+                if (sid === this.currentId) this._captureComposerState(sid);
+                this._restoreUncertainDraft(st, record);
+                this._resolveChatRecoveryDraft(sid, st.draft.input);
+                this._persistChatDraft(sid, st.draft.input);
+                if (sid === this.currentId) this._activateComposerState(sid);
+              }
+              if (bubble) {
+                if (wasAdmitted) bubble._admissionPending = false;
+                else this._removePaneMessage(st, bubble);
+              }
+              this._removeOutgoing(sid, st, record);
+              await this._syncQueueFromServer(sid);
+            } else if (receipt.state === "accepted") {
+              const synced = await this._syncQueueFromServer(sid);
+              if (synced !== true) { record.status = "waiting"; continue; }
+              const bubble = (st.messages || []).find(m => m._clientMessageId === record.requestId);
+              if (bubble) {
+                bubble._admissionPending = false;
+                if (receipt.result?.turn_id) bubble._turnId = receipt.result.turn_id;
+              }
+              this._removeOutgoing(sid, st, record);
+              this._commitChatRecoveryDraft(sid, record.input);
+              // Existing stream ownership still decides whether attachment is safe.
+              await this._checkActiveTurn(sid);
+              if (!st.streaming && !st.es) await this.loadSession(sid, { quiet: true });
+            } else if (receipt.state === "failed") {
+              record.status = "failed";
+            } else record.status = "waiting";
+          } catch (_) {
+            record.status = "waiting";
+          }
+        }
+      } finally {
+        st._outgoingPumping = false;
+        if (this.tabState[sid] === st) {
+          this._persistOutgoing(sid, st);
+          if (this._outgoingRecords(st).some(r => r.cancelRequested || (!r.held && r.status !== "failed"))) this._scheduleOutgoing(sid);
+        }
+      }
+    },
+    async pausePendingQueue(sid, paused = true) {
+      const ids = this._holdPendingSnapshot(sid, paused);
+      try {
+        const r = await this._fetchWithDeadline("/api/chat/sessions/" + encodeURIComponent(sid) + "/queue/pause", {
+          method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          body: JSON.stringify({ paused, item_ids: ids }),
+        }, 8000);
+        if (!r.ok) throw new Error("pause unavailable");
+        await this._syncQueueFromServer(sid);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "队列操作未确认，请检查连接" : "Queue update not confirmed; check connection", "warn", 3000);
+      }
+      if (!paused) this._scheduleOutgoing(sid, 0);
+    },
+    _holdPendingSnapshot(sid, paused) {
+      const st = this.tabState[sid];
+      if (!st) return [];
+      const ids = (st.pendingQueue || []).filter(q => !this.queueItemIssue(q)).map(q => q.id);
+      for (const record of this._outgoingRecords(st)) {
+        if (record.kind !== "queue" || record.cancelRequested) continue;
+        record.held = paused;
+        ids.push("q-" + record.requestId);
+      }
+      if (st._queueAdmission && !st._queueAdmission._directSubmission) ids.push(st._queueAdmission.id);
+      for (const row of st.pendingQueue || []) if (ids.includes(row.id)) row.held = paused;
+      this._persistOutgoing(sid, st);
+      return [...new Set(ids)];
+    },
+    async _submissionReceipt(sid, requestId, kind) {
+      if (!requestId) return { state: "unknown" };
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const response = await this._fetchWithDeadline(
+            "/api/chat/sessions/" + encodeURIComponent(sid) + "/submissions/"
+              + encodeURIComponent(requestId) + "?kind=" + kind,
+            { headers: this.hdr(), cache: "no-store" }, 6000);
+          if (response.ok) {
+            const data = await response.json();
+            return data;
+          }
+        } catch (_) {}
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 300));
+      }
+      return { state: "unknown" };
+    },
+    _rememberUncertainSubmission(sid, requestId, kind, input) {
+      const source = this.tabState[sid];
+      if (!source) return;
+      const childSid = source._backgroundSuccessorSid;
+      const st = childSid && this.tabState[childSid]?._handoffSourceSid === sid
+        ? this.tabState[childSid] : source;
+      const ownerSid = sid;
+      if (st !== source) sid = childSid;
+      const admission = st._queueAdmission || {};
+      const record = { ...this._outgoingRecords(st).find(r => r.requestId === requestId),
+        ...(source._submissionPayloads?.[requestId] || {}),
+        requestId, kind, input, ownerSid, legacy: true, status: "waiting",
+        pendingQuotes: admission.pendingQuotes || [],
+        pendingImages: (admission.images || []).map(({id,mime})=>({id,mime})),
+        pendingDocs: (admission.docs || []).map(({id,name,kind})=>({id,name,kind})),
+      };
+      st._uncertainSubmission = record;
+      st._outgoing = [...this._outgoingRecords(st).filter(r => r.requestId !== requestId), record];
+      this._persistOutgoing(sid, st);
+      st._queueAdmission = {
+        ...(st._queueAdmission || {}), id: "q-" + requestId,
+        _submitToken: requestId, displayText: input,
+        _admissionPending: true, _uncertain: true,
+      };
+      this._setLS("muselab_submission_" + sid, JSON.stringify(record));
+      setTimeout(() => this.reconcileSubmission(sid), 1000);
+    },
+    _restoreUncertainDraft(st, record) {
+      st.draft.input = this._mergeChatDraftText(record.input, st.draft.input);
+      for (const key of ["pendingImages", "pendingDocs", "pendingQuotes"]) {
+        const existing = st.draft[key] || [];
+        const ids = new Set(existing.map(item=>item.id));
+        st.draft[key] = [...(record[key] || []).filter(item=>!ids.has(item.id)), ...existing];
+      }
+    },
+    async releaseUncertainSubmission(sid) {
+      const st = this.tabState[sid], record = st?._uncertainSubmission;
+      if (!record) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "解除发送等待" : "Release pending delivery",
+        body: this.lang === "zh"
+          ? "送达状态仍不确定，原请求可能已经执行。内容会保留为草稿，不会自动重发。请先核对聊天记录和任务结果，再决定是否重新发送。"
+          : "The original request may already have executed. Keep its content as a draft without resending. Check history and task results before sending again.",
+        okText: this.lang === "zh" ? "保留草稿并解除等待" : "Keep draft and release",
+        danger: true,
+      });
+      if (!ok || st._uncertainSubmission?.requestId !== record.requestId) return;
+      this._restoreUncertainDraft(st, record);
+      st._uncertainSubmission = null;
+      st._queueAdmission = null;
+      this._setLS("muselab_submission_" + sid, "null");
+      this._resolveChatRecoveryDraft(sid, st.draft.input);
+      this._persistChatDraft(sid, st.draft.input);
+      if (sid === this.currentId) this._activateComposerState(sid);
+    },
+    async reconcileSubmission(sid) {
+      const state = this.tabState[sid];
+      if (!state) return;
+      this._restoreOutgoing(sid, state);
+      const legacy = state._uncertainSubmission;
+      if (legacy && !this._outgoingRecords(state).some(r => r.requestId === legacy.requestId)) {
+        state._outgoing = [...this._outgoingRecords(state), { ...legacy, legacy: true, status: "waiting" }];
+        this._persistOutgoing(sid, state);
+      }
+      return this._pumpOutgoing(sid);
     },
     async _enqueueMessage(sid, item) {
       const enqueueState = this._ensureTabState(sid);
@@ -9650,19 +10337,18 @@ function portal() {
       }
       let accepted = null;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+        const r = await this._postSubmission(sid, item._submitToken, "queue", {
           // Snapshot the CURRENT permission mode with the item — the server
           // drain replays the turn under this mode (fixes queued messages
           // bypassing tool approval the UI said was required).
-          body: JSON.stringify({ text: item.text || "", image_ids,
+          text: item.text || "", image_ids,
                                  display_text: item.displayText || "",
                                  selection_quotes: item.pendingQuotes || [],
                                  permission,
                                  plan_return_permission: planReturnPermission,
                                  delivery,
-                                 active_turn_id: activeTurnId }),
+                                 active_turn_id: activeTurnId,
+                                 client_message_id: item._submitToken || "",
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -9671,15 +10357,23 @@ function portal() {
             "warn", 3000);
           return false;
         }
-        if (!r.ok) {
+        if (!r.ok && r.status < 500 && r.status !== 425) {
           this.toast(this.lang === "zh" ? "加入队列失败" : "Failed to queue", "error", 3000);
           return false;
         }
-        try { accepted = await r.json(); } catch (_) { accepted = null; }
+        if (!r.ok) throw new Error("queue acknowledgement unavailable");
+        accepted = await r.json();
       } catch (_e) {
-        this.toast(this.lang === "zh" ? "网络错误，未能入队" : "Network error — not queued",
-                   "error", 3000);
-        return false;
+        const receipt = await this._submissionReceipt(sid, item._submitToken, "queue");
+        if (receipt.state === "accepted") {
+          accepted = receipt.result;
+          accepted.queue = await this._settingsRead("/api/chat/sessions/" + sid + "/queue").catch(() => null);
+        } else if (receipt.state === "failed" || receipt.state === "cancelled") {
+          return false;
+        } else {
+          this._rememberUncertainSubmission(sid, item._submitToken, "queue", item.displayText || item.text || "");
+          return false;
+        }
       }
       // The POST response is the durable acceptance boundary. Reflect its item
       // immediately and reconcile in the background: waiting on a second GET
@@ -9837,8 +10531,21 @@ function portal() {
       child.pendingQueue = this._cloneRolloverValue(sourceState.pendingQueue || []);
       child._queueAdmission = this._cloneRolloverValue(
         sourceState._queueAdmission || null);
-      child._queuePaused = !!sourceState._queuePaused;
-      child._draining = !!sourceState._draining || child.pendingQueue.length > 0;
+      child._uncertainSubmission = this._cloneRolloverValue(sourceState._uncertainSubmission || null);
+      if (child._uncertainSubmission) {
+        child._uncertainSubmission.ownerSid ||= sourceSid;
+        this._setLS("muselab_submission_" + childSid, JSON.stringify(child._uncertainSubmission));
+      }
+      child._outgoing = this._cloneRolloverValue(this._outgoingRecords(sourceState));
+      for (const record of child._outgoing) record.ownerSid ||= sourceSid;
+      child._outgoingLoaded = true;
+      child._submissionPayloads = { ...(sourceState._submissionPayloads || {}) };
+      if (this._persistOutgoing(childSid, child)) {
+        this._setLS("muselab_outgoing_" + sourceSid, "[]");
+      }
+      child._queuePaused = child.pendingQueue.some(row => row.held);
+      this._scheduleOutgoing(childSid, 500);
+      child._draining = !!sourceState._draining || this.queuePendingItems(child).length > 0;
       child._handoffSourceSid = sourceSid;
       // A send can be waiting on its durable queue POST while the runtime fork
       // finishes. Transfer the primitive claim with the draft. Otherwise the
@@ -9910,6 +10617,26 @@ function portal() {
         const childSid = String(payload.id || payload.session_id || "");
         if (!childSid || childSid === sourceSid) {
           return { sessionId: sourceSid, queuePending: false, rolledOver: false };
+        }
+        // A session-list redirect can adopt this durable successor while the
+        // POST response is still in flight. Its source state is then retired.
+        // Replaying adoption would overwrite the child's canonical messages
+        // and remove its tab (the source's old tab index is already gone).
+        // Also respect a tab closed, switched, or rolled over again meanwhile.
+        if (this.tabState[sourceSid] !== sourceState) {
+          const adoptedSid = this._resolveSessionRedirectId(
+            sourceState._backgroundSuccessorSid || childSid);
+          if (this.tabState[adoptedSid]) {
+            await this._syncQueueFromServer(adoptedSid);
+          }
+          const adoptedState = this.tabState[adoptedSid];
+          return {
+            sessionId: adoptedSid,
+            queuePending: !!adoptedState && (
+              !!adoptedState._draining
+              || this.queuePendingItems(adoptedState).length > 0),
+            rolledOver: true,
+          };
         }
         const pending = Number(
           payload.inherited_background_tasks_pending
@@ -9987,7 +10714,7 @@ function portal() {
           ?? 0);
         const queuePending = Number(payload.queue_migrated) > 0
           || (Number.isFinite(advertisedDepth) && advertisedDepth > 0)
-          || childState.pendingQueue.length > 0;
+          || this.queuePendingItems(childState).length > 0;
         // Keep later sends on the durable FIFO until the poller observes the
         // migrated turn. _attachToServerTurn clears this when the queue is
         // genuinely idle; without this handoff guard a fast second Enter could
@@ -10170,7 +10897,7 @@ function portal() {
         docs: Array.isArray(docs) ? docs : [],
       }));
     },
-    _installActiveTurnUser(st, turnId, text = "", images = [], docs = []) {
+    _installActiveTurnUser(st, turnId, text = "", images = [], docs = [], queueItemId = "") {
       if (!st || !(text || images.length || docs.length)) return null;
       const messages = st.messages || [];
       let turnUser = turnId
@@ -10242,6 +10969,13 @@ function portal() {
       } else {
         turnUser._turnRoot = true;
       }
+      if (queueItemId) {
+        // Exact server ownership, not matching text, proves this row started.
+        turnUser._queueItemId = String(queueItemId);
+        st.pendingQueue = (st.pendingQueue || []).filter(q => q.id !== queueItemId);
+        if (st._queueAdmission?.id === queueItemId
+            && !st._queueAdmission._uncertain) st._queueAdmission = null;
+      }
       return { message: turnUser, appended };
     },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
@@ -10273,9 +11007,9 @@ function portal() {
       if (st0) st0._draining = true;
       await this._syncQueueFromServer(sid, options);
       const st = this.tabState[sid];
-      const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
+      const expect = !!(st && this.queuePendingItems(st).length);
       let active = false, startedAt = 0, turnId = "";
-      let uText = "", uImages = [], uDocs = [];
+      let uText = "", uImages = [], uDocs = [], queueItemId = "";
       let continuation = false;
       let scheduled = false;
       let background = false, attachable = true, backgroundTaskCount = 0;
@@ -10301,6 +11035,7 @@ function portal() {
           uText = d.user_text || "";
           uImages = d.user_images || [];
           uDocs = d.user_docs || [];
+          queueItemId = String(d.queue_item_id || "");
         }
       } catch (_e) {}
       if (options.signal?.aborted) {
@@ -10430,7 +11165,7 @@ function portal() {
         // matching tail bubble. Identity, not text, is the durable dedupe key:
         // two queued turns are allowed to contain identical prompts.
         const turnUser = this._installActiveTurnUser(
-          st, turnId, uText, uImages, uDocs);
+          st, turnId, uText, uImages, uDocs, queueItemId);
         if (turnUser && scheduled) turnUser.message._scheduledTrigger = true;
         if (turnUser && turnUser.appended) {
           this._scheduleLiveMessageViewport(st);
@@ -10693,9 +11428,12 @@ function portal() {
           attempt: attempt + 1,
         };
         ownerState._pendingCompletedTurnSync = next;
-        if (attempt < 30 && stillOwned()) {
+        if (stillOwned() && (attempt < 30
+            || (sid === this.currentId && document.visibilityState !== "hidden"))) {
           this._requestSessionSync(sid, "completed_turn", {
-            ...next, delayMs: Math.min(2000, 350 + attempt * 100),
+            ...next, delayMs: attempt < 30
+              ? Math.min(2000, 350 + attempt * 100)
+              : Math.min(30000, 5000 + (attempt - 30) * 1000),
           });
         }
       };
@@ -10710,13 +11448,6 @@ function portal() {
         // completed turn is harmless, while a different active turn means a
         // successor has already claimed this session and its optimistic/live
         // suffix must win over A's delayed canonical replacement.
-        const activeProbe = completedTurnId
-          ? this._fetchWithDeadline(
-              "/api/chat/sessions/" + sid + "/active",
-              { headers: this.hdr(), signal: options.signal },
-              2500,
-            ).catch(() => null)
-          : Promise.resolve(null);
         const historyResponse = await this._fetchWithDeadline(
           "/api/chat/sessions/" + sid + "?tail=" + reconcileTail,
           { headers: this.hdr(), signal: options.signal },
@@ -10724,11 +11455,23 @@ function portal() {
         if (!stillOwned()) return false;
         if (!historyResponse.ok) { retry(); return false; }
         const history = await historyResponse.json();
-        const activeResponse = await activeProbe;
-        if (!stillOwned()) return false;
         let activity = null;
-        try { activity = activeResponse?.ok ? await activeResponse.json() : null; }
-        catch (_) { activity = null; }
+        const committedState = history.completion_state;
+        if (committedState?.stable === true) {
+          activity = committedState;
+        } else if (committedState) {
+          retry();
+          return false;
+        } else if (completedTurnId) {
+          // Rolling upgrades: retain the old server's ownership probe.
+          try {
+            const response = await this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "/active",
+              { headers: this.hdr(), signal: options.signal }, 2500);
+            activity = response.ok ? await response.json() : null;
+          } catch (_) { activity = null; }
+        }
+        if (!stillOwned()) return false;
         const activeTurnId = String((activity && activity.turn_id) || "");
         if (activity && activity.active && !activity.background
             && activeTurnId && activeTurnId !== completedTurnId) {
@@ -10753,6 +11496,39 @@ function portal() {
                 && (message.text || "") === expectedText) {
               finalIndex = i;
               break;
+            }
+          }
+        }
+        // A stable, idle snapshot with a committed turn identity is authoritative
+        // when the live final text was incomplete and its UUID was missing.
+        // This also covers an older completion aged out of the bounded tail
+        // after fast successors. Do not require live text equality to adopt the
+        // very canonical suffix that is supposed to repair that live text.
+        // A known UUID is still a required boundary for this same turn: its
+        // absence must not authorize installing an unrelated successor suffix.
+        if (finalIndex < 0 && committedState?.stable === true
+            && !committedState.active && !history.has_later) {
+          let boundaryConfirmed = !!(committedState.completed_turn_id
+            && completedTurnId && (committedState.completed_turn_id !== completedTurnId
+              || !expectedAssistantUuid));
+          if (!boundaryConfirmed && expectedAssistantUuid && Number(history.offset) > 0) {
+            const boundaryResponse = await this._fetchWithDeadline(
+              "/api/chat/sessions/" + sid + "?around_uuid=" + encodeURIComponent(expectedAssistantUuid)
+                + "&before=1&after=1",
+              { headers: this.hdr(), signal: options.signal });
+            if (boundaryResponse.ok) {
+              const boundary = await boundaryResponse.json();
+              boundaryConfirmed = (boundary.messages || []).some(message =>
+                message.role === "assistant" && message.uuid === expectedAssistantUuid);
+            }
+          }
+          if (!stillOwned()) return false;
+          if (boundaryConfirmed) {
+            for (let i = messages.length - 1; i >= 0; i -= 1) {
+              if (messages[i]?.role === "assistant" && messages[i].uuid) {
+                finalIndex = i;
+                break;
+              }
             }
           }
         }
@@ -10803,6 +11579,11 @@ function portal() {
           minimumTail: completedTurnWindow,
           followTail: followTailStillOwned,
           signal: options.signal,
+          historySnapshot: history,
+          completedBoundary: (expectedAssistantUuid
+              ? messages[finalIndex].uuid === expectedAssistantUuid
+              : committedState?.completed_turn_id === completedTurnId)
+            ? { uuid: messages[finalIndex].uuid, text: expectedText } : null,
         });
         if (!loaded) retry();
         else {
@@ -10827,7 +11608,8 @@ function portal() {
     async removePendingQueueItem(sid, idx) {
       const st = this.tabState[sid];
       if (!st || !st.pendingQueue) return;
-      const item = st.pendingQueue[idx];
+      const item = typeof idx === "string"
+        ? st.pendingQueue.find(row => row.id === idx) : st.pendingQueue[idx];
       if (!item) return;
       const key = "remove:" + item.id;
       const r = await this._runQueueMutation(
@@ -10848,7 +11630,8 @@ function portal() {
       // that already expired (available:false) simply aren't restored.
       const st = this.tabState[sid];
       if (!st || !st.pendingQueue) return;
-      const item = st.pendingQueue[idx];
+      const item = typeof idx === "string"
+        ? st.pendingQueue.find(row => row.id === idx) : st.pendingQueue[idx];
       if (!item) return;
       // Snapshot before _syncQueueFromServer wipes the mirror.
       const text = item.text || "";
@@ -10896,26 +11679,7 @@ function portal() {
       }
     },
     async resumeQueueDrain(sid) {
-      // Un-pause server-side (which kicks its own drain), then attach to the
-      // turn it starts. Also the manual "kick" for the post-restart case —
-      // the server intentionally does NOT auto-resume draining on boot, so
-      // dormant items wait here until the user hits Resume.
-      const st = this.tabState[sid];
-      if (!st) return;
-      const r = await this._runQueueMutation(
-        sid, st, "resume",
-        "/api/chat/sessions/" + sid + "/queue/pause",
-        {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          body: JSON.stringify({ paused: false }),
-        },
-        "继续队列失败，请检查连接后重试",
-        "Could not resume the queue; check the connection and retry",
-      );
-      if (!r) return;
-      await this._syncQueueFromServer(sid);
-      this._drainPendingQueue(sid);
+      return this.pausePendingQueue(sid, false);
     },
     async discardQueue(sid) {
       const st = this.tabState[sid];
@@ -11949,6 +12713,7 @@ function portal() {
               String(payload.user_text || ""),
               Array.isArray(payload.user_images) ? payload.user_images : [],
               Array.isArray(payload.user_docs) ? payload.user_docs : [],
+              String(payload.queue_item_id || ""),
             )
           : null;
         if (turnUser && payload.scheduled) {
@@ -12156,21 +12921,19 @@ function portal() {
         }
       }
       const _ids = encodeURIComponent(_idSet.join(","));
-      let r;
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
-      );
+      let r, data;
       try {
-        r = await fetch(`/api/chat/sessions?limit=100&ids=${_ids}`, {
-          headers,
-          signal: controller.signal,
-        });
+        r = await this._fetchWithDeadline(
+          `/api/chat/sessions?limit=100&ids=${_ids}`, { headers },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+          async response => {
+            if (response.ok) data = await response.json();
+          },
+        );
       } catch (_) {
-        return false;  // network blip; next tick retries
-      } finally {
-        clearTimeout(timeout);
+        // Preserve both the installed list and its ETag when headers arrive
+        // but the response body fails or stalls. The next poll owns a new read.
+        return false;
       }
       if (r.status === 304) {
         // A transcript revision may have been deferred while its local stream
@@ -12178,16 +12941,11 @@ function portal() {
         this._reconcileOpenSession(this.sessions);
         return false;
       }
-      if (!r.ok) return false;
-      const et = r.headers.get("etag");
-      if (et) this._sessionsEtag = et;
-      let data = null;
-      try { data = await r.json(); } catch { data = null; }
-      this._applySessionRedirects(
-        (data && data.session_redirects) || {},
-        (data && data.sessions) || [],
-      );
-      this._applySessionList((data && data.sessions) || []);
+      if (!r.ok || !data || !Array.isArray(data.sessions)) return false;
+      this._applySessionRedirects(data.session_redirects || {}, data.sessions);
+      this._applySessionList(data.sessions);
+      // Commit the cache validator only after its complete body is installed.
+      this._sessionsEtag = r.headers.get("etag") || "";
       return true;
     },
     async refreshSessions() {
@@ -12561,22 +13319,39 @@ function portal() {
     },
     async _runCanonicalReplaySync(sid, st, options = {}) {
       if (this.tabState[sid] !== st) return false;
+      const ownedTurnId = String(st.activeTurnId || "");
+      const ownedStream = st.es;
       const startedAt = Number(st.sessionSync.canonicalStartedAt) || Date.now();
       const minimumWaitMs = Math.max(0, Number(options.minimumWaitMs) || 0);
       let active = true;
+      let activity = null;
       try {
         const r = await this._fetchWithDeadline(
           `/api/chat/sessions/${encodeURIComponent(sid)}/active`,
           { headers: this.hdr(), signal: options.signal },
         );
-        if (r.ok) active = !!(await r.json()).active;
+        if (r.ok) {
+          activity = await r.json();
+          active = !!activity.active;
+        }
       } catch (_) {
         if (options.signal?.aborted) return false;
         active = true;
       }
-      if (this.tabState[sid] !== st) return false;
+      if (this.tabState[sid] !== st || options.signal?.aborted) return false;
       const waited = Date.now() - startedAt;
-      if ((active || waited < minimumWaitMs) && waited < 31 * 60_000) {
+      const backgroundOnly = active && activity?.background === true
+        && activity.attachable === false;
+      const activityTurnId = String(activity?.turn_id || "");
+      // Watcher-only activity means the foreground Result is already readable.
+      // Preserve a successor admitted before/during this probe, including its
+      // optimistic prompt; an old watcher must never retire the newer stream.
+      const preserveOwner = this._hasPendingAdmission(st)
+        || st.es !== ownedStream || String(st.activeTurnId || "") !== ownedTurnId
+        || (backgroundOnly && (st.streaming || st.es)
+          && activityTurnId && ownedTurnId && activityTurnId !== ownedTurnId);
+      if (preserveOwner || (((active && !backgroundOnly) || waited < minimumWaitMs)
+          && waited < 31 * 60_000)) {
         this._requestSessionSync(sid, "canonical_replay", {
           minimumWaitMs, delayMs: 1000,
         });
@@ -12585,6 +13360,14 @@ function portal() {
       const retryN = Math.max(
         0, Number(st.sessionSync.canonicalRetryN) || 0);
       this._retireStaleSessionStream(sid, st);
+      if (backgroundOnly) {
+        st._serverActiveObserved = true;
+        if (activityTurnId && !st.activeTurnId) st.activeTurnId = activityTurnId;
+        this._setBackgroundTaskActive(
+          sid, true, activity.started_at, activity.background_tasks_pending,
+        );
+        this._ensureBgContPoller(sid);
+      }
       st._pendingExternalUpdate = true;
       const loaded = await this.loadSession(sid, {
         quiet: true, signal: options.signal,
@@ -12917,9 +13700,11 @@ function portal() {
     fileWorkspacePath() {
       return this.currentWorkspacePath();
     },
-    absoluteFilePath(path) {
-      const root = String(this.fileWorkspacePath() || "");
-      const relative = String(path || "").replace(/^\/+/, "");
+    absoluteFilePath(path, workspace = this.fileWorkspacePath()) {
+      const root = String(workspace || "");
+      const value = String(path || "");
+      if (value.startsWith("/")) return value;
+      const relative = value.replace(/^\.\/+/, "");
       if (!root) return relative;
       if (!relative) return root;
       return root.endsWith("/") ? root + relative : root + "/" + relative;
@@ -16205,6 +16990,8 @@ function portal() {
         : (this.lang === "zh" ? "分类用量：SDK" : "Categories: SDK");
       const limitSource = {
         gateway_catalog: this.lang === "zh" ? "网关模型目录" : "gateway catalog",
+        settings_model: this.lang === "zh" ? "模型设置" : "model setting",
+        settings_provider: this.lang === "zh" ? "Provider 设置" : "provider setting",
         env_override: this.lang === "zh" ? "环境配置" : "environment override",
         sdk: "SDK",
         session_sdk: this.lang === "zh" ? "会话 SDK" : "session SDK",
@@ -16256,6 +17043,8 @@ function portal() {
         : (this.lang === "zh" ? "用量" : "usage"));
       const limitSource = {
         gateway_catalog: this.lang === "zh" ? "网关目录" : "gateway catalog",
+        settings_model: this.lang === "zh" ? "模型设置" : "model setting",
+        settings_provider: this.lang === "zh" ? "Provider 设置" : "provider setting",
         env_override: this.lang === "zh" ? "配置覆盖" : "config override",
         sdk: "SDK",
         session_sdk: this.lang === "zh" ? "会话 SDK" : "session SDK",
@@ -16532,7 +17321,8 @@ function portal() {
       );
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
-      const failed = results.length - ok;
+      const uploadedName = results.find(r => r.status === "fulfilled" && r.value)?.value.path?.split("/").pop() || "";
+      const failed = results.filter(r => r.status === "rejected" || r.value === false).length;
       await this.reloadTree();
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
@@ -16547,9 +17337,9 @@ function portal() {
           : `Uploaded ${ok}, ${failed} failed`, "warn", 3500);
       } else if (ok === 1) {
         this.toast(this.lang === "zh"
-          ? `已上传 ${files[0].name}`
-          : `Uploaded ${files[0].name}`, "success", 2200);
-      } else {
+          ? `已上传 ${uploadedName}`
+          : `Uploaded ${uploadedName}`, "success", 2200);
+      } else if (ok) {
         this.toast(this.lang === "zh"
           ? `已上传 ${ok} 个文件`
           : `Uploaded ${ok} files`, "success", 2200);
@@ -16564,29 +17354,52 @@ function portal() {
       file,
       { reportError = false, ownerWorkspace = "" } = {},
     ) {
-      const transfer = this._beginFileUploadTransfer(file);
+      ownerWorkspace = ownerWorkspace || this.fileWorkspacePath();
+      const transfer = this._beginFileUploadTransfer(file, dirPath, ownerWorkspace);
+      const uploadState = this._fileUploadTransfer(transfer).transfer;
       let succeeded = false;
+      let failure = "";
       try {
-        const r = await this._uploadWorkspaceFile(dirPath, file, transfer);
+        const limit = await this._workspaceUploadLimit();
+        const pending = this._fileUploadTransfer(transfer);
+        if (!pending || uploadState.cancelled) return null;
+        if (limit && file.size > limit) {
+          failure = this.lang === "zh"
+            ? "文件 " + this.fmtSize(file.size) + " 超过单文件 " + this.fmtSize(limit) + " 上限"
+            : "File " + this.fmtSize(file.size) + " exceeds the " + this.fmtSize(limit) + " per-file limit";
+          return false;
+        }
+        const r = await this._uploadWorkspaceFile(dirPath, file, transfer, ownerWorkspace);
         if (!r.ok) {
-          console.warn("[upload]", file.name, "failed:", r.status);
-          if (
-            reportError
-            && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
-          ) {
-            const detail = await r.text().catch(() => "");
-            this.errToast("upload", detail || `HTTP ${r.status}`);
+          const raw = await r.text().catch(() => "");
+          failure = this._workspaceUploadError(r.status, raw);
+          if (reportError && this._workspaceIsCurrent(ownerWorkspace)) {
+            this.errToast("upload", failure);
           }
           return false;
         }
-        const data = (await r.json().catch(() => ({}))) || {};
+        let data = (await r.json().catch(() => ({}))) || {};
+        if (uploadState.cancelled) return null;
+        if (data.pending) {
+          uploadState.saving = true;
+          const committed = await fetch("/api/files/upload/commit", {
+            method: "POST", headers: {...this.fileHdr(ownerWorkspace), "Content-Type": "application/json"},
+            body: JSON.stringify({upload_id: transfer.uploadId, path: dirPath}),
+          });
+          if (!committed.ok) {
+            failure = this._workspaceUploadError(committed.status, await committed.text());
+            return false;
+          }
+          data = await committed.json();
+        }
         succeeded = true;
         return {
           path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
           replaced_trash_id: data.replaced_trash_id || null,
         };
       } catch (e) {
-        console.warn("[upload]", file.name, "error:", e);
+        if (uploadState.cancelled) return null;
+        failure = this._workspaceUploadError(0, "");
         if (
           reportError
           && (!ownerWorkspace || this._workspaceIsCurrent(ownerWorkspace))
@@ -16595,7 +17408,7 @@ function portal() {
         }
         return false;
       } finally {
-        this._finishFileUploadTransfer(transfer, succeeded);
+        this._finishFileUploadTransfer(transfer, succeeded, failure);
       }
     },
     _prepareUploadOverwrite(dirPath, files) {
@@ -16619,6 +17432,10 @@ function portal() {
         .filter(r => r.status === "fulfilled" && r.value && r.value.path)
         .map(r => r.value);
       if (!uploaded.length) return;
+      await this.revealInTree(uploaded[0].path, {
+        mode: "background", highlight: true, ownerWorkspace,
+      });
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       for (const item of uploaded) this._previewCacheDel(item.path);
       const replaced = uploaded.filter(item => item.replaced_trash_id).length;
       if (replaced) {
@@ -16730,12 +17547,8 @@ function portal() {
     historyRowClass(sid) {
       return { active: sid === this.currentId, open: this.openTabIds.includes(sid) };
     },
-    // The history picker popup escapes its container via position: fixed
-    // (the parent .chat-tabs has overflow-x: auto which forces overflow-y to
-    // also clip — an absolute-positioned popup gets cut off). We compute the
-    // viewport-anchored position from the 📁 button's bounding rect at click
-    // time so the popup floats just below it.
-    historyPickerStyle: "",
+    // The shared anchored-popup controller escapes overflow clipping and
+    // follows the history button when the viewport or pane geometry changes.
     sessionPickerSearch: "",
     // P2 (perf): the list is windowed to the recent ~100, so the picker's
     // client-side filter can no longer reach old sessions. Search goes to the
@@ -16855,18 +17668,6 @@ function portal() {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
       if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
-      const rect = btn ? btn.getBoundingClientRect() : null;
-      if (rect) {
-        const popW = Math.min(320, window.innerWidth - 16);
-        // Right-align under the button, but stay inside the viewport edges.
-        let left = Math.round(rect.right - popW);
-        if (left < 8) left = 8;
-        const top = Math.round(rect.bottom + 4);
-        this.historyPickerStyle =
-          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
-      } else {
-        this.historyPickerStyle = "";
-      }
       this.sessionPickerOpen = true;
       this.pickerGroupExpanded = {};  // reset collapse state on each open
       this._openFocusSurface(
@@ -16892,25 +17693,9 @@ function portal() {
       }
       this.openTab(sid);
     },
-    // Open-tabs quick picker for the file editor tab bar. Computes a fixed
-    // position from the button rect (same trick as toggleHistoryPicker) so the
-    // dropdown escapes the .tab-bar overflow: auto clip.
+    // The open-tabs picker uses the same anchored-popup controller as history.
     toggleEditorTabPicker(ev) {
       if (this.editorTabPickerOpen) { this.editorTabPickerOpen = false; return; }
-      const btn = ev && ev.currentTarget;
-      const rect = btn ? btn.getBoundingClientRect() : null;
-      if (rect) {
-        const popW = Math.min(280, window.innerWidth - 16);
-        // Left-align under the button, but stay inside the viewport edges.
-        let left = Math.round(rect.left);
-        if (left + popW > window.innerWidth - 8) left = window.innerWidth - 8 - popW;
-        if (left < 8) left = 8;
-        const top = Math.round(rect.bottom + 4);
-        this.editorTabPickerStyle =
-          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
-      } else {
-        this.editorTabPickerStyle = "";
-      }
       this.editorTabPickerOpen = true;
     },
     pickEditorTab(path) {
@@ -17625,7 +18410,7 @@ function portal() {
       // One privacy-bounded summary per canonical history load. Never include a
       // session id, message text, URL, model name, or error string.
       const numeric = [
-        "total_ms", "fetch_ms", "parse_ms", "shape_ms", "markdown_ms",
+        "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms", "shape_ms", "markdown_ms",
         "install_ms", "response_bytes", "block_count", "assistant_blocks",
         "long_task_count", "longest_task_ms",
       ];
@@ -17635,6 +18420,9 @@ function portal() {
         mode: ["cold", "quiet", "prefetch"].includes(fields.mode)
           ? fields.mode : "cold",
         foreground: !!fields.foreground,
+        visibility: ["visible", "hidden"].includes(fields.visibility) ? fields.visibility : "unknown",
+        cancel_reason: ["none", "superseded", "live_owner", "revision_changed", "anchor_missing", "aborted"]
+          .includes(fields.cancel_reason) ? fields.cancel_reason : "none",
       };
       for (const name of numeric) {
         const value = Math.round(Number(fields[name]) || 0);
@@ -17767,6 +18555,7 @@ function portal() {
               String(d.user_text || ""),
               Array.isArray(d.user_images) ? d.user_images : [],
               Array.isArray(d.user_docs) ? d.user_docs : [],
+              String(d.queue_item_id || ""),
             )
           : null;
         if (activeTurnUser && d.scheduled) {
@@ -17845,15 +18634,20 @@ function portal() {
     // tabState[sid].messages and never touches another pane or
     // messagesLoading unless sid === currentId), so prefetching an
     // off-screen session can't disturb the active view.
+    _backgroundHistoryLoadBusy() {
+      return (typeof document !== "undefined" && document.hidden)
+        || this.activeSessionPane().streaming
+        || Object.values(this._prefetching || {}).some(Boolean);
+    },
     prefetchSession(sid) {
-      if (!sid) return;
+      if (!sid || this._backgroundHistoryLoadBusy()) return;
       const st = this.tabState && this.tabState[sid];
       if (st && st._loaded) return;
       if (!this._prefetching) this._prefetching = {};
       if (this._prefetching[sid]) return;
       clearTimeout(this._prefetchTimer);
       this._prefetchTimer = setTimeout(async () => {
-        if (this._prefetching[sid]) return;
+        if (this._backgroundHistoryLoadBusy()) return;
         // Re-check loaded state: it may have flipped while we waited
         // (user clicked the row mid-debounce → switchSession ran).
         const st2 = this.tabState && this.tabState[sid];
@@ -17984,7 +18778,9 @@ function portal() {
         status: "cancelled",
         mode: quiet ? "quiet" : (isCurrent ? "cold" : "prefetch"),
         foreground: isCurrent,
-        total_ms: 0, fetch_ms: 0, parse_ms: 0, shape_ms: 0,
+        cancel_reason: "none",
+        visibility: typeof document !== "undefined" ? document.visibilityState : "unknown",
+        total_ms: 0, fetch_ms: 0, receive_ms: 0, parse_ms: 0, first_reveal_ms: 0, shape_ms: 0,
         markdown_ms: 0, install_ms: 0, response_bytes: 0,
         block_count: 0, assistant_blocks: 0,
         long_task_count: 0, longest_task_ms: 0,
@@ -18024,20 +18820,54 @@ function portal() {
           : preserveFullOrder
             ? "?full=1&tail=" + requestedTail
             : "?tail=" + requestedTail;
-        let r;
+        let r, parsedSession;
         const fetchStarted = perfNow();
+        let receivedHeaders = false;
+        const consumeHistory = async response => {
+          receivedHeaders = true;
+          historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
+          if (!response.ok) return;
+          const receiveStarted = perfNow();
+          if (typeof response.text === "function") {
+            const raw = await response.text();
+            historyPerf.receive_ms = Math.round(perfNow() - receiveStarted);
+            const parseStarted = perfNow();
+            parsedSession = JSON.parse(raw);
+            historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
+          } else {
+            // Reusable in-memory snapshots and older response adapters.
+            parsedSession = await response.json();
+            historyPerf.receive_ms = Math.round(perfNow() - receiveStarted);
+          }
+        };
         try {
+          const snapshot = opts.historySnapshot;
+          const reusable = snapshot && !full && !preserveFullOrder
+            && Array.isArray(snapshot.messages)
+            && snapshot.messages.length >= Math.min(Number(snapshot.total) || 0, requestedTail);
+          if (reusable) {
+            const trim = Math.max(0, snapshot.messages.length - requestedTail);
+            r = { ok: true, headers: new Headers(), json: async () => ({
+              ...snapshot, messages: snapshot.messages.slice(trim),
+              offset: (Number(snapshot.offset) || 0) + trim,
+              has_more: (Number(snapshot.offset) || 0) + trim > 0,
+            }) };
+            await consumeHistory(r);
+          } else {
           r = await this._fetchWithDeadline(
             "/api/chat/sessions/" + sid + qs,
             { headers: this.hdr(), signal: opts.signal },
             full ? 60_000
               : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
+            consumeHistory,
           );
+          }
         } catch (_) {
-          historyPerf.status = "error";
+          historyPerf.status = opts.signal?.aborted ? "cancelled" : "error";
+          if (opts.signal?.aborted) historyPerf.cancel_reason = "aborted";
           return false;
         } finally {
-          historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
+          if (!receivedHeaders) historyPerf.fetch_ms = Math.round(perfNow() - fetchStarted);
         }
         if (!r.ok) {
           historyPerf.status = "error";
@@ -18045,15 +18875,16 @@ function portal() {
         }
         historyPerf.response_bytes = Math.max(
           0, Number(r.headers.get("content-length")) || 0);
-        const parseStarted = perfNow();
-        const parsedSession = await r.json();
-        historyPerf.parse_ms = Math.round(perfNow() - parseStarted);
         const s = this._retainExpectedSessionSettings(parsedSession);
         if (this.tabState[sid] !== st
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          historyPerf.cancel_reason = "superseded";
           return false;
         }
-        if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+        if (st.streaming || st.es || this._hasAdmissionBubble(st)) {
+          historyPerf.cancel_reason = "live_owner";
+          return false;
+        }
         const loadedRuntimeUiRevision = String(s.runtime_ui_revision || "");
         const currentRuntimeUiRevision = String(st.runtimeUiRevision || "");
         // A different load for this same tab adopted another presentation
@@ -18063,6 +18894,7 @@ function portal() {
         // server revision is picked up by the existing poll/reconcile retry.
         if (currentRuntimeUiRevision !== runtimeUiRevisionAtLoad
             && currentRuntimeUiRevision !== loadedRuntimeUiRevision) {
+          historyPerf.cancel_reason = "revision_changed";
           return false;
         }
         const loadedUpdated = Number(s.updated_at) || 0;
@@ -18111,7 +18943,22 @@ function portal() {
           // in-place splice so Alpine keeps the existing bubble elements
           // mounted instead of destroying `sid:live:*` nodes and recreating
           // them as `sid:uuid:*` / `sid:hist:*`.
-          all = this._preserveCanonicalMessageIdentity(st, all);
+          let completedBoundary = opts.completedBoundary;
+          const completion = s.completion_state;
+          // A lost done frame reaches us through revision/replay recovery,
+          // rather than completed_turn. A stable idle snapshot for the exact
+          // retired stream supplies the same boundary without guessing across
+          // successor turns or an older around/full history window.
+          if (!completedBoundary && !s.has_later && completion?.stable
+              && !completion.active && completion.completed_turn_id
+              && [st.activeTurnId, st._lastTerminalTurnId]
+                .includes(completion.completed_turn_id)) {
+            const final = all.findLast(message => message.role === "assistant"
+              && message.uuid && !message.display_kind);
+            const live = st.messages.findLast(message => message.role === "assistant");
+            if (final && live) completedBoundary = { uuid: final.uuid, text: live.text || "" };
+          }
+          all = this._preserveCanonicalMessageIdentity(st, all, completedBoundary);
         }
         const incomingCount = all.length;
         historyPerf.block_count = incomingCount;
@@ -18138,6 +18985,7 @@ function portal() {
         if (this.tabState[sid] !== st || st.streaming || st.es
             || this._hasAdmissionBubble(st)
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          historyPerf.cancel_reason = "superseded";
           return false;
         }
         // Publish the canonical repository atomically. A 100-row in-place
@@ -18145,7 +18993,10 @@ function portal() {
         // make Alpine's keyed mover observe an inconsistent intermediate
         // lookup. The matched message objects and their `_k` values are still
         // reused, so stable bubbles keep their DOM identity on the normal path.
-        if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
+        if (st.streaming || st.es || this._hasAdmissionBubble(st)) {
+          historyPerf.cancel_reason = "live_owner";
+          return false;
+        }
         // _virtualStart/_virtualEnd are LOCAL to the revealed slice. A quiet
         // canonical refresh can move visibleStart from a narrow recent tail to
         // an older coordinate; carrying the same numbers across that change
@@ -18157,13 +19008,28 @@ function portal() {
         const followTailAtInstall = quiet && (
           opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
         );
+        // Only a complete, stable snapshot of the retired turn can prove a
+        // missing reader anchor was removed, rather than merely outside a tail
+        // page. Rebase to a surviving neighbor in that case; preserve the old
+        // window for partial/full-order or successor snapshots.
+        const completion = s.completion_state;
+        const verifiedCompletion = completion?.stable === true && !completion.active
+          && (opts.completedBoundary?.uuid
+            ? all.some(message => message.uuid === opts.completedBoundary.uuid)
+            : !!completion.completed_turn_id
+              && [st.activeTurnId, st._lastTerminalTurnId]
+                .includes(completion.completed_turn_id));
+        const allowRemovedAnchors = verifiedCompletion
+          && !full && !preserveFullOrder && !s.has_more && !s.has_later
+          && Number(s.offset) === 0 && Number(s.total) === all.length;
         const quietRangeResolved = quiet
           ? (followTailAtInstall
             ? {
               start: Math.max(0, all.length - this._liveMessageDomCap()),
               end: all.length,
             }
-            : this._resolveMessageRangeSnapshot(all, quietRangeSnapshot))
+            : this._resolveMessageRangeSnapshot(
+              all, quietRangeSnapshot, allowRemovedAnchors))
           : null;
         // A quiet response that no longer contains the reader's stable message
         // anchor belongs to another coordinate system (for example full/around vs
@@ -18171,8 +19037,19 @@ function portal() {
         // repository and expose the jump-to-latest affordance instead of silently
         // applying old numeric indices to unrelated messages.
         if (quiet && !quietRangeResolved) {
+          historyPerf.cancel_reason = "anchor_missing";
           st.atBottom = false;
           return false;
+        }
+        // Preserving the reader's position must not preserve an obsolete END
+        // boundary. A final answer can be present in the accepted repository
+        // but excluded from the scrollable range forever after a tool row.
+        // Expose the settled suffix while retaining the start/viewport anchor;
+        // physical virtualization still bounds mounted rows, and only explicit
+        // tail-follow may move the reader to the final answer.
+        if (quietRangeResolved && completion?.stable === true
+            && !completion.active && !s.has_later && !full && !preserveFullOrder) {
+          quietRangeResolved.end = all.length;
         }
         const installStarted = perfNow();
         // Cold loads start from an empty coordinate and reveal the newest rows in
@@ -18182,8 +19059,12 @@ function portal() {
         const quietEnd = quietRangeResolved ? quietRangeResolved.end : startIdx;
         st.messageRange.visibleStart = quiet ? quietStart : startIdx;
         st.messageRange.visibleEnd = quiet ? quietEnd : startIdx;
-        st.messages = all;
-        _paneMessageIndexCache.delete(st);
+        const sameRepository = st.messages.length === all.length
+          && st.messages.every((message, index) => message === all[index]);
+        if (!sameRepository) {
+          st.messages = all;
+          _paneMessageIndexCache.delete(st);
+        }
         Object.assign(st.messageRange, {
           visibleStart: quiet ? quietStart : startIdx,
           visibleEnd: quiet ? quietEnd : startIdx,
@@ -18198,12 +19079,15 @@ function portal() {
         if (quiet) {
           await new Promise(resolve => this.$nextTick(resolve));
         } else {
-          await this._revealMessagesChunked(sid, st, visible, true);
+          await this._revealMessagesChunked(sid, st, visible, true, () => {
+            historyPerf.first_reveal_ms = Math.round(perfNow() - historyPerfStarted);
+          });
         }
         historyPerf.install_ms = Math.round(perfNow() - installStarted);
         if (this.tabState[sid] !== st || st.streaming || st.es
             || this._hasAdmissionBubble(st)
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
+          historyPerf.cancel_reason = "superseded";
           return false;
         }
         if (quiet) {
@@ -18516,7 +19400,7 @@ function portal() {
     // Reveal the resident repository in small coordinate steps. The newest tail is
     // immediate; older rows are installed through _yieldHistoryInstall so mobile
     // input gets priority instead of Alpine occupying every animation frame.
-    async _revealMessagesChunked(sid, st, visible, tailFirst = true) {
+    async _revealMessagesChunked(sid, st, visible, tailFirst = true, onFirstReveal = null) {
       // Alpine row creation is the remaining dominant long task: one row can
       // contain many nested directives, tool cards and x-html bodies. Keep each
       // commit deliberately small so transcript installation yields to shell
@@ -18568,6 +19452,7 @@ function portal() {
         await new Promise(resolve => this.$nextTick(resolve));
         if (active && sid === this.currentId && this.tabState[sid] === st) {
           if (!st.messagesReady) st.messagesReady = true;
+          if (onFirstReveal) { onFirstReveal(); onFirstReveal = null; }
           if (st.atBottom !== false) {
             this._scrollChatTailNow(sid, st);
           } else if (scrollEl) {
@@ -18653,6 +19538,7 @@ function portal() {
         this._scheduleIdlePreload();
         return;
       }
+      if (this._backgroundHistoryLoadBusy()) return;
       if (!this._prefetching) this._prefetching = {};
       this._prefetching[next] = true;
       this._ensureSessionLoaded(next)
@@ -18803,8 +19689,10 @@ function portal() {
         // later canonical refresh; replacing it with renderKey here remounts
         // the bubble on the second poll even though object identity survived.
         const mountedKey = existing._k || renderKey;
-        Object.assign(existing, m, { _k: mountedKey });
-        if (loadedBody) Object.assign(existing, loadedBody);
+        const fields = { ...m, ...(loadedBody || {}), _k: mountedKey };
+        for (const [key, value] of Object.entries(fields)) {
+          if (!this._sameCanonicalValue(existing[key], value)) existing[key] = value;
+        }
         if (staleAssistantPresentation) {
           this._invalidateAssistantPresentation(existing, nextText, sid);
         }
@@ -18882,7 +19770,18 @@ function portal() {
       push("summary", m.summary);
       return out;
     },
-    _preserveCanonicalMessageIdentity(st, incoming) {
+    _sameCanonicalValue(left, right) {
+      const raw = value => window.Alpine?.raw ? window.Alpine.raw(value) : value;
+      left = raw(left); right = raw(right);
+      if (left === right) return true;
+      if (!left || !right || typeof left !== "object" || typeof right !== "object"
+          || Array.isArray(left) !== Array.isArray(right)) return false;
+      const keys = Object.keys(left);
+      return keys.length === Object.keys(right).length
+        && keys.every(key => Object.prototype.hasOwnProperty.call(right, key)
+          && this._sameCanonicalValue(left[key], right[key]));
+    },
+    _preserveCanonicalMessageIdentity(st, incoming, completedBoundary = null) {
       const existing = st.messages;
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
       const existingTail = existing[existing.length - 1];
@@ -18950,7 +19849,9 @@ function portal() {
         } : null;
         const canonicalFields = { ...canonical };
         delete canonicalFields._k;
-        Object.assign(matched, canonicalFields);
+        for (const [key, value] of Object.entries(canonicalFields)) {
+          if (!this._sameCanonicalValue(matched[key], value)) matched[key] = value;
+        }
         if (liveFields) {
           if (liveFields.ts) matched.ts = liveFields.ts;
           if (liveFields.elapsed) matched.elapsed = liveFields.elapsed;
@@ -18985,6 +19886,26 @@ function portal() {
         result[index] = matched;
         return true;
       };
+
+      // Completion reconciliation already verified the exact persisted final
+      // boundary and that no successor owns the pane. Its live text may be
+      // incomplete, so ordinary text matching cannot retain the viewport node.
+      // Bind only one unambiguous live assistant to that verified boundary;
+      // durable identities and repeated prose never get reassigned by this hint.
+      if (completedBoundary?.uuid) {
+        const canonicalIndexes = incoming.map((message, index) => (
+          message.role === "assistant" && message.uuid === completedBoundary.uuid
+            ? index : -1
+        )).filter(index => index >= 0);
+        const liveMatches = existing.filter(message =>
+          message.role === "assistant" && !message.uuid
+          && (!message.forkUuid || message.forkUuid === completedBoundary.uuid)
+          && String(message._k || "").includes(":live:")
+          && String(message.text || "") === completedBoundary.text);
+        if (canonicalIndexes.length === 1 && liveMatches.length === 1) {
+          adopt(canonicalIndexes[0], liveMatches[0], "strong");
+        }
+      }
 
       // Reserve every durable identity before considering prose continuity.
       // Otherwise canonical turn B can weak-match turn A's identical text and
@@ -19235,14 +20156,25 @@ function portal() {
       const end = Math.max(start, Math.min(range.visibleEnd, st.messages.length));
       return {
         followTail: st.atBottom !== false && !this._messageRangeHasLater(st),
+        // Edges may be transient tool/live blocks removed by canonicalization.
+        // Retain identities throughout the range, plus neighbors for a verified
+        // complete replacement. Never infer identity from repeated prose.
+        anchors: st.messages.map((message, index) => ({
+          identity: this._historyMessageIdentity(message),
+          key: message._k || "", relativeIndex: index - start,
+        })),
         startIdentity: this._historyMessageIdentity(st.messages[start]),
         endIdentity: this._historyMessageIdentity(st.messages[end - 1]),
+        // A completed live row can acquire its UUID during reconciliation.
+        // Its retained render key still identifies the same viewport node.
+        startKey: st.messages[start]?._k || "",
+        endKey: st.messages[end - 1]?._k || "",
         visibleCount: Math.max(0, end - start),
         order: range.order,
         generation: range.generation,
       };
     },
-    _resolveMessageRangeSnapshot(messages, snapshot) {
+    _resolveMessageRangeSnapshot(messages, snapshot, allowRemovedAnchors = false) {
       if (!snapshot) return null;
       if (snapshot.followTail) {
         const end = messages.length;
@@ -19252,8 +20184,13 @@ function portal() {
         };
       }
       const count = Math.max(1, Number(snapshot.visibleCount) || 1);
-      const startIndex = this._historyMessageIndex(messages, snapshot.startIdentity);
-      const endIndex = this._historyMessageIndex(messages, snapshot.endIdentity);
+      const resolveIndex = (identity, key) => {
+        const index = this._historyMessageIndex(messages, identity);
+        return index >= 0 || !key ? index
+          : messages.findIndex(message => message._k === key);
+      };
+      const startIndex = resolveIndex(snapshot.startIdentity, snapshot.startKey);
+      const endIndex = resolveIndex(snapshot.endIdentity, snapshot.endKey);
       if (startIndex >= 0 && endIndex >= startIndex) {
         return { start: startIndex, end: endIndex + 1 };
       }
@@ -19262,6 +20199,26 @@ function portal() {
       }
       if (endIndex >= 0) {
         return { start: Math.max(0, endIndex - count + 1), end: endIndex + 1 };
+      }
+      // Surviving interior rows are as authoritative as the old endpoints.
+      // Preserve their relative position when transient range edges disappear.
+      const anchors = snapshot.anchors || [];
+      const interior = anchors.filter(anchor => anchor.relativeIndex >= 0
+        && anchor.relativeIndex < count);
+      const neighbors = allowRemovedAnchors
+        ? anchors.filter(anchor => anchor.relativeIndex < 0
+            || anchor.relativeIndex >= count).sort((a, b) => {
+          const distance = anchor => anchor.relativeIndex < 0
+            ? -anchor.relativeIndex : anchor.relativeIndex - count + 1;
+          return distance(a) - distance(b);
+        }) : [];
+      for (const anchor of [...interior, ...neighbors]) {
+        const index = resolveIndex(anchor.identity, anchor.key);
+        if (index < 0) continue;
+        const start = Math.max(0, Math.min(
+          index - anchor.relativeIndex, Math.max(0, messages.length - count),
+        ));
+        return { start, end: Math.min(messages.length, start + count) };
       }
       return null;
     },
@@ -19761,15 +20718,10 @@ function portal() {
           if (!item?.id || (item.content && item._traceback)) return item;
           try {
             const base = "/api/memory/items/" + encodeURIComponent(item.id);
-            const [detailResponse, tracebackResponse] = await Promise.all([
-              fetch(base, { headers: this.hdr(), cache: "no-store" }),
-              fetch(base + "/traceback", {
-                headers: this.hdr(), cache: "no-store",
-              }),
+            const [detail, traceback] = await Promise.all([
+              this._settingsRead(base),
+              this._settingsRead(base + "/traceback"),
             ]);
-            const detail = detailResponse.ok ? await detailResponse.json() : {};
-            const traceback = tracebackResponse.ok
-              ? await tracebackResponse.json() : { sites: [] };
             return {
               ...item,
               kind: detail.kind || item.kind,
@@ -19826,8 +20778,9 @@ function portal() {
       // the initial geometry appeared to fit.
       popover.style.width = `${Math.round(width)}px`;
       popover.style.maxHeight = `${Math.round(maxHeight)}px`;
-      popover.style.left = `${pad}px`;
-      popover.style.top = `${pad}px`;
+      // Preserve the anchored coordinates while measuring. If positioning
+      // yields the same reactive style string, Alpine will not reapply it to
+      // undo temporary top/left writes (for example after details hydrate).
       const measuredHeight = Math.min(
         maxHeight,
         Math.max(1, popover.getBoundingClientRect().height || popover.scrollHeight),
@@ -19861,14 +20814,106 @@ function portal() {
     },
 
     // ===== settings modal =====
+    settingsDirty() { return !!this._settingsDraftGuard?.dirty(); },
+    async closeSettings() {
+      if (this._settingsLeavePending) return false;
+      if (this.settingsDirty()) {
+        this._settingsLeavePending = true;
+        const leave = await this.confirm({
+          title: this.lang === "zh" ? "设置尚未保存" : "Unsaved settings",
+          body: this.lang === "zh"
+            ? "关闭后草稿会保留在此页面。重新打开可继续编辑；刷新或离开页面前请先保存。"
+            : "Your drafts stay on this page when closed. Reopen to continue; save before refreshing or leaving the page.",
+          okText: this.lang === "zh" ? "保留草稿并关闭" : "Keep drafts & close",
+          cancelText: this.lang === "zh" ? "继续编辑" : "Keep editing",
+        });
+        this._settingsLeavePending = false;
+        if (!leave) return false;
+      }
+      this.settings.show = false;
+      return true;
+    },
+    async discardSettingsDrafts() {
+      const discard = await this.confirm({
+        title: this.lang === "zh" ? "放弃未保存的设置？" : "Discard unsaved settings?",
+        body: this.lang === "zh" ? "已保存的设置不受影响。" : "Saved settings remain unchanged.",
+        okText: this.lang === "zh" ? "放弃草稿" : "Discard drafts", danger: true,
+      });
+      if (discard) this._settingsDraftGuard?.discard();
+    },
+    settingsNavigation() {
+      const zh = this.lang === "zh";
+      return [
+        ["general", zh ? "通用" : "General", "settings"],
+        ["provider", zh ? "模型与连接" : "Models & connections", "key"],
+        ["defaults", zh ? "会话" : "Conversations", "msg"],
+        ["extensions", zh ? "扩展" : "Extensions", "puzzle"],
+        ["memory_engine", zh ? "记忆引擎" : "Memory engine", "brain"],
+        ["service", zh ? "服务与诊断" : "Service & diagnostics", "refresh"],
+        ["versions", zh ? "关于与更新" : "About & updates", "info"],
+        ["cost", zh ? "用量看板" : "Usage", "dollar"],
+      ];
+    },
+    settingsPageMatches(page) {
+      const selected = this.settings.activePage;
+      return selected === page
+        || (selected === "general" && ["lang", "appearance", "notification"].includes(page))
+        || (selected === "extensions" && ["skills", "hooks", "mcp"].includes(page));
+    },
+    selectSettingsPage(page) {
+      this.settings.activePage = page;
+      if (page === "memory_engine") this.loadMemorySettings({ includeList: false });
+      if (page === "memory") this.loadMemorySettings();
+      if (page === "provider") this.loadClaudeAuthStatus();
+      if (page === "cost") this.loadCostDashboard();
+      if (page === "service") this.loadServiceStatus();
+      if (page === "extensions") {
+        this.refreshMcpList();
+        this.refreshSkillList();
+        this.loadHookSettings();
+      }
+      if (page === "hooks") this.loadHookSettings();
+      if (page === "skills") this.refreshSkillList();
+      if (page === "mcp") this.refreshMcpList();
+    },
+    async loadServiceStatus() {
+      this.settings.serviceLoading = true;
+      this.settings.serviceError = "";
+      try { this.settings.service = await this._settingsRead("/api/settings/service"); }
+      catch (e) { this.settings.serviceError = this._settingsReadError(e); }
+      finally { this.settings.serviceLoading = false; }
+    },
     async openSettings(activePage = "") {
-      const r = await fetch("/api/settings", { headers: this.hdr() });
-      if (!r.ok) {
-        this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
+      if (!this._settingsDraftGuard) {
+        const { createSettingsDraftGuard } = await import("/static/modules/settings-drafts.mjs");
+        this._settingsDraftGuard = createSettingsDraftGuard(this);
+        this._settingsDraftGuard.capture();
+      }
+      if (this.settingsDirty()) {
+        this.settings.surface = activePage === "memory" ? "memory" : "settings";
+        this.settings.show = true;
+        this.selectSettingsPage(activePage || this.settings.activePage || (this.isWideScreen ? "provider" : null));
         return;
       }
-      const d = await r.json();
+      const generation = (this._settingsOpenGeneration || 0) + 1;
+      this._settingsOpenGeneration = generation;
+      if (this._settingsOpenController) this._settingsOpenController.abort();
+      const controller = new AbortController();
+      this._settingsOpenController = controller;
+      this.settings.surface = activePage === "memory" ? "memory" : "settings";
+      this.settings.show = true;
+      this.settings.error = "";
+      this.settings.loading = true;
+      this.selectSettingsPage(activePage || (this.isWideScreen ? "provider" : null));
+      // Render the shell immediately; optional panels have independent reads.
+      try {
+      const d = await this._settingsRead("/api/settings", controller);
+      if (generation !== this._settingsOpenGeneration) return;
       this.settings.providers = d.providers;
+      this.settings.contextGroups = d.context_groups || [];
+      this.settings.contextLimits = d.context_limits || { providers: {}, models: {} };
+      this.settings.contextError = "";
+      this.contextDraftChanged();
       this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
       // Reset provider-editor drafts each open so a stale half-edit from a
       // previous session doesn't reappear. Seed one (closed) draft per
@@ -19895,24 +20940,25 @@ function portal() {
         this.busySendMode = this._normalizeBusySendMode(d.defaults.busy_send_mode);
         this.savePrefs();
       }
+      this._settingsDraftGuard.capture([
+        "defaults", "keys", "newProvider",
+        ...d.providers.map(p => `provider:${p.id}`),
+      ]);
       // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
       // Desktop: sidebar is always visible, so land on a default tab
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = activePage === "memory"
-        ? "memory"
-        : activePage === "hooks"
-          ? "hooks"
-          : (this.isWideScreen ? "provider" : null);
-      this.settings.show = true;
-      // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
-      // stays lazy because Codex quota refresh intentionally runs a CLI probe.
-      this.refreshMcpList();
-      this.refreshSkillList();
-      if (activePage === "hooks") this.loadHookSettings();
-      this.loadClaudeAuthStatus();
-      this.loadMemorySettings();
+      } catch (e) {
+        if (generation === this._settingsOpenGeneration) {
+          this.settings.error = this._settingsReadError(e);
+        }
+      } finally {
+        if (generation === this._settingsOpenGeneration) {
+          this.settings.loading = false;
+          this._settingsOpenController = null;
+        }
+      }
     },
 
     async openMemoryCenter(tab = "") {
@@ -19943,14 +20989,19 @@ function portal() {
         );
         if (!response.ok) throw new Error(await response.text());
         item._traceback = (await response.json()).sites || [];
+        item._tracebackError = false;
       } catch (_) {
-        item._traceback = [];
+        // A failed request is not evidence that the memory has no source.
+        item._tracebackError = true;
+        this.toast(this.lang === "zh" ? "来源加载失败，请重试" : "Source unavailable; retry", "error");
+        return [];
       }
       return item._traceback;
     },
 
     async openMemorySource(item) {
       const site = (await this.loadMemoryTraceback(item))[0];
+      if (item._tracebackError) return;
       if (!site?.session_id) {
         this.toast(this.lang === "zh" ? "没有可打开的来源会话" : "No source session available", "warn");
         return;
@@ -20002,20 +21053,15 @@ function portal() {
     },
 
     async _pollMemoryReview() {
+      if (this._memoryReviewLoading) return;
+      this._memoryReviewLoading = true;
       try {
         if (this._memoryMonitorEnabled == null) {
-          const cfgR = await fetch("/api/memory/config", {
-            headers: this.hdr(), cache: "no-store",
-          });
-          if (!cfgR.ok) return;
-          this._memoryMonitorEnabled = (await cfgR.json()).mode !== "off";
+          const cfg = await this._settingsRead("/api/memory/config");
+          this._memoryMonitorEnabled = cfg.mode !== "off";
         }
         if (!this._memoryMonitorEnabled) return;
-        const r = await fetch("/api/memory/status", {
-          headers: this.hdr(), cache: "no-store",
-        });
-        if (!r.ok) return;
-        const status = await r.json();
+        const status = await this._settingsRead("/api/memory/status");
         this.settings.memory.status = status;
         const ids = status.pending_artifact_ids || [];
         let seen = [];
@@ -20035,26 +21081,81 @@ function portal() {
           this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
         }
       } catch (_) { /* optional and fail-soft */ }
+      finally { this._memoryReviewLoading = false; }
     },
 
-    async loadMemorySettings() {
-      const mem = this.settings.memory;
-      mem.loading = true;
-      try {
-        const [cfgR, statusR] = await Promise.all([
-          fetch("/api/memory/config", { headers: this.hdr(), cache: "no-store" }),
-          fetch("/api/memory/status", { headers: this.hdr(), cache: "no-store" }),
-        ]);
-        if (!cfgR.ok || !statusR.ok) throw new Error(`HTTP ${cfgR.status}/${statusR.status}`);
-        mem.config = await cfgR.json();
-        mem.status = await statusR.json();
-        await this.refreshMemoryCenter();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "记忆设置加载失败：" : "Memory settings failed: ")
-          + (e.message || e), "error");
-      } finally {
-        mem.loading = false;
+    SETTINGS_READ_TIMEOUT_MS: 8000,
+    _settingsReadError(error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        return this.lang === "zh"
+          ? "加载超时，请检查连接后重试"
+          : "Loading timed out. Check your connection and retry.";
       }
+      if (error?.name === "TypeError") {
+        return this.lang === "zh"
+          ? "连接中断，请重试"
+          : "Connection interrupted. Please retry.";
+      }
+      return String(error?.message || error);
+    },
+    async _settingsRead(url, controller = new AbortController()) {
+      if (controller.signal.aborted) throw this._abortError();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, this.SETTINGS_READ_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {
+          headers: this.hdr(), cache: "no-store", signal: controller.signal,
+        });
+        if (response.status === 503 && url.startsWith("/api/memory/")) {
+          throw new Error(this.lang === "zh"
+            ? "记忆查询暂时不可用，请重试"
+            : "Memory is temporarily unavailable. Please retry.");
+        }
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return await response.json();
+      } catch (error) {
+        if (timedOut) {
+          const timeout = new Error("settings request timed out");
+          timeout.name = "TimeoutError";
+          throw timeout;
+        }
+        throw error;
+      } finally { clearTimeout(timer); }
+    },
+
+    async loadMemorySettings({ includeList = true } = {}) {
+      const mem = this.settings.memory;
+      const generation = (this._memorySettingsGeneration || 0) + 1;
+      this._memorySettingsGeneration = generation;
+      mem.loading = true;
+      const load = async (key) => {
+        if (key === "config" && this._settingsDraftGuard?.dirty("memory")) return;
+        mem[`${key}Loading`] = true;
+        mem[`${key}Error`] = "";
+        try {
+          const data = await this._settingsRead(`/api/memory/${key}`);
+          if (generation !== this._memorySettingsGeneration) return;
+          mem[key] = data;
+          if (key === "config") {
+            mem.configLoaded = true;
+            this._settingsDraftGuard?.capture(["memory"]);
+          }
+        } catch (e) {
+          if (generation === this._memorySettingsGeneration) {
+            mem[`${key}Error`] = this._settingsReadError(e);
+          }
+        } finally {
+          if (generation === this._memorySettingsGeneration) mem[`${key}Loading`] = false;
+        }
+      };
+      await Promise.allSettled([
+        load("config"), load("status"),
+        ...(includeList ? [this.refreshMemoryCenter()] : []),
+      ]);
+      if (generation === this._memorySettingsGeneration) mem.loading = false;
     },
 
     _memoryErrorDetail(d, status) {
@@ -20089,6 +21190,7 @@ function portal() {
 
     async saveMemorySettings() {
       const mem = this.settings.memory;
+      const submittedConfig = JSON.parse(JSON.stringify(mem.config));
       mem.saving = true;
       try {
         const r = await fetch("/api/memory/config?probe=true", {
@@ -20098,7 +21200,11 @@ function portal() {
         });
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(this._memoryErrorDetail(d, r.status));
-        mem.config = d.config; mem.status = d.status;
+        if (JSON.stringify(mem.config) === JSON.stringify(submittedConfig)) {
+          mem.config = d.config;
+          this._settingsDraftGuard?.capture(["memory"]);
+        } else this._settingsDraftGuard?.accept("memory", submittedConfig);
+        mem.status = d.status;
         this._memoryMonitorEnabled = d.config.mode !== "off";
         this._startMemoryMonitor();
         this.toast(this.lang === "zh" ? "记忆设置已保存" : "Memory settings saved",
@@ -20111,8 +21217,17 @@ function portal() {
       }
     },
 
-    async refreshMemoryCenter() {
+    async refreshMemoryCenter({ keepPage = false } = {}) {
       const mem = this.settings.memory;
+      if (!this._memoryPrefsLoaded) {
+        this._memoryPrefsLoaded = true;
+        try {
+          const prefs = JSON.parse(localStorage.getItem("muselab_memory_browser") || "{}");
+          if (["auto", "updated_at", "recall_count", "last_recalled_at", "helpful_count", "unhelpful_count"].includes(prefs.sort)) mem.sort = prefs.sort;
+          if (["asc", "desc"].includes(prefs.direction)) mem.direction = prefs.direction;
+        } catch (_) {}
+      }
+      if (!keepPage) mem.offset = 0;
       let url = "/api/memory/items?limit=200";
       if (mem.tab === "episodes") url = "/api/memory/episodes?limit=200";
       else if (mem.tab === "reflections") url = "/api/memory/artifacts?kind=reflection_run&limit=200";
@@ -20122,20 +21237,58 @@ function portal() {
       else if (mem.tab === "backups") url = "/api/memory/backups?limit=200";
       else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
       if (mem.tab === "items") {
-        const qs = new URLSearchParams({ limit: "200" });
+        const qs = new URLSearchParams({
+          limit: String(mem.pageSize), offset: String(mem.offset),
+          sort: mem.sort, direction: mem.direction,
+        });
         if (mem.query) qs.set("q", mem.query);
         if (mem.kind) qs.set("kind", mem.kind);
         if (mem.itemStatus) qs.set("status", mem.itemStatus);
         url = "/api/memory/items?" + qs.toString();
       }
+      this._setLS("muselab_memory_browser", JSON.stringify({
+        sort: mem.sort, direction: mem.direction,
+      }));
+      const generation = ++mem.listGeneration;
+      if (this._memoryListAbort) this._memoryListAbort.abort();
+      const controller = new AbortController();
+      this._memoryListAbort = controller;
+      const cached = mem.listCache[url];
+      mem.items = cached ? cached.items : [];
+      mem.total = cached ? cached.total : 0;
+      mem.listLoaded = !!cached;
+      mem.listLoading = true;
+      mem.listError = "";
       try {
-        const r = await fetch(url, { headers: this.hdr(), cache: "no-store" });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        mem.items = (await r.json()).items || [];
+        const data = await this._settingsRead(url, controller);
+        if (generation !== mem.listGeneration) return;
+        mem.items = data.items || [];
+        mem.total = Number.isFinite(data.total) ? data.total : mem.items.length;
+        mem.listLoaded = true;
+        mem.listCache[url] = { items: mem.items, total: mem.total };
+        const keys = Object.keys(mem.listCache);
+        for (const key of keys.slice(0, Math.max(0, keys.length - 12))) delete mem.listCache[key];
       } catch (e) {
-        this.toast((this.lang === "zh" ? "记忆中心加载失败：" : "Memory Center failed: ")
-          + (e.message || e), "error");
+        if (generation !== mem.listGeneration) return;
+        mem.listError = ["AbortError", "TimeoutError"].includes(e.name)
+          ? (this.lang === "zh" ? "列表请求超时，请重试" : "List request timed out; retry")
+          : String(e.message || e);
+      } finally {
+        if (generation === mem.listGeneration) {
+          mem.listLoading = false;
+          this._memoryListAbort = null;
+        }
       }
+    },
+
+    memoryPage(delta) {
+      const mem = this.settings.memory;
+      if (mem.listLoading) return;
+      mem.offset = Math.max(0, Math.min(
+        Math.max(0, Math.ceil(mem.total / mem.pageSize) - 1) * mem.pageSize,
+        mem.offset + delta * mem.pageSize,
+      ));
+      return this.refreshMemoryCenter({ keepPage: true });
     },
 
     async loadMemoryDetail(item) {
@@ -20324,18 +21477,73 @@ function portal() {
       }
     },
 
+    contextModels() {
+      return (this.settings.contextGroups.find(p => p.id === this.settings.contextDraft.provider)?.models || []);
+    },
+
+    contextDraftChanged() {
+      const draft = this.settings.contextDraft;
+      const scope = draft.model ? "models" : "providers";
+      draft.tokens = this.settings.contextLimits[scope]?.[draft.model || draft.provider] ?? "";
+      this._settingsDraftGuard?.capture(["context"]);
+    },
+
+    async saveContextLimit() {
+      const draft = { ...this.settings.contextDraft };
+      const tokens = draft.tokens === "" || draft.tokens == null ? null : Number(draft.tokens);
+      if (tokens !== null && (!Number.isInteger(tokens) || tokens < 1024 || tokens > 10000000)) {
+        this.settings.contextError = this.lang === "zh" ? "请输入 1024～10000000 的整数，或留空恢复自动。" : "Enter an integer from 1024 to 10000000, or leave blank for automatic.";
+        return;
+      }
+      this.settings.contextSaving = true;
+      this.settings.contextError = "";
+      try {
+        const r = await fetch("/api/settings/context-limits", {
+          method: "PUT", headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ scope: draft.model ? "models" : "providers", key: draft.model || draft.provider, tokens }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(this._memoryErrorDetail(data, r.status));
+        this.settings.contextLimits = data.context_limits;
+        this._settingsDraftGuard?.accept("context", draft);
+        this.toast(this.lang === "zh" ? "上下文预算已保存" : "Context budget saved", "success");
+      } catch (e) { this.settings.contextError = e.message || String(e); }
+      finally { this.settings.contextSaving = false; }
+    },
+
+    async refreshMemoryDiagnostics() {
+      const mem = this.settings.memory;
+      if (mem.statusLoading) return;
+      mem.statusLoading = true;
+      mem.statusError = "";
+      try { mem.status = await this._settingsRead("/api/memory/status"); }
+      catch (e) { mem.statusError = this._settingsReadError(e); }
+      finally { mem.statusLoading = false; }
+    },
+
+    memoryJobState(job) {
+      const labels = this.lang === "zh"
+        ? { queued: job.attempts > 0 ? "等待重试" : "排队", running: "运行中", done: "成功", failed: "失败" }
+        : { queued: job.attempts > 0 ? "Retry pending" : "Queued", running: "Running", done: "Succeeded", failed: "Failed" };
+      return labels[job.status] || job.status;
+    },
+
     async memoryRunAction(action) {
       const mem = this.settings.memory;
+      if (mem.actionRunning) return;
       mem.actionRunning = true;
       try {
         const r = await fetch(`/api/memory/${action}`, {
           method: "POST", headers: this.hdr(),
         });
         if (!r.ok) throw new Error(await r.text());
-        this.toast(action === "dream"
+        const result = await r.json();
+        this.toast(action === "reindex" && result.queued === 0
+          ? (this.lang === "zh" ? "已有相同重建任务，或没有需要索引的记忆" : "Reindex already pending, or no memories to index")
+          : action === "dream"
           ? (this.lang === "zh" ? "跨会话反思任务已排队" : "Dream job queued")
           : (this.lang === "zh" ? "重建索引任务已排队" : "Reindex jobs queued"), "success");
-        await this.refreshMemoryCenter();
+        await Promise.allSettled([this.refreshMemoryCenter(), this.refreshMemoryDiagnostics()]);
       } catch (e) {
         this.toast(e.message || String(e), "error");
       } finally {
@@ -20570,6 +21778,7 @@ function portal() {
     },
     startAddHook() {
       this.settings.hooks.draft = this._newHookDraft();
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     editHook(row) {
       this.settings.hooks.draft = {
@@ -20585,9 +21794,11 @@ function portal() {
         groupIndex: row.groupIndex,
         handlerIndex: row.handlerIndex,
       };
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     cancelHookDraft() {
       this.settings.hooks.draft = { ...this._newHookDraft(), show: false };
+      this._settingsDraftGuard?.capture(["hook"]);
     },
     hookHandlerTemplate(type) {
       const templates = {
@@ -20773,7 +21984,7 @@ function portal() {
       if (this.cost.loading) return;
       if (this.cost.data && !force) return;
       this.cost.loading = true;
-      this.fetchCodexRateLimit({ refresh: true });
+      const quotaRefresh = this.fetchCodexRateLimit({ refresh: true });
       try {
         // Browser timezone offset is -getTimezoneOffset (JS reports east as
         // negative, server expects east-positive minutes).
@@ -20793,6 +22004,7 @@ function portal() {
       } catch (e) {
         this.cost.data = null;
       } finally {
+        await quotaRefresh;
         this.cost.loading = false;
       }
     },
@@ -20995,7 +22207,7 @@ function portal() {
         // the draft so the row collapses back to "已配置" view next render.
         const p = this.settings.providers.find(x => x.env_key === envKey);
         if (p) p.configured = true;
-        this.settings.draftKeys[envKey] = "";
+        if ((this.settings.draftKeys[envKey] || "").trim() === v) this.settings.draftKeys[envKey] = "";
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         // Refresh providers + model list so any newly-enabled model
         // appears in the chat dropdown immediately.
@@ -21047,7 +22259,11 @@ function portal() {
         drafts[p.id].open = false;
         return;
       }
+      if (drafts[p.id] && this._settingsDraftGuard?.dirty(`provider:${p.id}`)) {
+        drafts[p.id].open = true; return;
+      }
       drafts[p.id] = { ...this._draftFromProvider(p), open: true };
+      this._settingsDraftGuard?.capture([`provider:${p.id}`]);
     },
 
     _parseModels(text) {
@@ -21060,12 +22276,17 @@ function portal() {
     toggleAnthropicModels(p) {
       const drafts = this.settings.providerDrafts;
       if (drafts[p.id] && drafts[p.id].open) { drafts[p.id].open = false; return; }
+      if (drafts[p.id] && this._settingsDraftGuard?.dirty(`provider:${p.id}`)) {
+        drafts[p.id].open = true; return;
+      }
       drafts[p.id] = { open: true, models: (p.models || []).join("\n") };
+      this._settingsDraftGuard?.capture([`provider:${p.id}`]);
     },
 
     async saveAnthropicModels(p) {
       const dr = this.settings.providerDrafts[p.id];
       if (!dr) return;
+      const submittedDraft = JSON.parse(JSON.stringify(dr));
       const models = this._parseModels(dr.models);
       try {
         const r = await fetch("/api/settings/providers/anthropic-models", {
@@ -21079,7 +22300,8 @@ function portal() {
           throw new Error(msg);
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
-        if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
+        if (JSON.stringify(dr) === JSON.stringify(submittedDraft)) dr.open = false;
+        this._settingsDraftGuard?.accept(`provider:${p.id}`, submittedDraft);
         await this._reloadProviders();
         await this._fetchModels();
       } catch (e) {
@@ -21103,6 +22325,7 @@ function portal() {
       if (!prov) return 0;
       const dr = this.settings.providerDrafts[prov.id];
       if (!dr || !dr.open) return 0;
+      const submittedDraft = JSON.parse(JSON.stringify(dr));
       const next = this._parseModels(dr.models);
       const cur = prov.models || [];
       if (next.join("\n") === cur.join("\n")) return 0;  // no real change
@@ -21116,11 +22339,14 @@ function portal() {
         try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
         throw new Error(msg);
       }
-      dr.open = false;
+      if (JSON.stringify(dr) === JSON.stringify(submittedDraft)) dr.open = false;
+      this._settingsDraftGuard?.accept(`provider:${prov.id}`, submittedDraft);
       return 1;
     },
 
     async _submitProvider(body, pid) {
+      const submittedDraft = pid && this.settings.providerDrafts[pid]
+        ? JSON.parse(JSON.stringify(this.settings.providerDrafts[pid])) : null;
       try {
         const r = await fetch("/api/settings/providers", {
           method: "POST",
@@ -21134,7 +22360,11 @@ function portal() {
         }
         this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
         if (pid && this.settings.providerDrafts[pid]) {
-          this.settings.providerDrafts[pid].open = false;
+          const draft = this.settings.providerDrafts[pid];
+          const unchanged = JSON.stringify(draft) === JSON.stringify(submittedDraft);
+          if (draft.api_key === submittedDraft.api_key) draft.api_key = "";
+          if (unchanged) draft.open = false;
+          this._settingsDraftGuard?.accept(`provider:${pid}`, {...submittedDraft, api_key:""});
         }
         await this._reloadProviders();
         await this._fetchModels();
@@ -21233,6 +22463,10 @@ function portal() {
       if (!r.ok) return;
       const d = await r.json();
       this.settings.providers = d.providers;
+      this.settings.contextGroups = d.context_groups || [];
+      this.settings.contextLimits = d.context_limits || { providers: {}, models: {} };
+      this.settings.contextError = "";
+      this.contextDraftChanged();
       for (const p of d.providers) {
         if (!(p.env_key in this.settings.draftKeys)) this.settings.draftKeys[p.env_key] = "";
         // Seed a draft for any provider that doesn't have one yet (e.g. a
@@ -21440,63 +22674,65 @@ function portal() {
 
     async restartService() {
       if (this.settings.restarting) return;
-      // Confirm before restarting — a stray tap on a phone would otherwise
-      // drop every active chat session for ~10s with no recourse. Use the
-      // in-app modal (this.confirm), NOT native window.confirm: mobile
-      // webviews silently suppress window.confirm() so it returns false →
-      // the restart short-circuited with no dialog AND no feedback
-      // (2026-06-10 user report: tapped 重启, nothing happened). The in-app
-      // modal renders reliably on mobile and matches the rest of the app.
+      await this.loadServiceStatus();
+      const service = this.settings.service;
+      const zh = this.lang === "zh";
+      const impact = service
+        ? (zh ? `当前有 ${service.active_turns} 个进行中轮次、${service.background_tasks} 个后台任务。`
+          : `${service.active_turns} active turns and ${service.background_tasks} background tasks.`)
+        : (zh ? "当前任务数量暂时无法确认。" : "Current task counts are unavailable.");
       const ok = await this.confirm({
-        title: this.lang === "zh" ? "重启服务" : "Restart service",
-        body: this.lang === "zh"
-          ? "重启 muselab 服务？所有正在跑的对话会中断约 10 秒。"
-          : "Restart muselab? All running chats will pause for ~10 seconds.",
-        okText: this.lang === "zh" ? "重启" : "Restart",
-        danger: true,
+        title: zh ? "重启服务" : "Restart service",
+        body: impact + (zh
+          ? "重启会中断本实例中的运行任务。草稿会保留；恢复后自动重新连接。"
+          : " Restart interrupts this instance's running tasks. Drafts are preserved and the UI reconnects."),
+        okText: zh ? "重启" : "Restart", danger: true,
       });
       if (!ok) return;
       this.settings.restarting = true;
-      // Immediate feedback: the button also flips to "重启中…" via
-      // settings.restarting, but an explicit toast confirms the tap landed
-      // even before the health-poll loop reports success.
-      this.toast(this.lang === "zh" ? "正在重启服务…" : "Restarting service…", "info", 2500);
+      this.settings.restartStatus = zh ? "正在请求重启…" : "Requesting restart…";
+      let previousInstance = service?.instance_id || "";
       try {
-        // Fire the restart request — the server responds before it restarts
-        await fetch("/api/settings/restart", {
+        const response = await this._fetchWithDeadline("/api/settings/restart", {
           method: "POST", headers: this.hdr(),
-        });
-      } catch (_) {
-        // Expected: connection may drop immediately if the process exits fast
-      }
-      // Poll /api/health every 1.5 s until the server is back up, then
-      // do a soft chat refresh (no full page reload — preserves open tabs).
-      const pollStart = Date.now();
-      const MAX_WAIT = 30_000;
-      const poll = async () => {
-        if (!this.settings.restarting) return;
-        if (Date.now() - pollStart > MAX_WAIT) {
+        }, 5000);
+        if (!response.ok) {
+          this.settings.restartStatus = (zh ? "重启请求失败：" : "Restart request failed: ") + response.status;
           this.settings.restarting = false;
-          this.toast(this.lang === "zh" ? "服务重启超时，请手动刷新" : "Restart timed out — reload manually", "error", 5000);
           return;
         }
-        try {
-          const r = await fetch("/api/health", { cache: "no-store" });
-          if (r.ok) {
-            this.settings.restarting = false;
-            this.toast(this.lang === "zh" ? "✓ 服务已重启" : "✓ Service restarted", "success", 3000);
+        const receipt = await response.json();
+        previousInstance = receipt.instance_id || previousInstance;
+      } catch (_) {
+        // A lost response is ambiguous: reconcile identity, never auto-resubmit.
+      }
+      if (!this.settings.restarting) return;
+      this.settings.restartStatus = zh ? "等待服务重新启动…" : "Waiting for a new service instance…";
+      const deadline = Date.now() + 60000;
+      try {
+        while (Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          try {
+            const response = await this._fetchWithDeadline("/api/settings/service", {
+              headers: this.hdr(), cache: "no-store",
+            }, 2500);
+            if (!response.ok) continue;
+            const current = await response.json();
+            if (!previousInstance || current.instance_id === previousInstance) continue;
+            this.settings.service = current;
+            this.settings.restartStatus = zh ? "服务已重启，连接已恢复" : "Service restarted; connection restored";
             await this.refreshChat();
-            await this.loadVersions();
             return;
-          }
-        } catch (_) { /* still restarting */ }
-        setTimeout(poll, 1500);
-      };
-      // Give the process a moment to die before we start polling
-      setTimeout(poll, 2000);
+          } catch (_) { /* wait for the verified replacement */ }
+        }
+        this.settings.restartStatus = zh
+          ? "尚未确认服务恢复。草稿已保留，可以检查连接；不会自动重复重启。"
+          : "Recovery not confirmed. Drafts are preserved; check connection. Restart will not be repeated automatically.";
+      } finally { this.settings.restarting = false; }
     },
 
     async saveSettings() {
+      const submittedDefaults = JSON.parse(JSON.stringify(this.settings.draftDefaults));
       // Flush an open Claude model-list edit first so the global Save captures
       // it too (see _flushAnthropicModelDraft). modelChanges folds into the
       // "Saved N settings" tally below so the toast reflects the model edit
@@ -21509,10 +22745,10 @@ function portal() {
         return;
       }
       const body = {
-        default_model: this.settings.draftDefaults.model,
-        default_permission: this.settings.draftDefaults.permission,
+        default_model: submittedDefaults.model,
+        default_permission: submittedDefaults.permission,
         busy_send_mode: this._normalizeBusySendMode(
-          this.settings.draftDefaults.busy_send_mode,
+          submittedDefaults.busy_send_mode,
         ),
       };
       // Send every typed provider key through the generic provider_keys
@@ -21535,7 +22771,14 @@ function portal() {
       });
       if (r.ok) {
         const d = await r.json();
-        this.settings.show = false;
+        for (const [key, value] of Object.entries(providerKeys)) {
+          if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+        }
+        this._settingsDraftGuard?.accept("defaults", submittedDefaults);
+        this._settingsDraftGuard?.accept("keys", Object.fromEntries(
+          Object.keys(this.settings.draftKeys).map(key => [key, ""])));
+        // Other sections have their own explicit Save; never hide their drafts.
+        if (!this.settingsDirty()) this.settings.show = false;
         // Prefer `updated_count` (user-facing tally) over `updated.length`
         // (raw env-key count). Backend dedupes the MUSELAB_MODEL +
         // MUSELAB_DEFAULT_MODEL pair so changing the model dropdown reads
@@ -21560,20 +22803,20 @@ function portal() {
         // 之前只写了服务端 env，但前端的 this.model 还是 localStorage 里的
         // 老值 → 用户看不到任何变化。同步前端 + localStorage 让"我改了它生效"
         // 的预期成立。已建会话有自己 locked model，不受影响。
-        const newDefaultModel = this.settings.draftDefaults.model;
+        const newDefaultModel = submittedDefaults.model;
         if (newDefaultModel) {
           // newSession() seeds from defaultModel — update it so the change
           // takes effect on the very next new chat without a providers refetch.
           this.defaultModel = newDefaultModel;
           this.savePrefs();
         }
-        const newDefaultPerm = this.settings.draftDefaults.permission;
+        const newDefaultPerm = submittedDefaults.permission;
         if (newDefaultPerm && newDefaultPerm !== this.defaultPermission) {
           this.defaultPermission = newDefaultPerm;
           this.savePrefs();
         }
         const newBusySendMode = this._normalizeBusySendMode(
-          this.settings.draftDefaults.busy_send_mode,
+          submittedDefaults.busy_send_mode,
         );
         if (newBusySendMode !== this.busySendMode) {
           this.busySendMode = newBusySendMode;
@@ -21690,6 +22933,8 @@ function portal() {
       this.childCache = Object.fromEntries(Object.entries(childCache).map(
         ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows]));
       this.expanded = new Set(Array.isArray(cached.expanded) ? cached.expanded : []);
+      Object.assign(this, this._materializeFileSnapshot(
+        Object.values(this.childCache).flat().concat(this.visible), Array.from(this.expanded)));
       this._pendingExpanded = Array.from(this.expanded);
       if (cached.cursor != null) this._workspaceTreeCursors.set(ownerWorkspace, cached.cursor);
       this.treeError = "";
@@ -21790,6 +23035,39 @@ function portal() {
       }, this.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS);
       this._workspaceTreeCacheTimers.set(ownerWorkspace, handle);
     },
+    _sortFileRows(rows) {
+      return rows.sort((a, b) => {
+        const directories = Number(!a.is_dir) - Number(!b.is_dir);
+        if (directories) return directories;
+        if (this.fileSort !== "name") {
+          const delta = (Number(a.mtime) || 0) - (Number(b.mtime) || 0);
+          if (delta) return this.fileSort === "mtime_asc" ? delta : -delta;
+        }
+        return String(a.name || a.path).localeCompare(String(b.name || b.path))
+          || String(a.path).localeCompare(String(b.path));
+      });
+    },
+    fileSortLabel() {
+      const labels = this.lang === "zh"
+        ? {name:"名称", mtime_desc:"修改时间：最新在前", mtime_asc:"修改时间：最早在前"}
+        : {name:"Name", mtime_desc:"Modified: newest first", mtime_asc:"Modified: oldest first"};
+      return (this.lang === "zh" ? "排序：" : "Sort: ") + labels[this.fileSort]
+        + (this.lang === "zh" ? "（点击切换）" : " (click to switch)");
+    },
+    cycleFileSort() {
+      const modes = ["name", "mtime_desc", "mtime_asc"];
+      return this.setFileSort(modes[(modes.indexOf(this.fileSort) + 1) % modes.length]);
+    },
+    async setFileSort(value) {
+      if (!["name", "mtime_desc", "mtime_asc"].includes(value)) return;
+      this.fileSort = value;
+      this.savePrefs();
+      const entries = Object.values(this.childCache).flat().concat(this.visible);
+      Object.assign(this, this._materializeFileSnapshot(entries, Array.from(this.expanded)));
+      this._scheduleFileTreeViewportSync(true);
+      // Re-fetch truncated directory listings using the selected order too.
+      await this.reloadTree();
+    },
     _materializeFileSnapshot(entries, expandedPaths = []) {
       const byParent = new Map();
       const showHidden = !!this.showHidden;
@@ -21801,9 +23079,7 @@ function portal() {
         if (!byParent.has(parent)) byParent.set(parent, []);
         byParent.get(parent).push({ ...raw, path });
       }
-      const sortRows = rows => rows.sort((a, b) =>
-        (Number(!a.is_dir) - Number(!b.is_dir))
-        || String(a.name || a.path).localeCompare(String(b.name || b.path)));
+      const sortRows = rows => this._sortFileRows(rows);
       const childCache = {};
       for (const [parent, rows] of byParent) {
         childCache[`${parent}:${showHidden}`] = sortRows(rows);
@@ -21908,10 +23184,9 @@ function portal() {
               : 0)
             : raw.mtime_ns,
         });
-        // Existing rows are already sorted. A content/mtime-only modification
-        // preserves that order; only additions or sort-key changes need the
-        // affected sibling group sorted again.
-        if (type === "added"
+        // Re-sort the affected siblings when a selected sort key changes;
+        // content edits also change ordering in modification-time mode.
+        if (type === "added" || this.fileSort !== "name"
             || (previous && (
               (typeof raw.name === "string" && raw.name !== previous.name)
               || (raw.is_dir != null && !!raw.is_dir !== !!previous.is_dir)
@@ -21972,10 +23247,7 @@ function portal() {
         // snapshot/cache. Unknown collapsed parents stay lazy and canonical.
         if (siblings) siblings.push(row);
       }
-      const sortRows = rows => rows.sort((a, b) =>
-        (Number(!a.is_dir) - Number(!b.is_dir))
-        || String(a.name || a.path).localeCompare(String(b.name || b.path))
-        || String(a.path).localeCompare(String(b.path)));
+      const sortRows = rows => this._sortFileRows(rows);
       for (const parent of affectedParents) {
         const rows = byParent.get(parent);
         if (rows) sortRows(rows);
@@ -23124,7 +24396,8 @@ function portal() {
       const pendingKey = `${ownerWorkspace}\0${workspaceGeneration}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
       if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
-        + (showHidden ? "&show_hidden=true" : "");
+        + (showHidden ? "&show_hidden=true" : "")
+        + (this.fileSort !== "name" ? "&sort=" + this.fileSort : "");
       const requestHeaders = this.fileHdr();
       const promise = (async () => {
         let r;
@@ -23162,7 +24435,7 @@ function portal() {
           stale.staleWorkspace = true;
           throw stale;
         }
-        const entries = d.entries || [];
+        const entries = this._sortFileRows(d.entries || []);
         const treeOwner = isOwner();
         if (opts.cache !== false && treeOwner) {
           this.childCache[cacheKey] = entries;
@@ -24497,7 +25770,8 @@ function portal() {
       // LRU bump
       this._previewCache.delete(path);
       this._previewCache.set(path, e);
-      return e;
+      return e.mode === "md"
+        ? { ...e, renderedMd: this._renderPreviewMd(e.rawText || "") } : e;
     },
     _previewCacheSet(path, entry) {
       if (!path || !entry) return;
@@ -26341,7 +27615,9 @@ function portal() {
       //   4. Non-active tab — when the user right-clicks a non-current
       //      preview tab, `selected !== path`, so the row has no `sel`
       //      class. The pulse class handles that too.
-      if (!path) return;
+      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace);
+      if (!path || !isOwner()) return;
       const interactive = opts.mode !== "background";
       if (interactive) {
         if (this.searchMode) this.clearSearch();
@@ -26351,16 +27627,19 @@ function portal() {
       parts.pop();   // drop the filename, keep only directory chain
       const dirPath = parts.join("/");
       if (dirPath) await this.expandPath(dirPath);
+      if (!isOwner()) return;
       // With a virtualized tree the target row may intentionally not exist in
       // DOM yet. Position the logical row first; updating the viewport window
       // mounts it on the following tick.
       this.$nextTick(() => this.$nextTick(() => {
+        if (!isOwner()) return;
         this._positionFileTreePath(path, interactive ? "center" : "nearest");
         this.$nextTick(() => {
+          if (!isOwner()) return;
           const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
           const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
           if (!el) return;
-          if (!interactive) return;
+          if (!interactive && !opts.highlight) return;
           // Pulse highlight — independent of `sel` class so it fires even
           // when this isn't the active tab. Restart by removing+adding so
           // rapid re-reveals still trigger the animation.
@@ -26409,6 +27688,8 @@ function portal() {
       this.htmlPreviewFrames = [];
       this._htmlPreviewFrameClock = 0;
       this._previewTickets = {};
+      this._previewTicketExpires = {};
+      this._previewTicketRetryAt.clear();
       this._cancelPreviewViewRestore();
       this._previewAbort = null;
       this._csvAbort = null;
@@ -26569,42 +27850,70 @@ function portal() {
       this._previewTickets = next;
     },
     async _mintPreviewTicket(p, signal = undefined) {
-      const r = await fetch("/api/files/preview-ticket", {
-        method: "POST",
-        headers: { ...this.fileHdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ path: p }),
-        signal,
-      });
-      if (!r.ok) throw new Error(`preview ticket failed (${r.status})`);
-      const data = await r.json();
-      if (!data || !data.ticket) throw new Error("preview ticket missing");
       const key = this._previewTicketKey(p);
-      this._previewTickets = {
-        ...(this._previewTickets || {}),
-        [key]: data.ticket,
-      };
-      return data.ticket;
+      const pending = this._previewTicketRequests.get(key);
+      if (pending) return pending;
+      const workspace = this.fileWorkspacePath();
+      const request = (async () => {
+        let data;
+        await this._fetchWithDeadline("/api/files/preview-ticket", {
+          method: "POST",
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: p }),
+          signal,
+        }, this.REQUEST_DEADLINE_MS, async response => {
+          if (!response.ok) throw new Error(`preview ticket failed (${response.status})`);
+          data = await response.json();
+        });
+        if (!data || !data.ticket) throw new Error("preview ticket missing");
+        this._previewTicketExpires[key] = Date.now()
+          + Math.max(1, Number(data.expires_in) || 600) * 1000;
+        this._previewTickets = { ...this._previewTickets, [key]: data.ticket };
+        this._previewTicketRetryAt.delete(key);
+        // x-bind updates image/PDF URLs reactively. Markdown stores rendered
+        // HTML instead, so refresh its relative resources after a ticket arrives.
+        if (workspace === this.fileWorkspacePath()) {
+          if (this.previewMode === "md" && this.renderedMd) {
+            this.renderedMd = this._resolveMdImages(this.renderedMd);
+          }
+          if (this.editing && this.editorIsMd && this.livePreviewHtml) {
+            this.livePreviewHtml = this._resolveMdImages(this.livePreviewHtml);
+          }
+        }
+        return data.ticket;
+      })();
+      this._previewTicketRequests.set(key, request);
+      try {
+        return await request;
+      } catch (error) {
+        // A failed image request must not start an unbounded reactive retry loop.
+        this._previewTicketRetryAt.set(key, Date.now() + 10_000);
+        throw error;
+      } finally {
+        if (this._previewTicketRequests.get(key) === request) {
+          this._previewTicketRequests.delete(key);
+        }
+      }
     },
     rawUrl(p, opts = {}) {
-      const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
-      // Iframe/img/pdf/anchor requests cannot attach our custom workspace
-      // header, so carry the registered root in the query string too.
+      if (!p) return "about:blank";
+      const key = this._previewTicketKey(p);
+      const ticket = (this._previewTickets || {})[key] || "";
+      const expires = Number(this._previewTicketExpires[key] || 0);
+      // Resident HTML frames keep their loaded document. Other resources renew
+      // on the next render after expiry; all new requests remain scope-bound.
+      const stale = expires && expires <= Date.now() && !opts.preview;
+      if ((!ticket || stale) && this.token
+          && (this._previewTicketRetryAt.get(key) || 0) <= Date.now()) {
+        void this._mintPreviewTicket(p).catch(() => {});
+      }
+      if (!ticket) return "about:blank";
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      // preview=1 asks the backend to inject the click-to-zoom bridge into
-      // HTML (see files.py). Only the html preview iframe passes it; images /
-      // pdf / downloads stream untouched.
-      const pv = opts.preview ? "&preview=1" : "";
-      if (opts.preview) {
-        const ticket = (this._previewTickets || {})[
-          this._previewTicketKey(p)] || "";
-        if (!ticket) return "about:blank";
-        return "/api/files/raw?path=" + encodeURIComponent(p)
-                + "&ticket=" + encodeURIComponent(ticket)
-                + workspace + v + pv;
-      }
+      const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
       return "/api/files/raw?path=" + encodeURIComponent(p)
-              + "&token=" + encodeURIComponent(this.token) + workspace + v + pv;
+        + "&ticket=" + encodeURIComponent(ticket) + workspace + v
+        + (opts.preview ? "&preview=1" : "");
     },
     async reloadPreview() {
       // Manual "🗘 reload" button in preview header. Bumps previewVersion
@@ -27477,7 +28786,8 @@ function portal() {
         sessionId: this.currentId,
         messageId,
         text: selectedText,
-        path: source === "preview" ? this.selected : "",
+        path: source === "preview" ? this.absoluteFilePath(this.selected) : "",
+        workspace: source === "preview" ? this.fileWorkspacePath() : "",
         question: "",
         followup: "",
         x: Math.min(viewportWidth - popoverHalf - 12,
@@ -27516,7 +28826,7 @@ function portal() {
       this._cancelPreviewQuoteResize();
       Object.assign(this.previewQuote, {
         show: false, mode: "actions", source: "", role: "", sessionId: "",
-        messageId: "", text: "", path: "", question: "", followup: "",
+        messageId: "", text: "", path: "", workspace: "", question: "", followup: "",
         x: 0, y: 0, above: false, truncated: false, sending: false,
         dragged: false, dragging: false, askSessionId: "",
         askSessionName: "", askPrompt: "", askError: "", askAutoScroll: true,
@@ -27582,7 +28892,10 @@ function portal() {
         role: snapshot.role || "",
         sessionId: snapshot.sessionId || this.currentId || "",
         messageId: snapshot.messageId || "",
-        path: snapshot.path || "",
+        path: snapshot.source === "chat" ? (snapshot.path || "")
+          : this.absoluteFilePath(snapshot.path || this.selected || "",
+            snapshot.workspace || this.fileWorkspacePath()),
+        workspace: snapshot.workspace || this.fileWorkspacePath(),
         text: snapshot.text || "",
         truncated: !!snapshot.truncated,
       };
@@ -28723,6 +30036,66 @@ function portal() {
       this.previewDragHover = false;
       this.dragHover = false;
     },
+    _workspaceUploadLimit() {
+      if (!this._fileUploadLimitPromise) {
+        this._fileUploadLimitPromise = this._fetchWithDeadline(
+          "/api/files/upload-limits", { headers: this.hdr() }, 5000,
+        ).then(r => r.ok ? r.json() : null)
+          .then(data => Math.max(0, Number(data?.max_file_bytes) || 0))
+          .catch(() => 0);
+      }
+      return this._fileUploadLimitPromise;
+    },
+    _workspaceUploadError(status, raw) {
+      let detail = "";
+      try {
+        const data = JSON.parse(raw);
+        if (typeof data?.detail === "string") detail = data.detail.slice(0, 200);
+      } catch (_) { /* proxies may return HTML; do not render their error page */ }
+      const zh = this.lang === "zh";
+      if (status === 413) return (zh ? "文件超过服务器或入口的上传大小限制" : "File exceeds the server or proxy upload limit")
+        + (detail ? ": " + detail : "");
+      if (!status) return zh ? "网络连接中断，请重试；文件尚未确认保存" : "Connection interrupted; file has not been confirmed saved. Retry.";
+      return detail || (zh ? "上传失败，HTTP " : "Upload failed, HTTP ") + status;
+    },
+    canCancelFileUpload(item) {
+      return !item.done && !item.saving
+        && !(item.known && item.loaded >= item.total);
+    },
+    cancelFileUpload(item) {
+      const batch = this._fileUploadBatch;
+      const transfer = batch?.transfers[item.id];
+      if (!transfer || !this.canCancelFileUpload(transfer)) return;
+      const token = { batchId: batch.id, transferId: item.id };
+      transfer.cancelled = true;
+      this._fileUploadAborters.get(batch.id + "/" + item.id)?.();
+      this._finishFileUploadTransfer(token, false);
+      // Staged data cannot commit without the explicit success path above.
+      // If cleanup cannot reach the server, its staging lease expires.
+      fetch("/api/files/upload/cancel", {
+        method: "POST", headers: {...this.fileHdr(transfer.workspace), "Content-Type": "application/json"},
+        body: JSON.stringify({upload_id: transfer.uploadId, path: transfer.dirPath}),
+      }).catch(() => {});
+    },
+    fileUploadItemStatus(item) {
+      if (item.cancelled) return this.lang === "zh" ? "已取消传输" : "Transfer cancelled";
+      if (item.failed) return item.error || (this.lang === "zh" ? "上传失败" : "Failed");
+      if (item.done) return this.lang === "zh" ? "已保存" : "Saved";
+      if (item.known && item.loaded >= item.total) return this.lang === "zh" ? "正在保存…" : "Saving…";
+      return this.lang === "zh" ? "正在上传" : "Uploading";
+    },
+    async revealUploadedFile(item) {
+      if (!item.done || item.failed || item.cancelled || !this._workspaceIsCurrent(item.workspace)) return;
+      await this._refreshParentInTree(item.path, item.workspace);
+      if (this._workspaceIsCurrent(item.workspace)) {
+        await this.revealInTree(item.path, { ownerWorkspace: item.workspace });
+      }
+    },
+    dismissFileUploads() {
+      if (this.fileUploadProgress.activeFiles) return;
+      if (this._fileUploadHideTimer) clearTimeout(this._fileUploadHideTimer);
+      this.fileUploadProgress = { ...this.fileUploadProgress, visible: false };
+    },
     fileUploadProgressLabel() {
       const progress = this.fileUploadProgress || {};
       const total = Math.max(0, Number(progress.totalFiles) || 0);
@@ -28733,6 +30106,11 @@ function portal() {
           ? this.t("files.uploading_many", { done: completed, total })
           : this.t("files.uploading_one");
       }
+      if (Number(progress.cancelledFiles) > 0) {
+        return this.lang === "zh"
+          ? `已保存 ${completed}，已取消 ${progress.cancelledFiles}，失败 ${failed}`
+          : `Saved ${completed}, cancelled ${progress.cancelledFiles}, failed ${failed}`;
+      }
       return failed > 0
         ? this.t("files.upload_finished_errors", { failed })
         : this.t("files.upload_finished");
@@ -28741,9 +30119,10 @@ function portal() {
       if (!batch || this._fileUploadBatch !== batch) return;
       const transfers = Object.values(batch.transfers || {});
       const totalFiles = transfers.length;
-      const completedFiles = transfers.filter(item => item.done).length;
+      const completedFiles = transfers.filter(item => item.done && !item.failed && !item.cancelled).length;
       const failedFiles = transfers.filter(item => item.failed).length;
-      const activeFiles = totalFiles - completedFiles;
+      const cancelledFiles = transfers.filter(item => item.cancelled).length;
+      const activeFiles = transfers.filter(item => !item.done).length;
       const known = totalFiles > 0 && transfers.every(item => item.known);
       const totalBytes = transfers.reduce(
         (sum, item) => sum + Math.max(1, Number(item.total) || 0), 0,
@@ -28761,10 +30140,16 @@ function portal() {
         totalFiles,
         completedFiles,
         failedFiles,
+        cancelledFiles,
         activeFiles,
+        items: Object.entries(batch.transfers).map(([id, item]) => ({
+          ...item, id,
+          percent: item.known && item.total > 0
+            ? Math.min(100, Math.max(0, item.loaded / item.total * 100)) : 0,
+        })),
       };
     },
-    _beginFileUploadTransfer(file) {
+    _beginFileUploadTransfer(file, dirPath = "", workspace = this.fileWorkspacePath()) {
       if (this._fileUploadHideTimer) clearTimeout(this._fileUploadHideTimer);
       this._fileUploadHideTimer = null;
       let batch = this._fileUploadBatch;
@@ -28779,14 +30164,19 @@ function portal() {
       }
       const transferId = String(++this._fileUploadTransferSeq);
       batch.transfers[transferId] = {
+        name: String(file?.name || ""),
+        path: dirPath ? dirPath + "/" + file.name : file.name,
+        workspace, dirPath, uploadId: crypto.randomUUID().replaceAll("-", ""),
+        error: "", cancelled: false, saving: false,
         loaded: 0,
         total: Math.max(0, Number(file && file.size) || 0),
         known: false,
         done: false,
         failed: false,
       };
-      this._publishFileUploadProgress(batch);
-      return { batchId: batch.id, transferId };
+      // Alpine wraps a newly assigned batch; publish its canonical reactive identity.
+      this._publishFileUploadProgress(this._fileUploadBatch);
+      return { batchId: batch.id, transferId, uploadId: batch.transfers[transferId].uploadId };
     },
     _fileUploadTransfer(token) {
       const batch = this._fileUploadBatch;
@@ -28808,17 +30198,19 @@ function portal() {
       );
       this._publishFileUploadProgress(current.batch);
     },
-    _finishFileUploadTransfer(token, succeeded) {
+    _finishFileUploadTransfer(token, succeeded, error = "") {
       const current = this._fileUploadTransfer(token);
       if (!current || current.transfer.done) return;
       const transfer = current.transfer;
       transfer.known = true;
       transfer.total = Math.max(1, Number(transfer.total) || 0);
-      transfer.loaded = transfer.total;
+      if (succeeded) transfer.loaded = transfer.total;
       transfer.done = true;
-      transfer.failed = !succeeded;
+      transfer.failed = !succeeded && !transfer.cancelled;
+      transfer.error = error;
       this._publishFileUploadProgress(current.batch);
       if (Object.values(current.batch.transfers).some(item => !item.done)) return;
+      if (Object.values(current.batch.transfers).some(item => item.failed || item.cancelled)) return;
       const batchId = current.batch.id;
       this._fileUploadHideTimer = setTimeout(() => {
         const latest = this._fileUploadBatch;
@@ -28830,19 +30222,23 @@ function portal() {
           visible: false,
         };
         this._fileUploadHideTimer = null;
-      }, 900);
+      }, 6000);
     },
-    _uploadWorkspaceFile(dirPath, file, transferToken) {
+    _uploadWorkspaceFile(dirPath, file, transferToken, ownerWorkspace = "") {
       const fd = new FormData();
       fd.append("path", dirPath);
       fd.append("file", file);
-      const headers = this.fileHdr();
+      fd.append("upload_id", transferToken.uploadId);
+      const headers = this.fileHdr(ownerWorkspace);
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
+        const abortKey = transferToken.batchId + "/" + transferToken.transferId;
+        this._fileUploadAborters.set(abortKey, () => xhr.abort());
         let settled = false;
         const finish = (callback, value) => {
           if (settled) return;
           settled = true;
+          this._fileUploadAborters.delete(abortKey);
           callback(value);
         };
         xhr.open("POST", "/api/files/upload", true);
@@ -28856,6 +30252,14 @@ function portal() {
             event.total,
             event.lengthComputable && event.total > 0,
           );
+        });
+        xhr.upload.addEventListener("load", () => {
+          const current = this._fileUploadTransfer(transferToken);
+          if (!current || current.transfer.done) return;
+          // Once the body has left the browser, abort cannot undo a server
+          // commit. Let the save response settle instead of promising removal.
+          current.transfer.saving = true;
+          this._publishFileUploadProgress(current.batch);
         });
         xhr.addEventListener("load", () => {
           const responseText = xhr.responseText || "";
@@ -28903,7 +30307,8 @@ function portal() {
         return;
       }
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
-      const failed = results.length - ok;
+      const uploadedName = results.find(r => r.status === "fulfilled" && r.value)?.value.path?.split("/").pop() || "";
+      const failed = results.filter(r => r.status === "rejected" || r.value === false).length;
       await this.reloadTree();
       if (!this._workspaceIsCurrent(ownerWorkspace)) {
         ev.target.value = "";
@@ -28924,9 +30329,9 @@ function portal() {
           : `Uploaded ${ok}, ${failed} failed`, "warn", 3500);
       } else if (ok === 1) {
         this.toast(this.lang === "zh"
-          ? `已上传 ${files[0].name}`
-          : `Uploaded ${files[0].name}`, "success", 2200);
-      } else {
+          ? `已上传 ${uploadedName}`
+          : `Uploaded ${uploadedName}`, "success", 2200);
+      } else if (ok) {
         this.toast(this.lang === "zh"
           ? `已上传 ${ok} 个文件`
           : `Uploaded ${ok} files`, "success", 2200);
@@ -29140,7 +30545,8 @@ function portal() {
       );
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
-      const failed = results.length - ok;
+      const uploadedName = results.find(r => r.status === "fulfilled" && r.value)?.value.path?.split("/").pop() || "";
+      const failed = results.filter(r => r.status === "rejected" || r.value === false).length;
       const firstUploaded = results.find(r =>
         r.status === "fulfilled" && r.value && r.value.path);
       if (firstUploaded) {
@@ -29160,9 +30566,9 @@ function portal() {
           : `Uploaded ${ok} to ${intoLabel}, ${failed} failed`, "warn", 3500);
       } else if (ok === 1) {
         this.toast(this.lang === "zh"
-          ? `已上传 ${files[0].name} 到 ${intoLabel}`
-          : `Uploaded ${files[0].name} to ${intoLabel}`, "success", 2200);
-      } else {
+          ? `已上传 ${uploadedName} 到 ${intoLabel}`
+          : `Uploaded ${uploadedName} to ${intoLabel}`, "success", 2200);
+      } else if (ok) {
         this.toast(this.lang === "zh"
           ? `已上传 ${ok} 个文件到 ${intoLabel}`
           : `Uploaded ${ok} files to ${intoLabel}`, "success", 2200);
@@ -29786,11 +31192,11 @@ function portal() {
     // Idempotent: only touches the listener when the desired state changes,
     // so it never leaves a stale handler attached (which would break bfcache).
     _syncBeforeUnloadGuard() {
-      const wantGuard = this._editorDirty();
+      const wantGuard = this._editorDirty() || this.settingsDirty();
       if (wantGuard && !this._beforeUnloadFn) {
         this._beforeUnloadFn = (e) => {
           // Re-check at fire time — state may have changed since attach.
-          if (!this._editorDirty()) return;
+          if (!this._editorDirty() && !this.settingsDirty()) return;
           e.preventDefault();
           // Legacy browsers need returnValue set to trigger the native prompt;
           // the string itself is ignored by modern browsers.
@@ -29992,10 +31398,7 @@ function portal() {
 
     // ===== @ mention =====
     _mentionPath(path, isDir = false) {
-      const fileRoot = this.fileWorkspacePath();
-      let mentionPath = this.currentWorkspacePath() === fileRoot
-        ? path
-        : fileRoot.replace(/\/$/, "") + "/" + String(path || "").replace(/^\//, "");
+      let mentionPath = this.absoluteFilePath(path);
       if (isDir && mentionPath && !mentionPath.endsWith("/")) mentionPath += "/";
       return mentionPath;
     },
@@ -31259,6 +32662,18 @@ function portal() {
         movesTowardHistory = Number(ev.clientX) >= rect.right - 20;
       }
       if (!movesTowardHistory) return;
+      // Tool output/code panels have their own scroll containers. Their
+      // bubbling gestures do not mean the reader left the conversation tail.
+      // At an inner boundary allow normal scroll chaining to claim the outer
+      // viewport, unless the panel explicitly contains that chain.
+      for (let node = ev?.target instanceof Element ? ev.target : null;
+        node && node !== el; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (!/(auto|scroll|overlay)/.test(style.overflowY)
+            || node.scrollHeight <= node.clientHeight + 1) continue;
+        if (ev.type === "pointerdown" || node.scrollTop > 0
+            || /^(contain|none)$/.test(style.overscrollBehaviorY)) return;
+      }
       if (this.previewQuote.show && this.previewQuote.source === "chat"
           && this.previewQuote.mode !== "ask") {
         // Hide the contextual actions while the transcript moves, but preserve
@@ -31598,11 +33013,16 @@ function portal() {
           return false;
         }
       }
+      if (isComposerSubmission && (sendState._composerSubmitToken
+          || sendState._stoppingTurnId || sendState._uncertainSubmission
+          || this._outgoingRecords(sendState).length)) {
+        return this._submitWhileBusy(sendSid, sendState);
+      }
       // Keep the ownership token primitive. Alpine proxies objects assigned to
       // reactive state, which would break identity comparison in finally and
       // leave the send button permanently locked after a successful submit.
       const composerSubmitToken = opts._composerSubmitToken
-        || `composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        || this._uuid();
       if (isComposerSubmission) {
         if (sendState._composerSubmitToken
             && sendState._composerSubmitToken !== composerSubmitToken) {
@@ -31674,8 +33094,9 @@ function portal() {
         ]);
         for (const state of owners) {
           const pending = state && state._queueAdmission;
-          if (pending && pending._submitToken === composerSubmitToken) {
+          if (pending && pending._submitToken === composerSubmitToken && !pending._uncertain) {
             state._queueAdmission = null;
+            if (state._submissionPayloads) delete state._submissionPayloads[composerSubmitToken];
           }
         }
         queueAdmission = null;
@@ -31723,6 +33144,8 @@ function portal() {
       // the exact submitted payload without overwriting text typed meanwhile.
       let submittedDraftRestored = false;
       const restoreSubmittedComposer = (restoreAttachments = false) => {
+        if (sendState._uncertainSubmission?.requestId === composerSubmitToken
+            || successorState()?._uncertainSubmission?.requestId === composerSubmitToken) return;
         if (!isComposerSubmission || submittedDraftRestored) return;
         submittedDraftRestored = true;
         if (ownsSendDraft()) {
@@ -31930,17 +33353,22 @@ function portal() {
         name: doc.name || "file",
         kind: doc.kind || "text",
       }));
-      const stageQueueAdmission = () => {
+      // A queue-discovery poll alone is not user-visible waiting work.
+      const busyAtSubmit = !resumed && !!(this.isTabStreaming(sendSid)
+        || sendState.compacting || sendState.backgroundActive
+        || this.queuePendingItems(sendState).length);
+      const stageQueueAdmission = ({ direct = false } = {}) => {
         const owner = successorState()
           || (this.tabState[sendSid] === sendState ? sendState : null);
         if (!owner) return false;
         if (owner._queueAdmission
             && owner._queueAdmission._submitToken === composerSubmitToken) {
           queueAdmission = owner._queueAdmission;
+          queueAdmission._directSubmission = direct;
           return true;
         }
         queueAdmission = {
-          id: `admission:${composerSubmitToken}`,
+          id: `q-${composerSubmitToken}`,
           text,
           displayText: String(optimisticDisplayText || ""),
           pendingQuotes: composerQuotes.map(quote => ({ ...quote })),
@@ -31956,6 +33384,7 @@ function portal() {
           enqueuedAt: Date.now(),
           _admissionPending: true,
           _submitToken: composerSubmitToken,
+          _directSubmission: direct,
         };
         owner._queueAdmission = queueAdmission;
         return true;
@@ -31964,6 +33393,9 @@ function portal() {
         sendState,
         {
           role: "user", text,
+          _k: `${sendSid}:submission:${composerSubmitToken}`,
+          _clientMessageId: composerSubmitToken,
+          _noAnim: true,
           _turnRoot: true,
           // The bubble exists before the server decides whether this prompt
           // owns a turn or a queue slot. Keep pane-level Running hidden until
@@ -31996,10 +33428,8 @@ function portal() {
         // before appending so the optimistic user bubble enters the bounded range.
         sendState.atBottom = true;
         this._scheduleLiveMessageViewport(sendState);
-        const knownFifo = !resumed && busyDelivery === "queue"
-          && this._isBusy(sendSid);
-        if (knownFifo) stageQueueAdmission();
-        else sentUserBubble = appendOptimisticUserBubble();
+        stageQueueAdmission({ direct: !busyAtSubmit });
+        if (!busyAtSubmit) sentUserBubble = appendOptimisticUserBubble();
         if (this.currentId === sendSid) {
           sendState.atBottom = true;
           this.scrollToBottom(true);
@@ -32033,6 +33463,10 @@ function portal() {
       const confirmedBusy = !isReconnect && !resumed
         ? await this._confirmSessionBusy(sendSid, sendState)
         : false;
+      if (sendState._cancelledSubmitToken === composerSubmitToken) {
+        rollbackOptimisticSubmission();
+        return false;
+      }
       if (confirmedBusy) {
         if (busyDelivery === "queue") {
           if (sentUserBubble) {
@@ -32085,10 +33519,8 @@ function portal() {
       // The locally-known queue can finish while registration/settings probes
       // are in flight. If the authoritative busy check now says idle, promote
       // the temporary queue-tail card into the ordinary direct-turn bubble.
-      if (queueAdmission) {
-        clearQueueAdmission();
-        sentUserBubble = appendOptimisticUserBubble();
-      }
+      // Idle submissions retain their inline bubble through admission.
+      // Only actual waiting work belongs in the outbox.
       // Reconnect mode has no optimistic user bubble: the backend already owns
       // the prompt and its canonical replay replaces any stale rendered suffix.
       if (isReconnect && !isContinuation && resumeEventSeq === 0) {
@@ -32146,6 +33578,8 @@ function portal() {
       // from `this.currentId` here. That was the bug.
       const streamSid = sendSid;
       const streamState = sendState;
+      const uiMetricTurn = isReconnect ? this._browserMetrics?.currentTurn(streamSid)
+        : this._browserMetrics?.startTurn(streamSid);
       // Transport/render capability is fixed for the lifetime of this stream.
       // Viewport changes mid-reply must not silently switch replay policy.
       const streamMobile = this._isMobileLayout();
@@ -32249,7 +33683,9 @@ function portal() {
       // restores the full local payload and resets every stream flag/timer without
       // relying on the later-scoped _markDone closure.
       const rollbackUnstartedSend = (restoreDraft = true) => {
-        if (sentUserBubble) {
+        const keepPendingBubble = !restoreDraft && this._outgoingRecords(streamState)
+          .some(record => record.requestId === composerSubmitToken);
+        if (sentUserBubble && !keepPendingBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
           sentUserBubble = null;
         }
@@ -32300,24 +33736,23 @@ function portal() {
           useMux = true;
           let admittedTurnId = expectedTurnId;
           if (!isReconnect) {
-            const startTurn = async () => await fetch("/api/chat/turns/start", {
-              method: "POST",
-              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-              signal: streamStartController.signal,
-              body: JSON.stringify({
+            const startTurn = async () => await this._postSubmission(streamSid, composerSubmitToken, "turn", {
                 prompt: text,
                 session_id: streamSid,
                 model: sendModel,
                 permission: sendPermission,
                 image_ids: attachIds.length ? attachIds.join(",") : "",
                 mobile: streamMobile,
-              }),
-            });
+                client_message_id: composerSubmitToken,
+            }, streamStartController.signal);
             let tr = await startTurn();
             if (tr.status === 404 || tr.status === 405) {
               this._setChatMuxUnsupported();
               useMux = false;
             } else {
+              if (streamState._cancelBeforeStream || streamState._cancelledSubmitToken === composerSubmitToken) {
+                throw new Error("submission cancelled");
+              }
               if (tr.status === 409 && !resumed) {
                 if (busyDelivery === "queue") {
                   if (sentUserBubble) {
@@ -32353,12 +33788,12 @@ function portal() {
                   "info", 2800);
                   return true;
                 }
-                if (queueAdmission) {
-                  clearQueueAdmission();
-                  sentUserBubble = appendOptimisticUserBubble();
-                }
+                if (queueAdmission) clearQueueAdmission();
               }
-              if (!tr.ok) tr = await startTurn();
+              if (!tr.ok && tr.status >= 500) {
+                const receipt = await this._submissionReceipt(streamSid, composerSubmitToken, "turn");
+                if (receipt.state === "accepted") tr = new Response(JSON.stringify(receipt.result));
+              }
               if (!tr.ok) throw new Error("turn start " + tr.status);
               const admitted = await tr.json();
               if (admitted.accepted === false || !admitted.turn_id) {
@@ -32368,10 +33803,12 @@ function portal() {
               streamState.activeTurnId = admittedTurnId;
               streamState.parentTurnId = "";
               streamState.lastEventSeq = 0;
+              if (!sentUserBubble && !streamState._cancelBeforeStream) sentUserBubble = appendOptimisticUserBubble();
               if (sentUserBubble) {
                 sentUserBubble._turnId = admittedTurnId;
                 sentUserBubble._admissionPending = false;
               }
+              clearQueueAdmission();
               if (Number(admitted.started_at) > 0) {
                 streamState._streamStartedAt = Number(admitted.started_at) * 1000;
               }
@@ -32405,6 +33842,22 @@ function portal() {
           es = new EventSource(url);
         }
       } catch (_e) {
+        if (useMux && !isReconnect) {
+          const receipt = await this._submissionReceipt(streamSid, composerSubmitToken, "turn");
+          if (receipt.state === "accepted" || (receipt.state === "cancelled" && receipt.result?.turn_id)) {
+            rollbackUnstartedSend(false);
+            clearQueueAdmission();
+            this._commitChatRecoveryDraft(sendSid, composerInput);
+            await this._checkActiveTurn(streamSid);
+            if (!streamState.streaming) await this.loadSession(streamSid, {quiet:true});
+            return true;
+          }
+          if (!["failed", "cancelled"].includes(receipt.state)) {
+            this._rememberUncertainSubmission(streamSid, composerSubmitToken, "turn", composerInput);
+            rollbackUnstartedSend(false);
+            return false;
+          }
+        }
         if (streamState._cancelBeforeStream) {
           rollbackUnstartedSend();
           return false;
@@ -32421,7 +33874,14 @@ function portal() {
         }
       }
       if (streamState._cancelBeforeStream) {
-        rollbackUnstartedSend();
+        const wasAdmitted = !!streamState.activeTurnId;
+        try { es?.close(); } catch (_) {}
+        rollbackUnstartedSend(!wasAdmitted);
+        clearQueueAdmission();
+        if (wasAdmitted) {
+          this._commitChatRecoveryDraft(sendSid, composerInput);
+          await this.loadSession(streamSid, { quiet: true });
+        }
         return false;
       }
       streamState.es = es;
@@ -32438,6 +33898,11 @@ function portal() {
       // "0.0s" immediately instead of waiting through the SSE handshake, and
       // (b) mid-stream reconnects don't visibly reset the displayed elapsed.
       es.onopen = () => {
+        if (!useMux && !isReconnect) {
+          if (!sentUserBubble) sentUserBubble = appendOptimisticUserBubble();
+          sentUserBubble._admissionPending = false;
+          clearQueueAdmission();
+        }
         streamState._lastSseTransportAt = Date.now();
         if (!hasDetachedText && !isReconnect && !resumed) {
           this._commitChatRecoveryDraft(sendSid, composerInput);
@@ -32703,6 +34168,7 @@ function portal() {
         lastPlainPaint = Date.now();
         streamState._streamPlainRenderCount++;
         _scrollIfActive();
+        if (acc) this._browserMetrics?.paint(uiMetricTurn, "first", curBubble._k);
       };
       const schedulePlainPaint = () => {
         if (this.currentId !== streamSid || pendingTimer || pendingFrame) return;
@@ -33545,6 +35011,8 @@ function portal() {
             ta.focus();
           });
         }
+        if (stampedAssistant) this._browserMetrics?.paint(uiMetricTurn, "first", stampedAssistant._k);
+        if (tailCandidate) this._browserMetrics?.paint(uiMetricTurn, "final", tailCandidate._k);
         return {
           followTail: followedTail,
           userScrollAt: Math.max(
@@ -33740,27 +35208,11 @@ function portal() {
         // drain will hit st.compacting=true and bail; the compact-finally
         // path will pick it up. If the queue's tab isn't the active one,
         // drain bails too and activateTab handles it on return.
-        // A normal user turn error pauses the durable queue server-side, so
-        // mirror that state immediately while the final queue sync catches up.
-        // A background continuation is different: its originating task has
-        // already settled and the backend deliberately keeps queued user input
-        // runnable. Treating its incomplete auto-reaction as a queue failure
-        // stranded otherwise-valid follow-ups in the completion window.
-        const queueBlockingError = !!d.is_error && !isContinuation;
-        if (queueBlockingError) {
-          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-            streamState._queuePaused = true;
-            setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-          }
-        } else {
-          this.$nextTick(
-            () => this._drainPendingQueue(streamSid, completedTurnId),
-          );
-        }
+        // Failure belongs to one item. Discover the next turn on every
+        // terminal path, without manufacturing a whole-queue pause.
+        this.$nextTick(
+          () => this._drainPendingQueue(streamSid, completedTurnId),
+        );
         // If this turn left an SDK background task running (its card is still
         // ⏳), start polling /active so the server's continuation turn (card
         // flip + model auto-continue) surfaces live when the task finishes.
@@ -34003,21 +35455,7 @@ function portal() {
             streamState._seenUpdated = undefined;
             if (streamSid === this.currentId) this._openSeenUpdated = undefined;
           }
-          // Pause auto-drain — same context likely fails the next message
-          // too (quota / auth / cross-vendor signature). The failed user
-          // bubble surfaces a "resume queue (N)" CTA so the user can
-          // explicitly continue after fixing the root cause.
-          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-            // Optimistic — the server also pauses the queue in the turn's
-            // finally (Task 3) when an errored turn has items waiting. Show
-            // the banner now, reconcile with server truth a beat later.
-            streamState._queuePaused = true;
-            setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-          }
+          this.$nextTick(() => this._drainPendingQueue(streamSid));
           if (hasContextRecovery) {
             const recoveryId = String(
               errorMeta.recovered_session.id
@@ -34265,20 +35703,7 @@ function portal() {
             }
           });
         }
-        // User explicitly stopped — pause the queue too. Auto-draining
-        // here would be surprising (they cancelled for a reason, almost
-        // never "just this one but please send the rest"). The paused
-        // banner gives an explicit Resume.
-        if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
-          // Optimistic — the server pauses on an explicit interrupt too
-          // (broadcast.cancelled → finally pauses the queue). Reconcile after.
-          streamState._queuePaused = true;
-          setTimeout(() => {
-              if (this.tabState[streamSid] === streamState) {
-                this._syncQueueFromServer(streamSid);
-              }
-            }, 800);
-        }
+        this.$nextTick(() => this._drainPendingQueue(streamSid));
       });
       if (useMux) this._activateChatMuxChannel(es);
       // NOTE: errors are owned exclusively by the addEventListener("error")
@@ -34310,27 +35735,48 @@ function portal() {
       // Stop has exactly one meaning: interrupt the active turn for the current
       // session. Queued messages keep their independent edit/delete actions.
       const sid = this.currentId;
-      if (!sid || !this.isTabStreaming(sid)) return;
+      if (!sid) return;
       const st = this._ensureTabState(sid);
+      if (!this.isTabStreaming(sid) && !this._hasPendingAdmission(st) && !st._uncertainSubmission) return;
       const ownerTurnId = String(st.activeTurnId || "");
+      if (!ownerTurnId && st._composerSubmitToken) {
+        st._cancelledSubmitToken = st._composerSubmitToken;
+      }
       if (ownerTurnId && st._stoppingTurnId === ownerTurnId) return;
-      if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
+      // The server holds these exact IDs atomically with Stop. No extra network
+      // round trip, and new IDs submitted during Stop are never captured.
+      const pauseIds = this._holdPendingSnapshot(sid, true);
+      if (ownerTurnId) st._stoppingTurnId = ownerTurnId;
       // Before a channel and immutable turn id exist, abort only the start
       // request. send() rollback remains the sole owner of stream flags, timers,
       // channel state and the draft; Stop must not manufacture optimistic idle.
       if (st._streamStartController && !st.es && !ownerTurnId) {
+        const cancelledController = st._streamStartController;
         st._cancelBeforeStream = true;
-        st._streamStartController.abort();
-        if (st.pendingQueue && st.pendingQueue.length > 0) {
-          try {
-            await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/queue/pause`, {
-              method: "POST",
-              headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-              body: JSON.stringify({ paused: true }),
-            });
-          } catch (_) { /* queue sync below/next activation reconciles */ }
-          this._syncQueueFromServer(sid);
-        }
+        this._rememberCancelIntent(sid, st._composerSubmitToken || st._streamOwnerToken, "turn", pauseIds);
+        cancelledController.abort();
+        // Record cancellation independently of the request being aborted. If
+        // admission won the race, the server interrupts that exact receipt.
+        try {
+          await this._fetchWithDeadline(
+            "/api/chat/sessions/" + encodeURIComponent(sid) + "/submissions/"
+              + encodeURIComponent(st._composerSubmitToken || st._streamOwnerToken) + "/cancel"
+              + "?pause_item_ids=" + encodeURIComponent(pauseIds.join(",")),
+            { method: "POST", headers: this.hdr() }, 3000);
+        } catch (_) {}
+        this._syncQueueFromServer(sid);
+        return;
+      }
+      if (!ownerTurnId && st._uncertainSubmission?.kind === "turn") {
+        this._rememberCancelIntent(sid, st._uncertainSubmission.requestId, "turn", pauseIds);
+        try {
+          await this._fetchWithDeadline(
+            "/api/chat/sessions/" + encodeURIComponent(sid) + "/submissions/"
+              + encodeURIComponent(st._uncertainSubmission.requestId) + "/cancel"
+              + "?pause_item_ids=" + encodeURIComponent(pauseIds.join(",")),
+            { method: "POST", headers: this.hdr() }, 3000);
+          await this.reconcileSubmission(sid);
+        } catch (_) {}
         return;
       }
       if (!ownerTurnId) return;
@@ -34368,7 +35814,8 @@ function portal() {
       try {
         const r = await fetch(
           "/api/chat/interrupt?session_id=" + encodeURIComponent(sid)
-            + "&turn_id=" + encodeURIComponent(ownerTurnId),
+            + "&turn_id=" + encodeURIComponent(ownerTurnId)
+            + "&pause_item_ids=" + encodeURIComponent(pauseIds.join(",")),
           { method: "POST", headers: this.hdr(), signal: controller.signal },
         );
         if (!r.ok) throw new Error("interrupt failed");
@@ -34740,6 +36187,9 @@ function portal() {
       // better to show something technical than swallow useful info.
       const zh = this.lang === "zh";
       const s = String(raw || "");
+      if (/runtime_buffer_exceeded/i.test(s)) return zh
+        ? "输出积压过大，运行已停止。请先刷新会话历史确认结果，再决定是否重试。"
+        : "Output backlog stopped the run. Reload conversation history to confirm the result before retrying.";
       if (/401|unauthorized|invalid.api.key/i.test(s))
         return zh ? "API key 无效，去 Settings 检查" : "Invalid API key — check Settings";
       if (/429|rate.?limit|too many/i.test(s))
@@ -34796,6 +36246,7 @@ function portal() {
 
     // ===== command palette =====
     openPalette() {
+      this._cancelPaletteMessageSearch();
       this.palette.query = "";
       this.palette.activeIndex = 0;
       this.palette.fileResults = [];
@@ -34808,33 +36259,44 @@ function portal() {
         if (el) el.focus();
       });
     },
-    closePalette() { this.palette.show = false; },
-    // Cross-session full-text message search. Mirrors _fetchPaletteFiles
-    // shape — debounced from palette input, race-safe via query echo
-    // check. Server caps at 30 hits.
+    _cancelPaletteMessageSearch() {
+      if (this._paletteMessageAbort) this._paletteMessageAbort.abort();
+      this._paletteMessageAbort = null;
+      this.palette.messageLoading = false;
+    },
+    closePalette() {
+      this._cancelPaletteMessageSearch();
+      this.palette.show = false;
+    },
     async _fetchPaletteMessages() {
       const q = this.palette.query.trim();
-      if (q.length < 2) {
-        this.palette.messageResults = [];
-        this.palette.messageQuery = "";
-        return;
-      }
-      if (q === this.palette.messageQuery) return;
-      this.palette.messageQuery = q;
+      if (q === this.palette.messageQuery && q.length >= 2) return;
+      this._cancelPaletteMessageSearch();
+      this.palette.messageQuery = q.length >= 2 ? q : "";
+      this.palette.messageResults = [];
+      if (q.length < 2) return;
+      const controller = new AbortController();
+      this._paletteMessageAbort = controller;
       this.palette.messageLoading = true;
+      const owns = () => this._paletteMessageAbort === controller
+        && this.palette.query.trim() === q;
       try {
         const r = await fetch(
           "/api/chat/search?q=" + encodeURIComponent(q) + "&limit=20",
-          { headers: this.hdr() });
-        if (!r.ok) { this.palette.messageResults = []; return; }
+          { headers: this.hdr(), signal: controller.signal });
+        if (!r.ok) throw new Error("Search unavailable");
         const data = await r.json();
-        if (this.palette.query.trim() === q) {
-          this.palette.messageResults = data.hits || [];
+        if (owns()) this.palette.messageResults = data.hits || [];
+      } catch (error) {
+        if (owns()) {
+          this.palette.messageResults = [];
+          this.palette.messageQuery = ""; // allow retry after a transient failure
         }
-      } catch {
-        this.palette.messageResults = [];
       } finally {
-        this.palette.messageLoading = false;
+        if (this._paletteMessageAbort === controller) {
+          this._paletteMessageAbort = null;
+          this.palette.messageLoading = false;
+        }
       }
     },
     // Jump to a session and scroll to a specific message uuid. Used by
@@ -35350,6 +36812,11 @@ function portal() {
             if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
+          // The built-in inbox always follows activity time, including rows
+          // that acquired manual positions while moving between custom lanes.
+          if (groupKey === "custom:__ungrouped__") {
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
           if (custom) {
             const aManual = Number.isFinite(Number(a.group_order));
             const bManual = Number.isFinite(Number(b.group_order));
@@ -35359,9 +36826,6 @@ function portal() {
             if (aManual && bManual) {
               const order = Number(a.group_order) - Number(b.group_order);
               if (order) return order;
-            }
-            if (groupKey === "custom:__ungrouped__") {
-              return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
             }
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
@@ -35906,7 +37370,7 @@ function portal() {
       if (this._activityGroupPending[eventId]) return false;
       const target = String(groupId || "");
       const previous = String(item.group_id || "");
-      const hasPlacement = beforeEventId !== null;
+      const hasPlacement = !!target && beforeEventId !== null;
       this.closeActivityMoveMenu(true);
       if (!hasPlacement && target === previous) return true;
       const previousPlacement = new Map(this.activity.events.map(row => [
@@ -36511,7 +37975,10 @@ function portal() {
         if (seq !== this.scheduler.nativeLoadSeq) return false;
         const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
         this.scheduler.nativeTasks = tasks;
-        this._setScheduledTaskState(sid, tasks.length > 0, tasks.length);
+        this._setScheduledTaskState(sid,
+          payload.scheduled_active ?? tasks.some(task =>
+            ["active", "recovering", "unconfirmed"].includes(task.runtime_state || "active")),
+          tasks.length);
         return true;
       } catch (_) {
         if (seq !== this.scheduler.nativeLoadSeq) return false;
@@ -36523,6 +37990,50 @@ function portal() {
         if (seq === this.scheduler.nativeLoadSeq) {
           this.scheduler.nativeLoading = false;
         }
+      }
+    },
+    nativeScheduledStatus(task) {
+      const states = this.lang === "zh" ? {
+        active: "计划有效", interrupted: "运行环境已断开", recovering: "正在恢复会话",
+        unconfirmed: "会话已恢复，任务待确认", missing: "原生计划未恢复",
+        recovery_failed: "会话恢复失败", paused: "已暂停", expired: "已到期",
+        finished: "本次计划已结束",
+      } : {
+        active: "Scheduled", interrupted: "Runtime disconnected", recovering: "Resuming session",
+        unconfirmed: "Session resumed; schedule unconfirmed", missing: "Native schedule missing",
+        recovery_failed: "Session recovery failed", paused: "Paused", expired: "Expired",
+        finished: "One-shot finished",
+      };
+      return states[task.runtime_state || "active"] || (this.lang === "zh" ? "状态待确认" : "Unconfirmed");
+    },
+    nativeScheduledOutcome(task) {
+      if (task.last_execution_status === "not_executed" || task.last_error === "not_executed") return this.lang === "zh"
+        ? "上次触发未获得有效执行结果" : "Last trigger had no execution evidence";
+      if (task.record_saved === false) return this.lang === "zh"
+        ? "任务记录保存失败，恢复尚无保障" : "Receipt could not be saved; recovery is unavailable";
+      if (!task.last_finished_at_ms) return "";
+      const when = new Date(task.last_finished_at_ms).toLocaleString();
+      const outcome = task.last_status === "completed"
+        ? (this.lang === "zh" ? "回复完成" : "Response completed")
+        : (this.lang === "zh" ? "执行失败或中断" : "Failed or interrupted");
+      const tools = Math.max(0, Number(task.tool_results) || 0);
+      return `${when} · ${outcome} · ${this.lang === "zh" ? "工具结果" : "Tool results"} ${tools}`;
+    },
+    async recoverNativeScheduledTasks() {
+      const sid = this.scheduler.nativeSessionId;
+      if (!sid || this.scheduler.nativeLoading) return;
+      this.scheduler.nativeLoading = true;
+      this.scheduler.nativeError = "";
+      try {
+        const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/scheduled-tasks/recover`,
+          { method: "POST", headers: this.hdr() });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        await this.loadNativeScheduledTasks(sid);
+      } catch (_) {
+        this.scheduler.nativeError = this.lang === "zh"
+          ? "恢复未能开始，请检查任务状态" : "Recovery could not start; check the task status";
+      } finally {
+        this.scheduler.nativeLoading = false;
       }
     },
     openNativeScheduledTasks(sessionId, event = null) {

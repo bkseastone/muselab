@@ -49,12 +49,11 @@ class RetrievalConfig(BaseModel):
     dense_candidates: int = Field(default=20, ge=1, le=100)
     lexical_candidates: int = Field(default=20, ge=1, le=100)
     final_limit: int = Field(default=6, ge=1, le=20)
-    max_context_chars: int = Field(default=3000, ge=500, le=12000)
-    # 250ms was below the cost of a single local CPU embedding call (~0.15-0.3s
-    # for a short query), so the dense channel timed out on most real turns and
-    # recall returned nothing. Recall is best-effort and off the critical path
-    # of the reply, so a budget that actually fits the slowest hop is cheap.
-    soft_timeout_ms: int = Field(default=2000, ge=100, le=5000)
+    # Legacy field accepted for saved configurations; recall no longer truncates.
+    max_context_chars: int = Field(default=0, ge=0, le=12000)
+    # One end-to-end recall budget. Zero waits for every enabled stage without
+    # a timer; preserve the existing key so saved configurations keep working.
+    soft_timeout_ms: int = Field(default=0, ge=0)
 
 
 class ConsolidationConfig(BaseModel):
@@ -141,6 +140,11 @@ def load_config(*, fresh: bool = False) -> MemoryConfig:
         stamp = path.stat().st_mtime_ns
     except OSError:
         stamp = -1
+    # Saving holds the writer lock across fsync/replace. Readers can keep
+    # using the last committed immutable snapshot while that write is pending.
+    cached = _cached
+    if not fresh and cached and cached[0] == stamp:
+        return cached[1].model_copy(deep=True)
     with _LOCK:
         if not fresh and _cached and _cached[0] == stamp:
             return _cached[1].model_copy(deep=True)

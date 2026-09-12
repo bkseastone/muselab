@@ -12,9 +12,11 @@ StartLimitBurst=5
 [Service]
 Type=simple
 WorkingDirectory={{REPO_PATH}}
-EnvironmentFile={{REPO_PATH}}/.env
+EnvironmentFile={{ENV_PATH}}
 Environment=MUSELAB_SERVICE_NAME=muselab.service
-ExecStart={{UV_PATH}} run python -m backend.main
+# env passes a quoted executable path as an argument, including special
+# characters systemd rejects in its first executable token. It immediately execs uv.
+ExecStart=/usr/bin/env -- {{UV_PATH}} run python -m backend.main
 Restart=on-failure
 RestartSec=10
 # `uv run` forwards systemd's expected SIGTERM and exits 143 after the Python

@@ -1,4 +1,4 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
 .env
@@ -84,3 +84,7 @@ graphify-out/*
 !graphify-out/GRAPH_REPORT.md
 
 tests/
+
+# Validated dependency environments and private upgrade logs.
+/.venv-builds/
+/.venv.next.*

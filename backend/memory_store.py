@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -80,6 +81,75 @@ _SNAPSHOT_TABLES: tuple[
 )
 _SNAPSHOT_OWNER_TABLES = {"evidence", "episodes", "memories", "artifacts", "audit"}
 _SNAPSHOT_LIST_DEFAULTS = {"entities", "tags", "source_episode_ids"}
+
+
+class SnapshotValidationError(ValueError):
+    """Public import diagnostics contain locations/codes, never row contents."""
+
+    def __init__(self, table: str, row: int, field: str, reason: str):
+        self.detail = {
+            "category": "invalid_snapshot", "table": table,
+            "row": row, "field": field, "reason": reason,
+        }
+        super().__init__(f"invalid snapshot: {table}[{row}].{field}: {reason}")
+
+
+_SNAPSHOT_NULLABLE = {"source_ref", "ended_at", "valid_from", "valid_to"}
+_SNAPSHOT_NUMBERS = {
+    "created_at", "updated_at", "started_at", "ended_at",
+    "valid_from", "valid_to", "confidence",
+}
+_SNAPSHOT_INTEGERS = {"position", "turn_count", "version"}
+_SNAPSHOT_PRIMARY_KEYS = {
+    "episode_evidence": ("episode_id", "evidence_id"),
+    "memory_sources": ("memory_id", "source_type", "source_id", "relation"),
+}
+_SNAPSHOT_MEMORY_ENUMS = {
+    "kind": {"fact", "preference", "decision", "state", "episode", "reflection"},
+    "status": {"active", "pending_review", "superseded", "deleted"},
+    "authority": {"confirmed", "inferred", "legacy_import"},
+}
+
+
+def _validate_snapshot_row(table: str, index: int, row: dict,
+                           columns: tuple[str, ...], json_columns: tuple[str, ...]) -> None:
+    for column in columns:
+        key = column[:-5] if column.endswith("_json") else column
+        value = row.get(key)
+        reason = ""
+        if key not in row:
+            reason = "missing_field"
+        elif value is None and key in _SNAPSHOT_NULLABLE:
+            continue
+        elif column in json_columns:
+            expected = list if key in _SNAPSHOT_LIST_DEFAULTS else dict
+            if not isinstance(value, expected):
+                reason = "invalid_json_type"
+            else:
+                try:
+                    json.dumps(value, allow_nan=False)
+                except (TypeError, ValueError):
+                    reason = "invalid_json_value"
+        elif key in _SNAPSHOT_INTEGERS:
+            minimum = 1 if key == "version" else 0
+            if type(value) is not int or not minimum <= value <= 2**63 - 1:
+                reason = "invalid_integer"
+        elif key in _SNAPSHOT_NUMBERS:
+            try:
+                valid = type(value) in {int, float} and math.isfinite(value)
+            except OverflowError:
+                valid = False
+            if not valid or (key == "confidence" and not 0 <= value <= 1):
+                reason = "invalid_number"
+        elif not isinstance(value, str) or len(value) > 1_000_000:
+            reason = "invalid_text"
+        elif key in {"id", "episode_id", "evidence_id", "memory_id"} and not value:
+            reason = "empty_identifier"
+        elif table == "memories" and key in _SNAPSHOT_MEMORY_ENUMS:
+            if value not in _SNAPSHOT_MEMORY_ENUMS[key]:
+                reason = "unsupported_value"
+        if reason:
+            raise SnapshotValidationError(table, index, key, reason)
 
 
 def _is_cjk(char: str) -> bool:
@@ -156,12 +226,14 @@ def _fts_text(content: str) -> str:
 
 
 class MemoryStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
         self._lock = threading.RLock()
-        self._init()
-        self._harden_permissions()
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._init()
+            self._harden_permissions()
 
     def _harden_permissions(self) -> None:
         """Restrict the registry to the owning user.
@@ -188,12 +260,56 @@ class MemoryStore:
                 except OSError as exc:
                     log.debug("could not chmod %s: %s", sibling, exc)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # Recall must never run schema migration or wait ten seconds for a writer.
+        target = self.path.absolute().as_uri() + "?mode=ro" if self._read_only else self.path
+        conn = sqlite3.connect(target, uri=self._read_only,
+                               timeout=0.05 if self._read_only else 10,
+                               isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=50" if self._read_only
+                         else "PRAGMA busy_timeout=10000")
+            if self._read_only:
+                conn.execute("PRAGMA query_only=ON")
+                deadline = getattr(self, "_query_deadline", None)
+                cancelled = getattr(self, "_read_cancelled", None)
+                if deadline is not None or cancelled is not None:
+                    conn.set_progress_handler(
+                        lambda: int((deadline is not None and time.perf_counter() >= deadline)
+                                    or (cancelled is not None and cancelled.is_set())), 1000)
+            with conn:
+                yield conn
+        finally:
+            # Do not defer SQLite handles and WAL cleanup to cyclic GC, which
+            # may otherwise run on the application's event-loop thread.
+            conn.close()
+
+    @contextmanager
+    def read_budget(self, deadline: float | None, *, cancel_event=None):
+        """Interrupt expensive SQL after the read actor's absolute deadline."""
+        if not self._read_only:
+            raise RuntimeError("read budgets require a read-only store")
+        self._query_deadline = deadline
+        self._read_cancelled = cancel_event
+        try:
+            if ((deadline is not None and time.perf_counter() >= deadline)
+                    or (cancel_event is not None and cancel_event.is_set())):
+                raise TimeoutError("memory read deadline exceeded")
+            yield
+        except sqlite3.OperationalError as exc:
+            # The progress handler and asyncio timeout race at the same
+            # deadline. Both paths represent a read timeout, not a broken DB.
+            if (getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+                    and ((deadline is not None and time.perf_counter() >= deadline)
+                         or (cancel_event is not None and cancel_event.is_set()))):
+                raise TimeoutError("memory read deadline exceeded") from None
+            raise
+        finally:
+            self._query_deadline = None
+            self._read_cancelled = None
 
     @contextmanager
     def _write_tx(self) -> Iterator[sqlite3.Connection]:
@@ -253,6 +369,10 @@ class MemoryStore:
         );
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status
           ON memories(owner_id, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memories_owner_updated
+          ON memories(owner_id, updated_at DESC, id ASC);
+        CREATE INDEX IF NOT EXISTS idx_memories_owner_status_id
+          ON memories(owner_id, status, id);
         CREATE TABLE IF NOT EXISTS memory_sources (
           memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
           source_type TEXT NOT NULL, source_id TEXT NOT NULL, relation TEXT NOT NULL,
@@ -336,6 +456,11 @@ class MemoryStore:
         if "owner_id" not in columns:
             conn.execute(
                 "ALTER TABLE jobs ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+        if "operation_key" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN operation_key TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_operation "
+                     "ON jobs(owner_id, operation_key, status)")
 
     def _migrate_fts(self, conn: sqlite3.Connection) -> None:
         """Reindex memory_fts when the tokenization scheme changes.
@@ -671,6 +796,64 @@ class MemoryStore:
         with self._lock, self._connect() as conn:
             return [self._row(row) or {} for row in conn.execute(sql, params)]
 
+    def browse_memories(self, owner_id: str, *, limit: int = 100, offset: int = 0,
+                        status: str | None = None, kind: str | None = None,
+                        query: str | None = None, sort: str = "auto",
+                        direction: str = "desc") -> tuple[list[dict], int]:
+        """Filter and sort the entire owner-scoped result before pagination.
+
+        Keep lexical retrieval's scoring contract separate from the browser's
+        explicit sort. Never truncate a search candidate pool before sorting it.
+        """
+        columns = {
+            "updated_at": "m.updated_at",
+            "recall_count": "COALESCE(s.recall_count, 0)",
+            "last_recalled_at": "COALESCE(s.last_recalled_at, 0)",
+            "helpful_count": "COALESCE(s.helpful_count, 0)",
+            "unhelpful_count": "COALESCE(s.unhelpful_count, 0)",
+            "relevance": "bm25(memory_fts)" if query else "m.updated_at",
+        }
+        if sort == "auto":
+            sort = "relevance" if query else "updated_at"
+        if sort not in columns or direction not in ("asc", "desc"):
+            raise ValueError("Unsupported memory sort")
+        source = "memories m"
+        clauses, params = ["m.owner_id=?"], [owner_id]
+        if query:
+            terms = list(dict.fromkeys(_fts_terms(query)))[:20]
+            if not terms:
+                return [], 0
+            expression = " OR ".join(f'"{term}"' for term in terms)
+            source = "memory_fts JOIN memories m ON m.id=memory_fts.memory_id"
+            clauses.append("memory_fts MATCH ?")
+            params.append(expression)
+        if status:
+            clauses.append("m.status=?")
+            params.append(status)
+        if kind:
+            clauses.append("m.kind=?")
+            params.append(kind)
+        where = " AND ".join(clauses)
+        # Date/relevance ordering does not use recall stats. Joining the whole
+        # registry before LIMIT forced unrelated stats lookups on every page.
+        join = (" LEFT JOIN memory_recall_stats s"
+                " ON s.owner_id=m.owner_id AND s.memory_id=m.id") if sort in {
+                    "recall_count", "last_recalled_at", "helpful_count", "unhelpful_count"
+                } else ""
+        # BM25's lower value is more relevant. "desc" means best first in UI.
+        order = ("ASC" if direction == "desc" else "DESC") \
+            if query and sort == "relevance" else direction.upper()
+        with self._lock, self._connect() as conn:
+            total = conn.execute(
+                f"SELECT count(*) FROM {source} WHERE {where}", params,
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT m.* FROM {source}{join} WHERE {where}"
+                f" ORDER BY {columns[sort]} {order}, m.id ASC LIMIT ? OFFSET ?",
+                [*params, max(1, min(500, limit)), max(0, offset)],
+            ).fetchall()
+            return [self._row(row) or {} for row in rows], total
+
     def memories_by_ids(self, memory_ids: list[str]) -> list[dict]:
         if not memory_ids:
             return []
@@ -748,7 +931,7 @@ class MemoryStore:
             try:
                 for memory_id in memory_ids:
                     row = conn.execute(
-                        "SELECT attributes_json FROM memories WHERE id=?",
+                        "SELECT attributes_json FROM memories WHERE id=? AND status='active'",
                         (memory_id,),
                     ).fetchone()
                     if row is None:
@@ -870,6 +1053,8 @@ class MemoryStore:
                       confidence: float | None = None, authority: str | None = None,
                       attributes: dict | None = None, tags: list | None = None) -> dict | None:
         fields: dict[str, Any] = {"updated_at": _now()}
+        if status in {"deleted", "superseded"}:
+            fields["embedding_state"] = "pending"
         for key, value in (("content", content), ("status", status), ("kind", kind),
                            ("confidence", confidence), ("authority", authority)):
             if value is not None:
@@ -977,7 +1162,14 @@ class MemoryStore:
                         {status_clause} {kind_clause}
                         ORDER BY lexical_rank LIMIT ?""", params,
                 ).fetchall()
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                # Interrupts and lock contention must reach the recall actor:
+                # it applies the sole deadline/cancellation policy and retries
+                # short busy waits instead of accepting a false empty result.
+                code = getattr(exc, "sqlite_errorcode", 0) or 0
+                if (code & 0xff) in {sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY,
+                                    sqlite3.SQLITE_LOCKED}:
+                    raise
                 return []
             return [{"memory": self._row(row) or {},
                      "score": 1.0 / (1.0 + abs(float(row["lexical_rank"]))),
@@ -1045,7 +1237,8 @@ class MemoryStore:
         return self.artifact(artifact_id)
 
     def enqueue(self, kind: str, payload: dict, *, run_after: float | None = None,
-                owner_id: str = "") -> str:
+                owner_id: str = "", deduplicate: bool = False,
+                revision: str = "") -> str:
         """Queue a background job.
 
         `owner_id` is stamped at ENQUEUE time on purpose: the worker used to
@@ -1054,14 +1247,63 @@ class MemoryStore:
         switch) wrote its results into the wrong owner's registry.
         """
         job_id, now = _id("job"), _now()
-        with self._lock, self._connect() as conn:
+        operation_key = (hashlib.sha256(_json(
+            [kind, owner_id, revision, payload]).encode()).hexdigest()
+            if deduplicate else "")
+        with self._write_tx() as conn:
+            if operation_key:
+                existing = conn.execute(
+                    "SELECT id FROM jobs WHERE owner_id=? AND operation_key=? "
+                    "AND status IN ('queued','running') LIMIT 1",
+                    (owner_id, operation_key)).fetchone()
+                if existing:
+                    return existing["id"]
             conn.execute(
                 """INSERT INTO jobs
-                   (id,kind,payload_json,run_after,owner_id,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (job_id, kind, _json(payload), run_after or now, owner_id, now, now),
+                   (id,kind,payload_json,run_after,owner_id,created_at,updated_at,operation_key)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (job_id, kind, _json(payload), run_after or now, owner_id, now, now,
+                 operation_key),
             )
         return job_id
+
+    def enqueue_reindex_batches(self, owner_id: str, *, batch_size: int = 256,
+                                revision: str = "") -> int:
+        """Queue one durable operation for a semantic snapshot, in bounded batches.
+
+        The key excludes index timestamps: completed batches must not make a
+        repeated click enqueue the same operation again. New content or a new
+        provider revision is distinct and must never be silently dropped.
+        """
+        if not 1 <= batch_size <= 256:
+            raise ValueError("batch_size must be between 1 and 256")
+        total, cursor, now = 0, "", _now()
+        with self._write_tx() as conn:
+            digest = hashlib.sha256(_json([owner_id, revision]).encode())
+            for row in conn.execute(
+                "SELECT id,content FROM memories WHERE owner_id=? AND status='active' "
+                "ORDER BY id", (owner_id,)):
+                digest.update(_json([row["id"], row["content"]]).encode())
+            operation_key = digest.hexdigest()
+            if conn.execute(
+                "SELECT 1 FROM jobs WHERE owner_id=? AND kind='reindex_memories' "
+                "AND operation_key=? AND status IN ('queued','running') LIMIT 1",
+                (owner_id, operation_key)).fetchone():
+                return 0
+            while True:
+                ids = [row["id"] for row in conn.execute(
+                    "SELECT id FROM memories WHERE owner_id=? AND status='active' "
+                    "AND id>? ORDER BY id LIMIT ?", (owner_id, cursor, batch_size))]
+                if not ids:
+                    break
+                conn.execute(
+                    "INSERT INTO jobs(id,kind,payload_json,run_after,owner_id,created_at,"
+                    "updated_at,operation_key) VALUES (?,?,?,?,?,?,?,?)",
+                    (_id("job"), "reindex_memories", _json({"memory_ids": ids}),
+                     now, owner_id, now, now, operation_key))
+                total += len(ids)
+                cursor = ids[-1]
+        return total
 
     def claim_job(self) -> dict | None:
         with self._lock, self._connect() as conn:
@@ -1328,15 +1570,65 @@ class MemoryStore:
                     f"SELECT count(*) AS n FROM {table} WHERE {where}",
                     (owner_id,) if "?" in where else (),
                 ).fetchone()["n"])
-            queued = conn.execute(
-                "SELECT count(*) AS n FROM jobs WHERE status IN ('queued','running')"
-            ).fetchone()["n"]
+            counts = {row["status"]: row["n"] for row in conn.execute(
+                "SELECT status,count(*) AS n FROM jobs WHERE owner_id=? GROUP BY status",
+                (owner_id,))}
+            recent = []
+            kinds = {"consolidate_episode", "reconcile_transcript", "cross_episode_dream",
+                     "reindex_memory", "reindex_memories", "unindex_memory"}
+            categories = {"generation_failure", "timeout", "transport", "authentication",
+                          "transient_http", "http_error", "unknown_job", "owner_mismatch",
+                          "permission", "file_not_found", "missing_key", "invalid_type",
+                          "invalid_value", "malformed_response", "transient_provider"}
+            reasons = {"timeout", "invalid_json", "non_object_json", "empty_result",
+                       "empty_response", "api_error", "interrupted", "max_turns"}
+            for row in conn.execute(
+                "SELECT id,kind,status,attempts,run_after,updated_at,last_error "
+                "FROM jobs WHERE owner_id=? ORDER BY updated_at DESC,id DESC LIMIT 20",
+                (owner_id,)):
+                try:
+                    failure = json.loads(row["last_error"] or "{}")
+                except (ValueError, TypeError):
+                    failure = {}
+                if not isinstance(failure, dict):
+                    failure = {}
+                # Old registries may contain raw exception text or arbitrary
+                # JSON. Only allowlisted categories cross the status API.
+                recent.append({
+                    key: row[key] for key in
+                    ("id", "status", "attempts", "run_after", "updated_at")
+                } | {
+                    "kind": row["kind"] if row["kind"] in kinds else "unknown_job",
+                    "category": (failure.get("category")
+                                 if isinstance(failure.get("category"), str) and failure.get("category") in categories else
+                                 "unclassified" if row["last_error"] else ""),
+                    "reason": failure.get("reason") if isinstance(failure.get("reason"), str) and failure.get("reason") in reasons else "",
+                })
+            last_success = conn.execute(
+                "SELECT MAX(updated_at) FROM jobs WHERE owner_id=? AND status='done'",
+                (owner_id,)).fetchone()[0]
+            last_op = conn.execute(
+                "SELECT operation_key,created_at FROM jobs WHERE owner_id=? "
+                "AND kind='reindex_memories' AND operation_key!='' "
+                "ORDER BY created_at DESC LIMIT 1", (owner_id,)).fetchone()
+            progress = None
+            if last_op:
+                progress = dict(conn.execute(
+                    "SELECT count(*) AS total_batches, "
+                    "SUM(status='done') AS done_batches, SUM(status='failed') AS failed_batches, "
+                    "SUM(status IN ('queued','running')) AS pending_batches "
+                    "FROM jobs WHERE owner_id=? AND operation_key=? AND created_at=?",
+                    (owner_id, last_op["operation_key"], last_op["created_at"])).fetchone())
             return {
                 "memories": count("memories", "owner_id=? AND status='active'"),
                 "episodes": count("episodes"),
                 "pending_artifacts": count(
                     "artifacts", "owner_id=? AND status='pending_review'"),
-                "queued_jobs": int(queued),
+                "pending_index": count(
+                    "memories", "owner_id=? AND status='active' AND embedding_state!='ready'"),
+                "queued_jobs": counts.get("queued", 0) + counts.get("running", 0),
+                "job_counts": counts, "recent_jobs": recent,
+                "last_success_at": last_success, "reindex_progress": progress,
             }
 
     def export_snapshot(self, owner_id: str) -> dict:
@@ -1450,16 +1742,18 @@ class MemoryStore:
         if not isinstance(values, list) or len(values) > 100_000:
             raise ValueError(f"invalid {table} rows")
         placeholders = ",".join("?" for _ in columns)
+        primary_key = _SNAPSHOT_PRIMARY_KEYS.get(table, ("id",))
         sql = (
-            f"INSERT OR IGNORE INTO {table}"
-            f"({','.join(columns)}) VALUES ({placeholders})"
+            f"INSERT INTO {table}({','.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(primary_key)}) DO NOTHING"
         )
         inserted = 0
         memory_ids: list[str] = []
-        for value in values:
+        for index, value in enumerate(values, start=1):
             if not isinstance(value, dict):
-                raise ValueError(f"invalid {table} row")
+                raise SnapshotValidationError(table, index, "row", "invalid_row")
             row = dict(value)
+            _validate_snapshot_row(table, index, row, columns, json_columns)
             if table in _SNAPSHOT_OWNER_TABLES:
                 row["owner_id"] = owner_id
             if table == "memories":
@@ -1485,7 +1779,11 @@ class MemoryStore:
                 MemoryStore._snapshot_column_value(row, column, json_columns)
                 for column in columns
             ]
-            cursor = conn.execute(sql, tuple(args))
+            try:
+                cursor = conn.execute(sql, tuple(args))
+            except sqlite3.IntegrityError:
+                raise SnapshotValidationError(
+                    table, index, "row", "reference_or_unique_conflict") from None
             inserted += max(0, int(cursor.rowcount))
         return inserted, memory_ids
 

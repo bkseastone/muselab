@@ -30,6 +30,7 @@ from .activity_api import router as activity_router
 from .terminal import router as terminal_router
 from .file_events import router as file_events_router
 from .todos_api import router as todos_router
+from .api_delivery import router as delivery_router
 from .settings import ROOT, PORT, HOST
 from .version import project_version
 from .observability import (
@@ -38,6 +39,8 @@ from .observability import (
     monotonic as _perf_monotonic,
     perf_enabled as _perf_enabled,
     perf_event,
+    start_diagnostics,
+    stop_diagnostics,
 )
 
 
@@ -197,6 +200,19 @@ class _EventLoopStallWatchdog:
         safe_function = re.sub(r"[^A-Za-z0-9_.-]", "_", function)[:60]
         return f"{safe_module}:{safe_function}"
 
+    def _blocked_callers(self) -> str:
+        # Function names only: no source lines, paths, locals, or user payloads.
+        frame = sys._current_frames().get(self._loop_thread_id)
+        callers = []
+        for _ in range(4):
+            frame = frame.f_back if frame is not None else None
+            if frame is None:
+                break
+            module = str(frame.f_globals.get("__name__", "unknown"))
+            function = str(frame.f_code.co_name or "unknown")
+            callers.append(re.sub(r"[^A-Za-z0-9_.:-]", "_", f"{module}:{function}")[:80])
+        return ">".join(callers)[:160] or "unknown"
+
     def _check_once(self, observed_at: float) -> None:
         lag_s = max(0.0, observed_at - self._heartbeat_at)
         if lag_s < self._threshold_s:
@@ -210,6 +226,7 @@ class _EventLoopStallWatchdog:
                 "runtime.loop_stall",
                 lag_ms=round(lag_s * 1000),
                 site=self._blocked_site(),
+                callers=self._blocked_callers(),
             )
         except Exception:
             # Diagnostics must never terminate the watchdog thread.
@@ -366,7 +383,7 @@ async def _monitor_event_loop_lag() -> None:
 
 
 async def _recover_message_queues_at_startup(session_store) -> int:
-    """Restore durable claims and leave every surviving queue paused.
+    """Restore claims, isolating ambiguous input from unstarted FIFO work.
 
     Kept as a small helper so the startup safety boundary is regression-testable
     without booting schedulers, terminals, or file watchers.
@@ -380,10 +397,8 @@ async def _recover_message_queues_at_startup(session_store) -> int:
             queue = await asyncio.to_thread(
                 session_store.recover_queue_inflight, sid)
         except Exception as exc:
-            # Continue the sweep so one unwritable/corrupt sidecar cannot
-            # leave every later queue live.  We still fail startup after the
-            # sweep: serving requests with even one queue whose pause was not
-            # durably committed would re-open automatic draining.
+            # Finish the sweep, then fail closed: an ambiguous claim must be
+            # durably isolated before any scheduler can resume pending work.
             failures += 1
             sys.stderr.write(
                 f"[muselab] queue recovery failed sid={sid[:8]} "
@@ -435,6 +450,12 @@ async def _lifespan(app: FastAPI):
         _asyncio.to_thread(_activity.initialize_runtime_state),
         _asyncio.to_thread(_todos.initialize_runtime_state),
     )
+    repaired_fork_activity = await _asyncio.to_thread(
+        _activity.reconcile_fork_sessions)
+    if repaired_fork_activity:
+        sys.stderr.write(
+            f"[muselab] restored {repaired_fork_activity} fork activity row(s) on startup\n")
+        sys.stderr.flush()
     # Older releases allowed a successor CLI's synthetic ``stopped`` record to
     # overwrite the predecessor's real terminal state. Repair each runtime
     # chain from its oldest owner before applying restart recovery, so a true
@@ -480,14 +501,14 @@ async def _lifespan(app: FastAPI):
         ) from None
     if recovered:
         sys.stderr.write(
-            f"[muselab] recovered {recovered} paused message queue(s) "
+            f"[muselab] recovered {recovered} message queue(s) "
             "on startup\n")
         sys.stderr.flush()
     # A hidden background-task owner can finish its Agent continuation just
     # before the process exits.  The private READY outbox survives that crash;
     # resume its presentation-only delivery to the latest visible successor.
-    # Scheduling is non-blocking, and queue recovery above has already paused
-    # every stale claim so no restarted turn can race ahead of the projection.
+    # Scheduling is non-blocking. Queue recovery has isolated stale claims;
+    # the drain flushes READY projections before it starts another turn.
     from . import chat as _chat
     recovered_continuations = await (
         _chat.recover_runtime_continuation_outboxes_at_startup()
@@ -575,7 +596,17 @@ async def _lifespan(app: FastAPI):
     from .file_events import manager as _file_watch_manager
     await _start_workspace_index(_file_watch_manager)
     await _terminal_manager.start()
+    start_diagnostics()
     try:
+        # All queue/attachment recovery and runtime projections are committed.
+        # Resume only unstarted items; review-only records cannot be claimed.
+        _chat._queue_runtime_closing = False
+        await _chat.recover_native_cron_at_startup()
+        queue_sids = await _asyncio.to_thread(_sess.list_queue_session_ids)
+        for sid in queue_sids:
+            queue = await _asyncio.to_thread(_sess.get_queue, sid)
+            if _sess.queue_pending_items(queue):
+                _chat._schedule_queue_drain(sid)
         yield
     finally:
         from .runtime_lifecycle import shutdown_runtime
@@ -586,6 +617,9 @@ async def _lifespan(app: FastAPI):
             terminal=_terminal_manager,
             file_watcher=_file_watch_manager,
         )
+        from .files import cleanup_pending_uploads
+        await cleanup_pending_uploads()
+        await asyncio.to_thread(stop_diagnostics)
 
 
 async def _backfill_turn_counts() -> None:
@@ -895,6 +929,7 @@ app.include_router(workspaces_router)
 app.include_router(activity_router)
 app.include_router(terminal_router)
 app.include_router(todos_router)
+app.include_router(delivery_router)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1354,6 +1389,16 @@ def _safe_client_error_record(payload: object) -> dict[str, object] | None:
         record["reason_fp"] = reason_fp
     if trace_fp:
         record["trace_fp"] = trace_fp
+    for field in ("reason_fp", "trace_fp"):
+        value = payload.get(field)
+        if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{24}", value):
+            record[field] = value
+    for field in ("app_line", "app_column"):
+        if field in payload:
+            record[field] = _client_error_int(payload[field])
+    revision = payload.get("asset_revision")
+    if isinstance(revision, str) and re.fullmatch(r"[a-f0-9]{8,64}", revision):
+        record["asset_revision"] = revision
     last_fetch = payload.get("lastFetch")
     if isinstance(last_fetch, dict):
         method = str(last_fetch.get("method") or "").upper()
@@ -1385,18 +1430,30 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
         return min(100_000_000, max(0, value))
 
     allowed_fields = {
-        "status", "mode", "foreground", "total_ms", "fetch_ms", "parse_ms",
+        "status", "mode", "foreground", "visibility", "cancel_reason",
+        "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms",
         "shape_ms", "markdown_ms", "install_ms", "response_bytes",
         "block_count", "assistant_blocks", "long_task_count", "longest_task_ms",
     }
     if any(name not in allowed_fields for name in payload):
         return JSONResponse(
             {"ok": False, "error": "invalid_payload"}, status_code=422)
+    visibility = payload.get("visibility", "unknown")
+    cancel_reason = payload.get("cancel_reason", "none")
+    if (not isinstance(visibility, str) or not isinstance(cancel_reason, str)
+            or visibility not in {"visible", "hidden", "unknown"}
+            or cancel_reason not in {"none", "superseded", "live_owner",
+                                     "revision_changed", "anchor_missing", "aborted"}):
+        return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
     try:
         perf_event(
             "client.history_load",
             status=status,
             mode=mode,
+            visibility=visibility,
+            cancel_reason=cancel_reason,
+            receive_ms=bounded_int("receive_ms"),
+            first_reveal_ms=bounded_int("first_reveal_ms"),
             foreground=bool(payload.get("foreground")),
             total_ms=bounded_int("total_ms"),
             fetch_ms=bounded_int("fetch_ms"),

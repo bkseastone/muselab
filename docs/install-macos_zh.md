@@ -7,6 +7,8 @@
 
 ## 环境要求
 
+- Xcode Command Line Tools（状态栏 helper 需要 Swift）：`xcode-select --install`。安装器会在修改配置前检查编译器。
+
 - macOS 12（Monterey）或更高（Apple Silicon 或 Intel）
 - `uv`（[安装文档](https://docs.astral.sh/uv/getting-started/installation/)）：
   ```bash
@@ -69,9 +71,8 @@ grep MUSELAB_TOKEN .env               # 登录时粘贴
 
 会——plist 内 `RunAtLoad=true`，登录后 launchd 自动拉起 agent，无需额外配置。
 
-如果你想**登录前**就启动（罕见场景，比如 headless Mac mini），把它从
-`LaunchAgents` 移到 `LaunchDaemons` 并以 root 运行——超出安装脚本的范围；
-需要时参见[排错](troubleshooting_zh.md)或提 [GitHub issue](https://github.com/hesorchen/muselab/issues)。
+登录前启动需要单独配置 LaunchDaemon 与专用的非 root 服务用户，超出当前
+用户级安装器范围。不要为此让拥有工作区和终端权限的服务以 root 运行。
 
 ## 常用命令
 

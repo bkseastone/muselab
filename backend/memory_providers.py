@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+import time
 import json
 import logging
 import math
@@ -34,6 +38,32 @@ def _safe_http_url(raw: str) -> str:
     return value
 
 
+_DEFAULT_REQUEST_BUDGET = object()
+_recall_deadline = ContextVar("memory_recall_deadline", default=_DEFAULT_REQUEST_BUDGET)
+
+
+@contextmanager
+def recall_request_budget(deadline: float | None):
+    """Override adapter timers for recall only; background jobs keep theirs."""
+    token = _recall_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _recall_deadline.reset(token)
+
+
+def _request_timeout(configured: float) -> float | None:
+    deadline = _recall_deadline.get()
+    if deadline is _DEFAULT_REQUEST_BUDGET:
+        return configured
+    if deadline is None:
+        return None
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise TimeoutError("memory recall deadline exceeded")
+    return remaining
+
+
 class EmbeddingProvider:
     def __init__(self, config: EmbeddingConfig):
         self.config = config
@@ -50,7 +80,7 @@ class EmbeddingProvider:
         vectors: list[list[float]] = []
         batch_size = max(1, int(self.config.batch_size))
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_seconds)
+            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
         ) as client:
             for start in range(0, len(texts), batch_size):
                 chunk = texts[start:start + batch_size]
@@ -133,7 +163,7 @@ class QdrantVectorStore(VectorStore):
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_seconds)
+            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
         ) as client:
             response = await client.request(
                 method, f"{self.base}{path}", headers=self.headers, **kwargs)
@@ -198,7 +228,8 @@ class QdrantVectorStore(VectorStore):
         )
         body = response.json()
         result = body.get("result", {})
-        points = result.get("points", result if isinstance(result, list) else [])
+        points = (result.get("points", []) if isinstance(result, dict) else
+                  result if isinstance(result, list) else [])
         return [{
             "id": (point.get("payload") or {}).get("memory_id"),
             "score": float(point.get("score", 0)),
@@ -301,17 +332,25 @@ class PgVectorStore(VectorStore):
 
     async def search(self, vector: list[float], *, owner_id: str,
                      limit: int) -> list[dict]:
-        def run():
-            with self._connect() as conn:
-                rows = conn.execute(
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise RuntimeError(
+                "pgvector requires the optional psycopg[binary] dependency") from exc
+        timeout = _request_timeout(self.config.timeout_seconds)
+        async with asyncio.timeout(timeout):
+            async with await psycopg.AsyncConnection.connect(
+                self.config.url, connect_timeout=0,
+            ) as conn:
+                cursor = await conn.execute(
                     f"""SELECT id,payload,1-(embedding <=> %s::vector) AS score
                         FROM {self.table} WHERE owner_id=%s AND status='active'
                         ORDER BY embedding <=> %s::vector LIMIT %s""",
                     (json.dumps(vector), owner_id, json.dumps(vector), limit),
-                ).fetchall()
+                )
+                rows = await cursor.fetchall()
                 return [{"id": row[0], "payload": row[1],
                          "score": float(row[2]), "channel": "dense"} for row in rows]
-        return await asyncio.to_thread(run)
 
     async def delete(self, item_id: str) -> None:
         def run():
@@ -344,7 +383,7 @@ class Reranker:
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout_seconds)
+            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
         ) as client:
             response = await client.post(url, headers=headers, json={
                 "model": self.config.model, "query": query,
@@ -505,12 +544,17 @@ def _classify_sdk_result_error(message: Any) -> tuple[bool, str, int | None]:
     return False, "generation_failure", None
 
 
+generation_job_ref: ContextVar[str] = ContextVar("memory_generation_job_ref", default="")
+
+_generation_phases: ContextVar[dict | None] = ContextVar("memory_generation_phases", default=None)
+
+
 class GenerationError(RuntimeError):
     """Sanitized generation failure carrying only retry/log metadata."""
 
     def __init__(self, *, retryable: bool, provider: str = "", model: str = "",
                  api_error_status: int | None = None,
-                 category: str | None = None):
+                 category: str | None = None, reason: str = "unknown"):
         category = category or (
             "transient_provider" if retryable else "generation_failure")
         super().__init__(category)
@@ -519,6 +563,11 @@ class GenerationError(RuntimeError):
         self.model = model
         self.api_error_status = api_error_status
         self.category = category
+        self.reason = reason if reason in {
+            "unknown", "timeout", "transport_error", "http_error", "sdk_exception",
+            "sdk_result_error", "missing_terminal", "empty_output", "invalid_json",
+            "non_object_json", "configuration", "exception",
+        } else "unknown"
 
 
 class GenerationProvider:
@@ -568,12 +617,23 @@ class GenerationProvider:
                        max_tokens: int = 3000) -> str:
         provider, configured_model = self.metadata()
         timeout = generation_timeout_seconds()
+        started = time.perf_counter()
+        route_kind, outcome, reason, cause_kind = "unresolved", "error", "unknown", "none"
+        response_chars = 0
+        phases = {"phase": "routing"}
+        phase_token = _generation_phases.set(phases)
         try:
             async with asyncio.timeout(timeout):
                 route = self._route()
                 if route is None:
-                    return await self._complete_with_sdk(system, prompt)
+                    route_kind = "ducc" if configured_model.startswith("ducc:") else "sdk"
+                    phases["phase"] = "awaiting_sdk_event"
+                    result = await self._complete_with_sdk(system, prompt)
+                    response_chars, outcome = len(result), "done"
+                    return result
+                route_kind = "http"
                 url, key, model = route
+                phases["phase"] = "http_response"
                 payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
                            "system": system,
                            "messages": [{"role": "user", "content": prompt}]}
@@ -605,7 +665,7 @@ class GenerationProvider:
                             provider=provider,
                             model=configured_model,
                             api_error_status=response.status_code,
-                            category="malformed_response",
+                            category="malformed_response", reason="invalid_json",
                         ) from exc
                 if not isinstance(body, dict) or not isinstance(body.get("content"), list):
                     raise GenerationError(
@@ -613,7 +673,7 @@ class GenerationProvider:
                         provider=provider,
                         model=configured_model,
                         api_error_status=response.status_code,
-                        category="malformed_response",
+                        category="malformed_response", reason="empty_output",
                     )
                 blocks = body["content"]
                 text_blocks = [block.get("text") for block in blocks
@@ -627,18 +687,39 @@ class GenerationProvider:
                         provider=provider,
                         model=configured_model,
                         api_error_status=response.status_code,
-                        category="malformed_response",
+                        category="malformed_response", reason="empty_output",
                     )
-                return "".join(text_blocks)
+                result = "".join(text_blocks)
+                phases["phase"] = "complete"
+                phases["response_ms"] = round((time.perf_counter() - started) * 1000)
+                response_chars, outcome = len(result), "done"
+                return result
         except asyncio.CancelledError:
+            outcome, reason = "cancelled", "unknown"
             raise
-        except GenerationError:
+        except GenerationError as exc:
+            reason = exc.reason
             raise
         except Exception as exc:
             status = _generation_error_status(exc)
+            reason = (
+                "timeout" if isinstance(exc, (TimeoutError, httpx.TimeoutException))
+                else "transport_error" if isinstance(exc, httpx.TransportError)
+                else "http_error" if status is not None
+                else "sdk_exception" if _sdk_error_names(exc)
+                else "configuration" if isinstance(exc, ValueError)
+                else "exception")
+            name = type(exc).__name__
+            cause_kind = name if name in {
+                "TimeoutError", "ConnectTimeout", "ReadTimeout", "WriteTimeout",
+                "PoolTimeout", "ConnectError", "ReadError", "WriteError",
+                "RemoteProtocolError", "HTTPStatusError",
+                *_SDK_RETRYABLE_ERROR_NAMES, *_SDK_TERMINAL_ERROR_NAMES,
+            } else "OtherError"
             retryable = is_retryable_generation_error(exc)
             raise GenerationError(
                 retryable=retryable,
+                reason=reason,
                 provider=provider,
                 model=configured_model,
                 api_error_status=status,
@@ -650,6 +731,18 @@ class GenerationProvider:
                         else "generation_failure")
                 ),
             ) from exc
+
+        finally:
+            from .observability import perf_event
+            perf_event(
+                "memory.generation", job_ref=generation_job_ref.get(), route=route_kind, outcome=outcome,
+                reason=reason, cause_kind=cause_kind,
+                model_ref=hashlib.sha256(configured_model.encode()).hexdigest()[:12],
+                timeout_seconds=timeout, response_chars=response_chars,
+                duration_ms=round((time.perf_counter() - started) * 1000),
+                **phases,
+            )
+            _generation_phases.reset(phase_token)
 
     async def _complete_with_sdk(self, system: str, prompt: str) -> str:
         from claude_agent_sdk import ClaudeAgentOptions, query
@@ -695,53 +788,90 @@ class GenerationProvider:
             include_partial_messages=False,
             **options_kwargs,
         )
+        phases = _generation_phases.get()
+        sdk_started = time.perf_counter()
+        result_at = None
         parts: list[str] = []
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content or []:
-                    if isinstance(block, TextBlock):
-                        parts.append(block.text or "")
-            elif isinstance(message, ResultMessage) and message.is_error:
-                retryable, category, status = _classify_sdk_result_error(message)
-                provider, model = self.metadata()
-                raise GenerationError(
-                    retryable=retryable,
-                    provider=provider,
-                    model=model,
-                    api_error_status=status,
-                    category=category,
-                )
-        text = "".join(parts)
+        final_text = ""
+        completed = False
+        terminal_error = None
+        # ResultMessage may contain the only final answer. Drain the public
+        # query iterator before returning/raising: its nested SDK generators
+        # own subprocess cleanup, which an early break can defer until GC.
+        from contextlib import aclosing
+        async with aclosing(query(prompt=prompt, options=options)) as messages:
+            async for message in messages:
+                if phases is not None and phases["phase"] == "awaiting_sdk_event":
+                    phases["first_event_ms"] = round((time.perf_counter() - sdk_started) * 1000)
+                    phases["phase"] = "awaiting_sdk_result"
+                if completed:
+                    continue
+                if isinstance(message, AssistantMessage):
+                    for block in message.content or []:
+                        if isinstance(block, TextBlock):
+                            if phases is not None and "first_output_ms" not in phases:
+                                phases["first_output_ms"] = round((time.perf_counter() - sdk_started) * 1000)
+                            parts.append(block.text or "")
+                elif isinstance(message, ResultMessage):
+                    completed = True
+                    result_at = time.perf_counter()
+                    if phases is not None:
+                        phases["result_ms"] = round((result_at - sdk_started) * 1000)
+                        phases["phase"] = "sdk_cleanup"
+                    if message.is_error:
+                        retryable, category, status = _classify_sdk_result_error(message)
+                        provider, model = self.metadata()
+                        terminal_error = GenerationError(
+                            retryable=retryable, provider=provider, model=model,
+                            api_error_status=status, category=category, reason="sdk_result_error")
+                    elif isinstance(message.result, str):
+                        final_text = message.result
+        if phases is not None and result_at is not None:
+            phases["cleanup_ms"] = round((time.perf_counter() - result_at) * 1000)
+            phases["phase"] = "complete"
+        if terminal_error is not None:
+            raise terminal_error
+        if not completed:
+            provider, model = self.metadata()
+            raise GenerationError(retryable=True, provider=provider, model=model,
+                                  category="transient_provider", reason="missing_terminal")
+        text = final_text if final_text.strip() else "".join(parts)
         if not text.strip():
             provider, model = self.metadata()
             raise GenerationError(
                 retryable=False, provider=provider, model=model,
-                category="malformed_response")
+                category="malformed_response", reason="empty_output")
         return text
 
     async def complete_json(self, system: str, prompt: str) -> dict:
-        text = (await self.complete(system, prompt)).strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        try:
+        # A syntactically valid array/string is still the wrong schema. Make
+        # one bounded format-repair attempt instead of losing the job at once.
+        instruction = "\nReturn exactly one JSON object. No arrays, quoted JSON, Markdown or prose."
+        for attempt in range(2):
+            text = (await self.complete(system + instruction, prompt)).strip()
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            reason = "invalid_json"
             try:
-                value = json.loads(text)
+                try:
+                    value = json.loads(text)
+                except json.JSONDecodeError:
+                    start, end = text.find("{"), text.rfind("}")
+                    if start < 0 or end <= start:
+                        raise
+                    value = json.loads(text[start:end + 1])
+                if isinstance(value, dict):
+                    return value
+                reason = "non_object_json"
             except json.JSONDecodeError:
-                start, end = text.find("{"), text.rfind("}")
-                if start < 0 or end <= start:
-                    raise
-                value = json.loads(text[start:end + 1])
-        except json.JSONDecodeError as exc:
-            provider, model = self.metadata()
-            raise GenerationError(
-                retryable=False, provider=provider, model=model,
-                category="malformed_response") from exc
-        if not isinstance(value, dict):
-            provider, model = self.metadata()
-            raise GenerationError(
-                retryable=False, provider=provider, model=model,
-                category="malformed_response")
-        return value
+                pass
+            from .observability import perf_event
+            perf_event("memory.generation_format", job_ref=generation_job_ref.get(),
+                       reason=reason, attempt=attempt + 1, retrying=attempt == 0)
+            instruction += "\nThe prior response had the wrong format. Follow the requested object schema strictly."
+        provider, model = self.metadata()
+        raise GenerationError(retryable=False, provider=provider, model=model,
+                              category="malformed_response", reason=reason)
 
     async def probe(self) -> dict:
         value = await self.complete_json(
