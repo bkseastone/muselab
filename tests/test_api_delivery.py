@@ -121,7 +121,7 @@ def test_preview_rejects_active_or_scheduled_writers(
     elif busy == "queue":
         monkeypatch.setattr(sessions, "get_queue", lambda _sid: {"items": [{"id": "pending"}]})
     elif busy == "cron":
-        f.chat._sdk_cron_jobs[f.sid] = [{"id": "cron"}]
+        f.chat._sdk_cron_jobs[f.sid] = {"cron": {"runtime_state": "active"}}
     else:
         f.chat._pending_runtime_rebuilds.add(f.sid)
     try:

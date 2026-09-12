@@ -7,8 +7,10 @@ and exposes failure through its existing EOF/canonical-recovery path.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import dataclasses
 import sys
+import re
 import time
 import weakref
 from typing import Any
@@ -56,11 +58,23 @@ def estimated_size(value: Any, limit: int = MAX_BYTES) -> int:
     return size
 
 
+def message_kind(item: Any) -> str:
+    """Describe the SDK envelope only, never its prompt or output."""
+    name = type(item).__name__
+    subtype = getattr(item, "subtype", None)
+    if isinstance(subtype, str) and re.fullmatch(r"[a-z_]{1,48}", subtype):
+        return f"{name}:{subtype}"
+    return name if re.fullmatch(r"[A-Za-z_]{1,64}", name) else "unknown"
+
+
 class RuntimeMessageQueue(asyncio.Queue):
     def __init__(self, *, lane: str, eof: Any = _NO_EOF,
-                 max_events: int | None = None, max_bytes: int | None = None):
+                 max_events: int | None = None, max_bytes: int | None = None,
+                 session_id: str = ""):
         super().__init__()
         self.lane = lane
+        self.session_id = session_id[:8]
+        self.message_kinds: Counter[str] = Counter()
         self.eof = eof
         self.max_events = MAX_EVENTS if max_events is None else max_events
         self.max_bytes = MAX_BYTES if max_bytes is None else max_bytes
@@ -78,9 +92,12 @@ class RuntimeMessageQueue(asyncio.Queue):
             _overflows += 1
             obs.perf_event('chat.runtime_buffer_exceeded', lane=self.lane,
                            depth=self.qsize(), estimated_bytes=self.estimated_bytes,
-                           incoming_bytes=size)
+                           incoming_bytes=size, session=self.session_id,
+                           incoming_kind=message_kind(item), oldest_ms=self.oldest_ms,
+                           envelope_counts=dict(self.message_kinds.most_common(12)))
             raise RuntimeBufferExceeded()
         super().put_nowait((item, size, time.monotonic()))
+        self.message_kinds[message_kind(item)] += 1
         self.estimated_bytes += size
         self.peak_depth = max(self.peak_depth, self.qsize())
         self.peak_bytes = max(self.peak_bytes, self.estimated_bytes)
@@ -91,6 +108,10 @@ class RuntimeMessageQueue(asyncio.Queue):
         global _max_wait_ms
         item, size, enqueued = super().get_nowait()
         self.estimated_bytes -= size
+        kind = message_kind(item)
+        self.message_kinds[kind] -= 1
+        if self.message_kinds[kind] <= 0:
+            del self.message_kinds[kind]
         wait_ms = max(0, round((time.monotonic() - enqueued) * 1000))
         self.max_wait_ms = max(self.max_wait_ms, wait_ms)
         _max_wait_ms = max(_max_wait_ms, wait_ms)
@@ -103,9 +124,9 @@ class RuntimeMessageQueue(asyncio.Queue):
 
 class RuntimeMessageDeque:
     """Deque facade that refuses overflow instead of silently evicting messages."""
-    def __init__(self, *, maxlen: int, lane: str):
+    def __init__(self, *, maxlen: int, lane: str, session_id: str = ""):
         self.maxlen = maxlen
-        self.queue = RuntimeMessageQueue(lane=lane, max_events=maxlen)
+        self.queue = RuntimeMessageQueue(lane=lane, max_events=maxlen, session_id=session_id)
 
     def append(self, item: Any) -> None:
         self.queue.put_nowait(item)

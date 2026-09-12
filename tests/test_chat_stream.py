@@ -4142,6 +4142,7 @@ def test_turn_does_not_consume_buffered_continuation(stream_env):
     async def exercise():
         stream = chat_mod._SessionStream.__new__(chat_mod._SessionStream)
         # Build the routing state directly; a real pump needs a live CLI.
+        stream.key = ("buffered-continuation", "model", "auto", "")
         stream._turn = None
         stream._background = None
         stream._orphans = collections.deque(maxlen=8)
@@ -7073,7 +7074,12 @@ def test_native_cron_tools_update_live_schedule_state(stream_env):
             "scheduled_active": True,
             "scheduled_count": 1,
         }
-        assert chat_mod._sdk_cron_jobs[sid] == {
+        row = chat_mod._sdk_cron_jobs[sid]["93d1bb35"]
+        assert row["runtime_state"] == "active"
+        assert row["model"] == key[1]
+        assert {"93d1bb35": {field: row[field] for field in (
+            "cron", "recurring", "durable", "prompt", "prompt_sha256", "prompt_truncated",
+        )}} == {
             "93d1bb35": {
                 "cron": "7 * * * *",
                 "recurring": True,

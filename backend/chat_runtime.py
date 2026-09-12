@@ -338,7 +338,7 @@ class SessionStream:
         self.client = client
         self._turn: asyncio.Queue | None = None
         self._background: asyncio.Queue | None = None
-        self._orphans = RuntimeMessageDeque(maxlen=self._ORPHAN_MAX, lane="orphan")
+        self._orphans = RuntimeMessageDeque(maxlen=self._ORPHAN_MAX, lane="orphan", session_id=key[0])
         self._closed = False
         self._failure: Exception | None = None
         self.task: asyncio.Task = asyncio.create_task(self._pump())
@@ -348,7 +348,7 @@ class SessionStream:
             queue.put_nowait(self._orphans.popleft())
 
     def attach_turn(self) -> asyncio.Queue:
-        queue: asyncio.Queue = RuntimeMessageQueue(lane="turn", eof=STREAM_EOF)
+        queue: asyncio.Queue = RuntimeMessageQueue(lane="turn", eof=STREAM_EOF, session_id=self.key[0])
         self._turn = queue
         return queue
 
@@ -392,7 +392,7 @@ class SessionStream:
             raise
 
     def attach_background(self) -> asyncio.Queue:
-        queue: asyncio.Queue = RuntimeMessageQueue(lane="background", eof=STREAM_EOF)
+        queue: asyncio.Queue = RuntimeMessageQueue(lane="background", eof=STREAM_EOF, session_id=self.key[0])
         self._background = queue
         self._adopt_orphans(queue)
         return queue
@@ -504,8 +504,6 @@ async def _evict_failed_session_stream_owned(stream: SessionStream) -> None:
                 CLIENT_LRU.remove(key)
         if SESSION_STREAMS.get(key) is stream:
             SESSION_STREAMS.pop(key, None)
-    if notify_disconnected:
-        _require_hooks().session_runtime_disconnected(key[0])
     if isinstance(stream._failure, RuntimeBufferExceeded):
         interrupt = getattr(client, "interrupt", None)
         if callable(interrupt):
@@ -527,6 +525,10 @@ async def _evict_failed_session_stream_owned(stream: SessionStream) -> None:
             f"exc={type(exc).__name__}\n"
         )
         sys.stderr.flush()
+    finally:
+        # Recovery is admitted only after exact-client cleanup is registered.
+        if notify_disconnected:
+            _require_hooks().session_runtime_disconnected(key[0])
 
 
 async def drop_session_streams(session_id: str) -> None:
@@ -675,7 +677,6 @@ async def disconnect_client(session_id: str) -> None:
     to_disconnect: list[ClaudeSDKClient] = []
     hooks.pending_runtime_rebuilds.discard(session_id)
     await drop_session_streams(session_id)
-    hooks.session_runtime_disconnected(session_id)
     async with CLIENT_LOCK:
         keys = [key for key in CLIENTS if key[0] == session_id]
         for key in keys:
@@ -687,10 +688,13 @@ async def disconnect_client(session_id: str) -> None:
                 CLIENT_LRU.remove(key)
             if client is not None:
                 to_disconnect.append(client)
-    if not await hooks.join_session_disconnects(session_id, to_disconnect):
-        raise RuntimeCleanupTimeout(
-            "session runtime cleanup did not finish; retry the operation"
-        )
+    try:
+        if not await hooks.join_session_disconnects(session_id, to_disconnect):
+            raise RuntimeCleanupTimeout(
+                "session runtime cleanup did not finish; retry the operation"
+            )
+    finally:
+        hooks.session_runtime_disconnected(session_id)
 
 
 async def disconnect_background_task_owner(
