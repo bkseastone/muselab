@@ -7082,8 +7082,12 @@
           </div>
           <div class="sched-native-note"
                x-text="lang==='zh'
-                 ? '由 Claude SDK Cron 工具管理；任务随该会话的 Claude 运行环境存在。'
-                 : 'Managed by Claude SDK Cron tools and owned by this session runtime.'"></div>
+                 ? '计划由 Claude 执行；MuseLab 保存任务记录并在断开后恢复会话。恢复状态以实际任务确认和执行记录为准。'
+                 : 'Claude runs the schedules. MuseLab retains receipts and resumes disconnected sessions; task confirmation and execution evidence determine recovery status.'"></div>
+          <button type="button" class="btn-text sm"
+                  x-show="scheduler.nativeTasks.some(task => ['interrupted', 'recovery_failed', 'paused'].includes(task.runtime_state))"
+                  :disabled="scheduler.nativeLoading" @click="recoverNativeScheduledTasks()"
+                  x-text="lang==='zh' ? '恢复任务会话' : 'Resume task session'"></button>
           <div class="sched-native-loading" x-show="scheduler.nativeLoading"
                x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
           <div class="sched-native-error"
@@ -7105,9 +7109,15 @@
                     ? (lang==='zh' ? '循环' : 'recurring')
                     : (lang==='zh' ? '一次' : 'one-time')"></span>
                 </div>
+                <div class="sched-native-state" x-text="nativeScheduledStatus(task)"></div>
                 <div class="sched-native-prompt" x-text="task.prompt || '—'"></div>
+                <div class="sched-native-outcome" x-show="nativeScheduledOutcome(task)"
+                     x-text="nativeScheduledOutcome(task)"></div>
                 <div class="sched-native-meta">
                   <span class="mono" x-text="task.job_id"></span>
+                  <span x-text="task.durable
+                    ? (lang==='zh' ? 'CLI 已确认持久化' : 'CLI confirmed persistence')
+                    : (lang==='zh' ? '会话内计划' : 'Session-scoped')"></span>
                   <span x-show="task.prompt_truncated"
                         x-text="lang==='zh' ? '已截断显示' : 'preview truncated'"></span>
                 </div>

@@ -459,6 +459,7 @@ def test_native_cron_jobs_have_authenticated_read_only_inspector(
         assert payload == {
             "session_id": sid,
             "runtime_owned": True,
+            "scheduled_active": True,
             "count": 1,
             "tasks": [{
                 "job_id": "job-a",

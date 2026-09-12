@@ -600,6 +600,7 @@ async def _lifespan(app: FastAPI):
         # All queue/attachment recovery and runtime projections are committed.
         # Resume only unstarted items; review-only records cannot be claimed.
         _chat._queue_runtime_closing = False
+        await _chat.recover_native_cron_at_startup()
         queue_sids = await _asyncio.to_thread(_sess.list_queue_session_ids)
         for sid in queue_sids:
             queue = await _asyncio.to_thread(_sess.get_queue, sid)

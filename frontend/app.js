@@ -37880,7 +37880,10 @@ function portal() {
         if (seq !== this.scheduler.nativeLoadSeq) return false;
         const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
         this.scheduler.nativeTasks = tasks;
-        this._setScheduledTaskState(sid, tasks.length > 0, tasks.length);
+        this._setScheduledTaskState(sid,
+          payload.scheduled_active ?? tasks.some(task =>
+            ["active", "recovering", "unconfirmed"].includes(task.runtime_state || "active")),
+          tasks.length);
         return true;
       } catch (_) {
         if (seq !== this.scheduler.nativeLoadSeq) return false;
@@ -37892,6 +37895,50 @@ function portal() {
         if (seq === this.scheduler.nativeLoadSeq) {
           this.scheduler.nativeLoading = false;
         }
+      }
+    },
+    nativeScheduledStatus(task) {
+      const states = this.lang === "zh" ? {
+        active: "计划有效", interrupted: "运行环境已断开", recovering: "正在恢复会话",
+        unconfirmed: "会话已恢复，任务待确认", missing: "原生计划未恢复",
+        recovery_failed: "会话恢复失败", paused: "已暂停", expired: "已到期",
+        finished: "本次计划已结束",
+      } : {
+        active: "Scheduled", interrupted: "Runtime disconnected", recovering: "Resuming session",
+        unconfirmed: "Session resumed; schedule unconfirmed", missing: "Native schedule missing",
+        recovery_failed: "Session recovery failed", paused: "Paused", expired: "Expired",
+        finished: "One-shot finished",
+      };
+      return states[task.runtime_state || "active"] || (this.lang === "zh" ? "状态待确认" : "Unconfirmed");
+    },
+    nativeScheduledOutcome(task) {
+      if (task.last_execution_status === "not_executed" || task.last_error === "not_executed") return this.lang === "zh"
+        ? "上次触发未获得有效执行结果" : "Last trigger had no execution evidence";
+      if (task.record_saved === false) return this.lang === "zh"
+        ? "任务记录保存失败，恢复尚无保障" : "Receipt could not be saved; recovery is unavailable";
+      if (!task.last_finished_at_ms) return "";
+      const when = new Date(task.last_finished_at_ms).toLocaleString();
+      const outcome = task.last_status === "completed"
+        ? (this.lang === "zh" ? "回复完成" : "Response completed")
+        : (this.lang === "zh" ? "执行失败或中断" : "Failed or interrupted");
+      const tools = Math.max(0, Number(task.tool_results) || 0);
+      return `${when} · ${outcome} · ${this.lang === "zh" ? "工具结果" : "Tool results"} ${tools}`;
+    },
+    async recoverNativeScheduledTasks() {
+      const sid = this.scheduler.nativeSessionId;
+      if (!sid || this.scheduler.nativeLoading) return;
+      this.scheduler.nativeLoading = true;
+      this.scheduler.nativeError = "";
+      try {
+        const response = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/scheduled-tasks/recover`,
+          { method: "POST", headers: this.hdr() });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        await this.loadNativeScheduledTasks(sid);
+      } catch (_) {
+        this.scheduler.nativeError = this.lang === "zh"
+          ? "恢复未能开始，请检查任务状态" : "Recovery could not start; check the task status";
+      } finally {
+        this.scheduler.nativeLoading = false;
       }
     },
     openNativeScheduledTasks(sessionId, event = null) {

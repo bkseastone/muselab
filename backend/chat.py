@@ -1760,13 +1760,19 @@ _sdk_cron_tool_calls: dict[
     chat_runtime.ClientKey, dict[str, dict[str, Any]]
 ] = {}
 _sdk_cron_state_lock = threading.RLock()
+_native_cron_recovery_tasks: dict[str, asyncio.Task] = {}
+_native_cron_write_tasks: set[asyncio.Task] = set()
+_native_cron_recovery_suppressed: set[str] = set()
+_NATIVE_CRON_LIVE_STATES = {"active", "recovering", "unconfirmed"}
+_native_cron_recovery_slots = asyncio.Semaphore(2)
+
 _SDK_CRON_JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SDK_CRON_CREATE_RESULT = re.compile(
-    r"Scheduled\s+(?:recurring|one-time)\s+job\s+([A-Za-z0-9_-]{1,128})",
+    r"Scheduled\s+(?:recurring|one-time|one-shot)\s+(?:job|task)\s+(?P<job_id>[A-Za-z0-9_-]{1,128})",
     re.IGNORECASE,
 )
 _SDK_CRON_DELETE_RESULT = re.compile(
-    r"Cancelled\s+job\s+([A-Za-z0-9_-]{1,128})",
+    r"Cancel(?:led|ed)\s+(?:job|task)\s+([A-Za-z0-9_-]{1,128})",
     re.IGNORECASE,
 )
 _SDK_CRON_LIST_LINE = re.compile(
@@ -1799,6 +1805,10 @@ class _ScheduledDelivery:
     subagent_mux: Any = None
     registration_task: asyncio.Task | None = None
     job_id: str = ""
+    model_response: bool = False
+    synthetic_response: bool = False
+    tool_calls: set[str] = dataclass_field(default_factory=set)
+    tool_results: set[str] = dataclass_field(default_factory=set)
 
 
 _sdk_scheduled_deliveries: dict[
@@ -3618,6 +3628,10 @@ async def _build_and_connect_client(
         },
     )
     if not side_question_runtime:
+        for event in ("Stop", "SessionStart"):
+            opts_kwargs["hooks"].setdefault(event, []).append(HookMatcher(
+                hooks=[_native_cron_inventory_hook(session_id)], timeout=10,
+            ))
         for event, matcher in task_delivery.build_hooks(session_id, workspace_root).items():
             opts_kwargs["hooks"].setdefault(event, []).append(matcher)
         if not is_ducc:
@@ -4330,6 +4344,18 @@ async def shutdown_runtime() -> None:
     chat_search.shutdown()
     global _queue_runtime_closing
     _queue_runtime_closing = True
+    current_loop = asyncio.get_running_loop()
+    recoveries = tuple(task for task in _native_cron_recovery_tasks.values()
+                       if task.get_loop() is current_loop and not task.done())
+    for task in recoveries:
+        task.cancel()
+    if recoveries:
+        await asyncio.gather(*recoveries, return_exceptions=True)
+    await asyncio.gather(*(task for task in tuple(_native_cron_write_tasks)
+                           if task.get_loop() is current_loop), return_exceptions=True)
+    _native_cron_recovery_tasks.clear()
+    _native_cron_write_tasks.clear()
+    _native_cron_recovery_suppressed.clear()
 
     # Stop detached task watchers and active turn pumps before tearing down the
     # shared SDK streams they consume.
@@ -4428,6 +4454,12 @@ async def shutdown_runtime() -> None:
 
     _active_turns.clear()
     _sdk_scheduled_deliveries.clear()
+    for sid in tuple(_sdk_cron_jobs):
+        with _sdk_cron_state_lock:
+            for raw in _sdk_cron_jobs.get(sid, {}).values():
+                if raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES:
+                    raw["runtime_state"] = "interrupted"
+        await _persist_native_cron_state(sid)
     with _sdk_cron_state_lock:
         _sdk_cron_jobs.clear()
         _sdk_cron_tool_calls.clear()
@@ -5284,7 +5316,9 @@ def list_sessions_api(
             for sid, jobs in _sdk_cron_jobs.items()
             if jobs
         }
-    scheduled_active_sids = set(scheduled_counts)
+    scheduled_active_sids = {
+        sid for sid in scheduled_counts if _sdk_scheduled_snapshot(sid)["scheduled_active"]
+    }
     active_sids = turn_active_sids | background_active_sids
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
@@ -7458,6 +7492,8 @@ def _purge_session_storage_disk_locked(sid: str) -> bool:
     with hook_traces._trace_lock(sid):
         _hook_diagnostic_generations[sid] = _hook_diagnostic_generations.get(sid, 0) + 1
         hook_traces.purge(sid)
+        from . import native_cron
+        native_cron.purge(sid)
     from . import submissions
     submissions.purge(sid)
     return removed
@@ -10833,6 +10869,11 @@ async def native_clear_session_api(sid: str) -> dict:
                 # new Claude conversation.  It must never be reused under that
                 # stale key, even if the browser keeps the old tab open.
                 _pending_runtime_rebuilds.add(sid)
+                _native_cron_recovery_suppressed.add(sid)
+                with _sdk_cron_state_lock:
+                    for raw in _sdk_cron_jobs.get(sid, {}).values():
+                        raw.update(runtime_state="paused", last_error="conversation_cleared")
+                await _persist_native_cron_state(sid)
                 await disconnect_client(sid)
     except HTTPException:
         raise
@@ -17105,7 +17146,8 @@ async def _start_turn(
                         and _is_codex_gateway_model(model_to_use)
                         and not _sessions_with_inflight_tasks.get(session_id)
                         and not _session_has_live_watcher(session_id)
-                        and not _session_has_scheduled_delivery(session_id)):
+                        and not _session_has_scheduled_delivery(session_id)
+                        and not _session_has_scheduled_tasks(session_id)):
                     obs.diagnostic_line(
                         f"[chat-preflight] rebuilding stalled Codex runtime "
                         f"sid={session_id[:8]} model={model_to_use} "
@@ -20665,11 +20707,213 @@ hook_settings.configure_runtime_invalidator(
     _invalidate_hook_setting_runtimes)
 
 
+async def _persist_native_cron_state(session_id: str, snapshot: dict | None = None,
+                                     revision: int | None = None) -> bool:
+    from . import native_cron
+    if snapshot is None:
+        with _sdk_cron_state_lock:
+            snapshot = {job_id: dict(raw) for job_id, raw in _sdk_cron_jobs.get(session_id, {}).items()}
+    revision = revision or time.time_ns()
+    snapshot = {job_id: {**raw, "record_saved": True,
+                         **({"last_error": ""} if raw.get("last_error") == "receipt_write_failed" else {})}
+                for job_id, raw in snapshot.items()}
+
+    def write() -> bool:
+        with sess.session_lifecycle_lock(session_id):
+            if sess.session_is_deleting(session_id) or sess.get_session_meta(session_id) is None:
+                return False
+            native_cron.save(session_id, snapshot, revision)
+            return True
+    try:
+        saved = await obs.to_thread_io("chat.native_cron_receipt", session_id, write)
+        if saved:
+            with _sdk_cron_state_lock:
+                for job_id, raw in _sdk_cron_jobs.get(session_id, {}).items():
+                    if job_id in snapshot:
+                        raw["record_saved"] = True
+                        if raw.get("last_error") == "receipt_write_failed":
+                            raw["last_error"] = ""
+        return saved
+    except Exception as exc:
+        with _sdk_cron_state_lock:
+            for raw in _sdk_cron_jobs.get(session_id, {}).values():
+                raw["record_saved"] = False
+                raw["last_error"] = "receipt_write_failed"
+        obs.diagnostic_line(f"[native-cron] receipt write failed sid={session_id[:8]} exc={type(exc).__name__}\n")
+        return False
+
+
+def _queue_native_cron_write(session_id: str) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    with _sdk_cron_state_lock:
+        snapshot = {job_id: dict(raw) for job_id, raw in _sdk_cron_jobs.get(session_id, {}).items()}
+    task = loop.create_task(_persist_native_cron_state(session_id, snapshot, time.time_ns()))
+    _native_cron_write_tasks.add(task)
+    task.add_done_callback(_native_cron_write_tasks.discard)
+
+
+def _schedule_native_cron_recovery(session_id: str) -> asyncio.Task | None:
+    if _queue_runtime_closing or session_id in _native_cron_recovery_suppressed:
+        return None
+    previous = _native_cron_recovery_tasks.get(session_id)
+    if previous is not None and not previous.done():
+        return previous
+    with _sdk_cron_state_lock:
+        if not any(raw.get("runtime_state") == "interrupted"
+                   for raw in _sdk_cron_jobs.get(session_id, {}).values()):
+            return None
+    try:
+        task = asyncio.get_running_loop().create_task(_recover_native_cron_runtime(session_id))
+    except RuntimeError:
+        return None
+    _native_cron_recovery_tasks[session_id] = task
+    def finished(done):
+        if _native_cron_recovery_tasks.get(session_id) is done:
+            _native_cron_recovery_tasks.pop(session_id, None)
+    task.add_done_callback(finished)
+    return task
+
+
+async def _recover_native_cron_runtime(session_id: str) -> None:
+    """Resume the owning conversation; never create jobs or duplicate a fire."""
+    async with _native_cron_recovery_slots:
+        for attempt, delay in enumerate((0.2, 2.0, 10.0), 1):
+            await asyncio.sleep(delay)
+            if _queue_runtime_closing or session_id in _native_cron_recovery_suppressed:
+                return
+            try:
+                async with _session_runtime_lock_for(session_id):
+                    meta = await obs.to_thread_io("chat.native_cron_owner", session_id,
+                                                 sess.get_session_meta, session_id)
+                    if meta is None or sess.session_is_deleting(session_id):
+                        return
+                    with _sdk_cron_state_lock:
+                        targets = [raw for raw in _sdk_cron_jobs.get(session_id, {}).values()
+                                   if raw.get("runtime_state") in {"interrupted", "recovering"}]
+                        if not targets:
+                            return
+                        for raw in targets:
+                            raw.update(runtime_state="recovering", recovery_attempts=attempt)
+                    # A user turn may already have resumed the same conversation.
+                    # Reuse it instead of changing its model/permission or reader.
+                    if not await _join_session_disconnects(session_id):
+                        raise RuntimeCleanupTimeout("native schedule cleanup pending")
+                    async with _lock:
+                        clients = [client for key, client in _clients.items() if key[0] == session_id]
+                    if not clients:
+                        if _session_runtime_busy(session_id):
+                            raise RuntimeError("session owner is still settling")
+                        kwargs = {"effort": meta.get("effort") or "auto",
+                                  "service_tier": meta.get("service_tier") or ""}
+                        permission = meta.get("permission") or "default"
+                        if permission == "plan":
+                            kwargs["plan_return_permission"] = meta.get("plan_return_permission") or "default"
+                        async with asyncio.timeout(90):
+                            await get_client(session_id, meta.get("model") or targets[0].get("model") or MODEL,
+                                             permission, **kwargs)
+                    with _sdk_cron_state_lock:
+                        if any(raw.get("runtime_state") == "interrupted"
+                               for raw in _sdk_cron_jobs.get(session_id, {}).values()):
+                            raise RuntimeError("native runtime ended during recovery")
+                        for raw in _sdk_cron_jobs.get(session_id, {}).values():
+                            if raw.get("runtime_state") == "recovering":
+                                raw.update(runtime_state="unconfirmed", recovered_at_ms=int(time.time() * 1000),
+                                           last_error="awaiting_native_confirmation")
+                    await _persist_native_cron_state(session_id)
+                    obs.perf_event("chat.native_cron_recovery", session=session_id[:8],
+                                   status="resumed", attempt=attempt)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                obs.perf_event("chat.native_cron_recovery", session=session_id[:8],
+                               status="retry" if attempt < 3 else "failed", attempt=attempt,
+                               error_kind=type(exc).__name__)
+        with _sdk_cron_state_lock:
+            for raw in _sdk_cron_jobs.get(session_id, {}).values():
+                if raw.get("runtime_state") in {"interrupted", "recovering"}:
+                    raw.update(runtime_state="recovery_failed", last_error="runtime_recovery_failed")
+        await _persist_native_cron_state(session_id)
+
+
+async def recover_native_cron_at_startup() -> int:
+    from . import native_cron
+    try:
+        receipts = await obs.to_thread_io("chat.native_cron_load", "startup", native_cron.load_all)
+    except Exception as exc:
+        obs.diagnostic_line(f"[native-cron] receipt recovery failed exc={type(exc).__name__}\n")
+        return 0
+    now = int(time.time() * 1000)
+    count = 0
+    for sid, jobs in receipts.items():
+        meta = await obs.to_thread_io("chat.native_cron_owner", sid, sess.get_session_meta, sid)
+        if meta is None:
+            continue
+        for raw in jobs.values():
+            if raw.get("expires_at_ms") and raw["expires_at_ms"] <= now:
+                raw.update(runtime_state="expired", last_error="native_schedule_expired")
+            elif raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES | {"interrupted"}:
+                raw.update(runtime_state="interrupted", last_error="service_restarted")
+        with _sdk_cron_state_lock:
+            if sid in _sdk_cron_jobs:
+                continue
+            _sdk_cron_jobs[sid] = jobs
+        count += len(jobs)
+        _schedule_native_cron_recovery(sid)
+    return count
+
+
+def _native_cron_inventory_hook(session_id: str):
+    async def observe(input_data, _tool_use_id, _context):
+        inventory = input_data.get("session_crons")
+        if not isinstance(inventory, list):
+            return {}  # older runtimes omit this field entirely
+        if any(not isinstance(item, dict) or not _SDK_CRON_JOB_ID.fullmatch(str(item.get("id") or ""))
+               for item in inventory):
+            return {}  # do not interpret an unknown protocol shape as removal
+        listed = {str(item["id"]) for item in inventory[:50]}
+        with _sdk_cron_state_lock:
+            jobs = _sdk_cron_jobs.get(session_id, {})
+            for job_id, raw in jobs.items():
+                if raw.get("runtime_state") in {"paused", "expired"}:
+                    continue
+                if job_id in listed:
+                    raw.update(runtime_state="active", last_error="")
+                elif raw.get("recurring") or raw.get("last_status") != "completed":
+                    raw.update(runtime_state="missing", last_error="native_job_missing")
+        if jobs:
+            await _persist_native_cron_state(session_id)
+        return {}
+    return observe
+
+
+@router.post("/sessions/{sid}/scheduled-tasks/recover", dependencies=[Depends(require_token)])
+async def recover_native_cron_api(sid: str) -> dict:
+    if await obs.to_thread_io("chat.native_cron_owner", sid, sess.get_session_meta, sid) is None:
+        raise HTTPException(404, "session not found")
+    _native_cron_recovery_suppressed.discard(sid)
+    with _sdk_cron_state_lock:
+        jobs = _sdk_cron_jobs.get(sid, {})
+        for raw in jobs.values():
+            if raw.get("runtime_state") in {"interrupted", "recovery_failed", "paused"}:
+                raw.update(runtime_state="interrupted", last_error="")
+    task = _schedule_native_cron_recovery(sid)
+    if task is None:
+        raise HTTPException(409, "no interrupted native runtime to recover")
+    return {"session_id": sid, "status": "recovering"}
+
+
 def _sdk_scheduled_snapshot(session_id: str) -> dict[str, Any]:
     """Return the privacy-safe, thread-safe native schedule projection."""
     with _sdk_cron_state_lock:
-        count = len(_sdk_cron_jobs.get(session_id, {}))
-    return {"scheduled_active": count > 0, "scheduled_count": count}
+        jobs = _sdk_cron_jobs.get(session_id, {})
+        count = len(jobs)
+        active = any(raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES
+                     for raw in jobs.values())
+    return {"scheduled_active": active, "scheduled_count": count}
 
 
 @router.get(
@@ -20691,10 +20935,16 @@ def list_sdk_scheduled_tasks_api(sid: str) -> dict[str, Any]:
             "durable": bool(raw.get("durable")),
             "prompt": str(raw.get("prompt") or ""),
             "prompt_truncated": bool(raw.get("prompt_truncated")),
+            **{field: raw.get(field) for field in (
+                "runtime_state", "last_status", "last_error", "last_execution_status", "record_saved",
+                "last_started_at_ms", "last_finished_at_ms", "last_success_at_ms",
+                "tool_calls", "tool_results",
+            ) if field in raw},
         })
     return {
         "session_id": sid,
         "runtime_owned": True,
+        "scheduled_active": _sdk_scheduled_snapshot(sid)["scheduled_active"],
         "tasks": tasks,
         "count": len(tasks),
     }
@@ -20945,11 +21195,11 @@ def _sdk_tool_result_text(block: ToolResultBlock) -> str:
 def _observe_sdk_cron_message(
     key: chat_runtime.ClientKey,
     message: Any,
-) -> None:
+) -> bool:
     """Track native Cron tool state without retaining its prompt or output."""
     content = getattr(message, "content", None)
     if not isinstance(content, list):
-        return
+        return False
     calls = _sdk_cron_tool_calls.setdefault(key, {})
     changed = False
     observed_result = False
@@ -20977,7 +21227,7 @@ def _observe_sdk_cron_message(
             if name == "CronCreate":
                 match = _SDK_CRON_CREATE_RESULT.search(text)
                 if match:
-                    job_id = match.group(1)
+                    job_id = match.group("job_id")
                     jobs[job_id] = {
                         field: call[field]
                         for field in (
@@ -20986,13 +21236,30 @@ def _observe_sdk_cron_message(
                         )
                         if field in call
                     }
+                    # The CLI may ignore a requested durable flag. Its actual
+                    # successful tool result owns both defaults and persistence.
+                    jobs[job_id]["recurring"] = bool(re.search(
+                        r"Scheduled\s+recurring", text, re.IGNORECASE))
+                    jobs[job_id]["durable"] = (
+                        "persisted to .claude/scheduled_tasks.json" in text.casefold())
+                    jobs[job_id].update({
+                        "model": key[1], "effort": key[2], "service_tier": key[3],
+                        "runtime_state": "active", "created_at_ms": int(time.time() * 1000),
+                        "record_saved": True,
+                    })
+                    expiry = re.search(r"Auto-expires after (\d+) days", text, re.IGNORECASE)
+                    if expiry:
+                        jobs[job_id]["expires_at_ms"] = (
+                            jobs[job_id]["created_at_ms"] + min(int(expiry.group(1)), 366) * 86400000)
+
             elif name == "CronDelete":
                 match = _SDK_CRON_DELETE_RESULT.search(text)
                 if match:
                     jobs.pop(match.group(1), None)
             elif name == "CronList":
-                if "no scheduled jobs" in text.casefold():
-                    jobs = {}
+                if re.search(r"no scheduled (?:jobs|tasks)", text, re.IGNORECASE):
+                    jobs = {job_id: {**raw, "runtime_state": "missing", "last_error": "native_job_missing"}
+                            for job_id, raw in before.items()}
                 else:
                     listed = {
                         match.group(1)
@@ -21000,18 +21267,25 @@ def _observe_sdk_cron_message(
                     }
                     if listed:
                         jobs = {
-                            job_id: dict(before.get(job_id, {}))
-                            for job_id in listed
+                            job_id: {**raw, "runtime_state": "missing", "last_error": "native_job_missing"}
+                            for job_id, raw in before.items() if job_id not in listed
                         }
+                        jobs.update({
+                            job_id: {**before.get(job_id, {}), "runtime_state": "active", "last_error": ""}
+                            for job_id in listed
+                        })
             if jobs:
-                _sdk_cron_jobs[key[0]] = jobs
+                from . import native_cron
+                _sdk_cron_jobs[key[0]] = native_cron.bounded_jobs(jobs)
             else:
                 _sdk_cron_jobs.pop(key[0], None)
-            changed = jobs != before
+            changed = changed or jobs != before
     if not calls:
         _sdk_cron_tool_calls.pop(key, None)
     if changed or observed_result:
         _publish_sdk_scheduled_state(key)
+
+    return changed or observed_result
 
 
 def _scheduled_trigger_text(message: UserMessage) -> str:
@@ -21038,10 +21312,8 @@ def _matching_sdk_cron_job(
     digest = safe_prompt[1]
     with _sdk_cron_state_lock:
         jobs = tuple(_sdk_cron_jobs.get(key[0], {}).items())
-    for job_id, job in jobs:
-        if job.get("prompt_sha256") == digest:
-            return str(job_id)
-    return ""
+    matches = [str(job_id) for job_id, job in jobs if job.get("prompt_sha256") == digest]
+    return matches[0] if len(matches) == 1 else ""
 
 
 def _is_sdk_scheduled_trigger(
@@ -21119,6 +21391,13 @@ async def _begin_scheduled_delivery(
         job_id=_matching_sdk_cron_job(key, prompt),
     )
     _sdk_scheduled_deliveries[key] = delivery
+    with _sdk_cron_state_lock:
+        job = _sdk_cron_jobs.get(key[0], {}).get(delivery.job_id)
+        if job is not None:
+            job.update(runtime_state="active", last_error="",
+                       last_started_at_ms=int(time.time() * 1000), last_status="running")
+    if job is not None:
+        await _persist_native_cron_state(key[0])
     registration = asyncio.create_task(_register_scheduled_delivery(delivery))
     delivery.registration_task = registration
     _retain_maintenance_task(registration)
@@ -21277,17 +21556,13 @@ async def _finish_scheduled_delivery(
             before = dict(_sdk_cron_jobs.get(session_id, {}))
             job = before.get(delivery.job_id) or {}
             if job and not bool(job.get("recurring")):
-                after = dict(before)
-                after.pop(delivery.job_id, None)
-                if after:
-                    _sdk_cron_jobs[session_id] = after
-                else:
-                    _sdk_cron_jobs.pop(session_id, None)
+                job["runtime_state"] = "finished"
                 schedule_changed = True
 
     # Some compatible providers expose final prose only on ResultMessage.
     result_text = str(getattr(result, "result", None) or "")
-    if result_text and not "".join(delivery.render_state["streamed"]).strip():
+    if (_meaningful_scheduled_text(result_text)
+            and not "".join(delivery.render_state["streamed"]).strip()):
         broadcast.publish({
             "event": "text", "data": json.dumps({"text": result_text}),
         })
@@ -21300,6 +21575,18 @@ async def _finish_scheduled_delivery(
         is_error=bool(getattr(result, "is_error", False)),
         cancelled=bool(broadcast.cancelled),
     )
+    response_present = delivery.model_response or (
+        not delivery.synthetic_response and (
+            _meaningful_scheduled_text(result_text)
+            or _meaningful_scheduled_text("".join(delivery.render_state["streamed"]))
+        )
+    )
+    execution_status = (
+        "tools_executed" if delivery.tool_results else
+        "model_response" if response_present else "not_executed"
+    )
+    if status == "completed" and execution_status == "not_executed":
+        status = "failed"
     completed_at_ms = int(time.time() * 1000)
     assistant_uuid = str(delivery.render_state.get("assistant_uuid") or "")
     elapsed_s = round(max(0.0, time.time() - broadcast.started_at), 1)
@@ -21327,8 +21614,15 @@ async def _finish_scheduled_delivery(
     errors = [str(item) for item in (getattr(result, "errors", None) or [])]
     done_payload: dict[str, Any] = {
         "cancelled": status == "cancelled",
-        "is_error": bool(getattr(result, "is_error", False)),
-        "error": "\n".join(errors) or (result_text if status == "failed" else ""),
+        "is_error": status == "failed",
+        "error": "\n".join(errors) or (
+            "定时任务已触发，但未获得有效执行结果" if (
+                status == "failed" and execution_status == "not_executed"
+            ) else result_text if status == "failed" else ""
+        ),
+        "execution_status": execution_status,
+        "tool_calls": len(delivery.tool_calls),
+        "tool_results": len(delivery.tool_results),
         "model": broadcast.model,
         "scheduled": True,
         "continuation": False,
@@ -21343,6 +21637,21 @@ async def _finish_scheduled_delivery(
             getattr(result, "model_usage", None)),
         "background_tasks_pending": len(delivery.pending_tasks),
     }
+    with _sdk_cron_state_lock:
+        job = _sdk_cron_jobs.get(session_id, {}).get(delivery.job_id)
+        if job is not None:
+            job.update(last_status=status, last_execution_status=execution_status,
+                       last_finished_at_ms=completed_at_ms,
+                       last_run_id=broadcast.turn_id, tool_calls=len(delivery.tool_calls),
+                       tool_results=len(delivery.tool_results),
+                       last_error="not_executed" if execution_status == "not_executed" else "")
+            if status == "completed":
+                job["last_success_at_ms"] = completed_at_ms
+    if delivery.job_id:
+        await _persist_native_cron_state(session_id)
+    obs.perf_event("chat.native_cron_run", session=session_id[:8],
+                   job_id=delivery.job_id, status=status, execution_status=execution_status,
+                   tool_calls=len(delivery.tool_calls), tool_results=len(delivery.tool_results))
     broadcast.perf_status = status
     broadcast.perf_error_kind = "scheduled_turn" if status == "failed" else "none"
     broadcast.publish({"event": "done", "data": json.dumps(done_payload)})
@@ -21380,21 +21689,76 @@ async def _finish_scheduled_delivery(
     _retain_maintenance_task(refresh)
 
 
+def _is_unannounced_scheduled_output(key: chat_runtime.ClientKey, message: Any) -> bool:
+    """Recognize detached output without claiming a foreground or task reader."""
+    if not _session_has_scheduled_tasks(key[0]):
+        return False
+    current = _active_turns.get(key[0])
+    if current is not None and not current.done:
+        return False
+    if _sessions_with_inflight_tasks.get(key[0]) or _session_has_live_watcher(key[0]):
+        return False
+    stream = chat_runtime.SESSION_STREAMS.get(key)
+    if stream is not None and (stream._turn is not None or stream._background is not None):
+        return False
+    if getattr(message, "parent_tool_use_id", None):
+        return False
+    if isinstance(message, AssistantMessage):
+        return True
+    return isinstance(message, StreamEvent) and message.event.get("type") in {
+        "message_start", "content_block_start", "content_block_delta", "message_delta",
+    }
+
+
+def _scheduled_execution_evidence(delivery: _ScheduledDelivery, message: Any) -> None:
+    if isinstance(message, AssistantMessage):
+        if str(message.model or "") == "<synthetic>":
+            delivery.synthetic_response = True
+            return
+        delivery.model_response = delivery.model_response or any(
+            isinstance(block, TextBlock) and _meaningful_scheduled_text(block.text)
+            for block in message.content
+        )
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, ToolUseBlock):
+            delivery.tool_calls.add(str(block.id))
+        elif isinstance(block, ToolResultBlock) and not getattr(block, "is_error", False):
+            tool_id = str(block.tool_use_id)
+            if tool_id in delivery.tool_calls:
+                delivery.tool_results.add(tool_id)
+
+
+def _meaningful_scheduled_text(value: Any) -> bool:
+    return bool(isinstance(value, str) and value.strip() and value.strip().casefold() not in {
+        "no response requested", "no response requested.", "(no content)",
+    })
+
+
 async def _observe_sdk_scheduled_delivery(
     key: chat_runtime.ClientKey,
     message: Any,
 ) -> bool:
     delivery = _sdk_scheduled_deliveries.get(key)
     if delivery is None:
-        if not _is_sdk_scheduled_trigger(key, message):
+        if _is_sdk_scheduled_trigger(key, message):
+            await _begin_scheduled_delivery(key, message)
+            return True
+        if not _is_unannounced_scheduled_output(key, message):
             return False
-        delivery = await _begin_scheduled_delivery(key, message)
-        return True
+        # A runtime may expose only autonomous assistant output. Do not invent
+        # a job id or charge a particular schedule for an unattributed run.
+        delivery = await _begin_scheduled_delivery(key, UserMessage(content=""))
 
+    _scheduled_execution_evidence(delivery, message)
     if await _observe_scheduled_task_lifecycle(delivery, message):
         return True
     if isinstance(message, ResultMessage):
         await _finish_scheduled_delivery(delivery, message)
+        return True
+    if isinstance(message, AssistantMessage) and str(message.model or "") == "<synthetic>":
         return True
     if chat_subagents.is_subagent_message(message):
         for record in delivery.subagent_mux.feed(message):
@@ -21409,14 +21773,23 @@ async def _observe_sdk_scheduled_delivery(
 
 
 def _on_sdk_runtime_disconnected(session_id: str) -> None:
-    """Drop runtime-owned schedules and close any interrupted Cron delivery."""
+    """Retain interrupted schedule receipts and close their active delivery."""
     with _sdk_cron_state_lock:
-        _sdk_cron_jobs.pop(session_id, None)
+        jobs = _sdk_cron_jobs.get(session_id, {})
+        for raw in jobs.values():
+            if raw.get("runtime_state", "active") in _NATIVE_CRON_LIVE_STATES:
+                raw.update(runtime_state="interrupted", last_error="runtime_disconnected",
+                           disconnected_at_ms=int(time.time() * 1000))
         for key in [key for key in _sdk_cron_tool_calls if key[0] == session_id]:
             _sdk_cron_tool_calls.pop(key, None)
     for key in [key for key in _sdk_scheduled_deliveries if key[0] == session_id]:
         delivery = _sdk_scheduled_deliveries.pop(key)
         broadcast = delivery.broadcast
+        with _sdk_cron_state_lock:
+            job = _sdk_cron_jobs.get(session_id, {}).get(delivery.job_id)
+            if job is not None:
+                job.update(last_status="interrupted", last_error="runtime_disconnected",
+                           last_finished_at_ms=int(time.time() * 1000))
         if delivery.registration_task is not None:
             delivery.registration_task.cancel()
         broadcast.cancelled = True
@@ -21444,7 +21817,10 @@ def _on_sdk_runtime_disconnected(session_id: str) -> None:
                 _retain_maintenance_task(task)
             except RuntimeError:
                 pass
-    # A foreground turn may be the only live carrier for the dot removal.
+    if jobs:
+        _queue_native_cron_write(session_id)
+        _schedule_native_cron_recovery(session_id)
+    # A foreground turn may be the only live carrier for the state update.
     for key in [key for key in _clients if key[0] == session_id]:
         _publish_sdk_scheduled_state(key)
 
@@ -21476,7 +21852,8 @@ async def _observe_sdk_stream_message(
     message: Any,
 ) -> bool:
     """Observe safe lifecycle state and consume autonomous scheduled turns."""
-    _observe_sdk_cron_message(key, message)
+    if _observe_sdk_cron_message(key, message):
+        await _persist_native_cron_state(key[0])
     consumed = await _observe_sdk_scheduled_delivery(key, message)
     if not hook_traces.is_hook_message(message):
         return consumed
@@ -21494,16 +21871,20 @@ async def _observe_sdk_stream_message(
         or (not live and session_id in _sessions_with_inflight_tasks)
         else "foreground"
     )
-    global _hook_diagnostic_worker
-    if _hook_diagnostic_worker is None:
-        from .diagnostic_worker import DiagnosticWorker
-        _hook_diagnostic_worker = DiagnosticWorker("muselab-hook-traces", capacity=256)
-    if not _hook_diagnostic_worker.submit(
-            _hook_trace_job, asyncio.get_running_loop(), session_id, message,
-            turn_id, origin, broadcast if live else None,
-            _hook_diagnostic_generations.get(session_id, 0)):
-        obs.perf_event("chat.hook_trace_dropped", count=_hook_diagnostic_worker.dropped)
-    return consumed
+    try:
+        global _hook_diagnostic_worker
+        if _hook_diagnostic_worker is None:
+            from .diagnostic_worker import DiagnosticWorker
+            _hook_diagnostic_worker = DiagnosticWorker("muselab-hook-traces", capacity=256)
+        if not _hook_diagnostic_worker.submit(
+                _hook_trace_job, asyncio.get_running_loop(), session_id, message,
+                turn_id, origin, broadcast if live else None,
+                _hook_diagnostic_generations.get(session_id, 0)):
+            obs.perf_event("chat.hook_trace_dropped", count=_hook_diagnostic_worker.dropped)
+    except Exception as exc:
+        # Diagnostic failures cannot return already-owned hooks to the orphan lane.
+        obs.perf_event("chat.hook_trace_dropped", error_kind=type(exc).__name__, count=1)
+    return True
 
 
 chat_runtime.configure_hooks(chat_runtime.RuntimeHooks(
