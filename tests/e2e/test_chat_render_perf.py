@@ -8205,7 +8205,7 @@ def test_live_turn_keeps_resident_messages_but_bounds_mounted_rows(
     assert result["physicalBottomAtBottom"] is False
     assert result["emojiLength"] == 1500
     assert result["emojiTruncated"] is False
-    assert result["latest"] == {"start": 200, "end": 300, "mounted": 100}
+    assert result["latest"] == {"start": 280, "end": 300, "mounted": 20}
     _assert_no_browser_errors(page, errors)
 
 

@@ -1616,7 +1616,7 @@ class MemoryEngine:
                 limit=cfg.retrieval.dense_candidates))
 
         async def lexical() -> list[dict]:
-            return await self._recall_store_call(lambda store: store.lexical_search(
+            return await self._recall_store_call(lambda store: store.lexical_candidates(
                 cfg.owner_id, query, limit=cfg.retrieval.lexical_candidates
             ), deadline=search_deadline, recall_id=recall_id,
                 stage="lexical", channel="lexical")
@@ -1626,6 +1626,35 @@ class MemoryEngine:
         # results, discarding every result on a loaded filesystem.
         search_deadline = deadline
 
+        hydration_jobs: dict[str, asyncio.Future] = {}
+
+        async def hydrate(ids, channel):
+            # Claim IDs before the first await. Submit new work inline so a
+            # ready dense result enters the actor before a slow lexical query.
+            missing = [item_id for item_id in ids if item_id not in hydration_jobs]
+            if missing:
+                future = asyncio.get_running_loop().create_future()
+                for item_id in missing:
+                    hydration_jobs[item_id] = future
+                try:
+                    rows = await self._recall_store_call(
+                        lambda store: store.memories_with_stats_by_ids(cfg.owner_id, missing),
+                        deadline=deadline, recall_id=recall_id, stage="hydrate", channel=channel)
+                    future.set_result((rows, None))
+                except BaseException as exc:
+                    # Store failure as a value: a channel may be the only waiter.
+                    future.set_result(([], exc))
+                    raise
+            jobs = list(dict.fromkeys(hydration_jobs[item_id] for item_id in ids))
+            groups = await asyncio.gather(*(asyncio.shield(job) for job in jobs))
+            wanted = set(ids)
+            result = []
+            for rows, error in groups:
+                if error is not None:
+                    raise error
+                result.extend(item for item in rows if item["id"] in wanted)
+            return result
+
         async def retrieve(name, search):
             rows = await stage(name, search, channel=name)
             ids = list(dict.fromkeys(
@@ -1634,10 +1663,7 @@ class MemoryEngine:
             ids = [memory_id for memory_id in ids if memory_id]
             if not ids:
                 return rows, [], None
-            memories = await stage("hydrate", lambda: self._recall_store_call(
-                lambda store: store.memories_with_stats_by_ids(cfg.owner_id, ids),
-                deadline=deadline, recall_id=recall_id, stage="hydrate", channel=name),
-                channel=name)
+            memories = await stage("hydrate", lambda: hydrate(ids, name), channel=name)
             return rows, memories, stages["hydrate"]
 
         dense_result, lexical_result = await asyncio.gather(

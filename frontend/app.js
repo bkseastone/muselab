@@ -1,3 +1,41 @@
+const museRichMessages = new WeakMap();
+const museTranscriptPerf = new Map();
+// One bounded worker, shared by history decoration and code highlighting.
+// A stalled parser is terminated; the complete plain text remains readable.
+const museRichWorker = (() => {
+  let worker = null, active = false;
+  const queue = [];
+  function pump() {
+    if (active || !queue.length) return;
+    const job = queue.shift();
+    if (!job.valid()) { job.resolve(null); pump(); return; }
+    active = true;
+    let timer, settled = false;
+    const finish = (result, reset = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (reset && worker) { worker.terminate(); worker = null; }
+      active = false;
+      job.resolve(job.valid() ? result : null);
+      pump();
+    };
+    try {
+      const version = document.querySelector('meta[name="muselab-asset-version"]')?.content || "";
+      if (!worker) worker = new Worker("/static/render-worker.js?v=" + encodeURIComponent(version));
+      worker.onmessage = event => finish(event.data.failed ? null : event.data.html);
+      worker.onerror = () => finish(null, true);
+      timer = setTimeout(() => finish(null, true), 5000);
+      worker.postMessage(job.data);
+    } catch (_) { finish(null, true); }
+  }
+  return (data, valid = () => true) => new Promise(resolve => {
+    if (queue.length >= 32 || typeof Worker !== "function") { resolve(null); return; }
+    queue.push({ data, valid, resolve });
+    pump();
+  });
+})();
+
 // ==========================================================================
 // Global error capture — runs before anything else so we catch errors that
 // happen during boot too (Alpine x-init, vendor scripts, etc).
@@ -5234,11 +5272,12 @@ function portal() {
           queue.push(message);
         }
       }
-      if (!queue.length || st._deferredStreamRichHandle) return;
+      if (!queue.length || st._deferredStreamRichHandle || st._deferredStreamRichRunning) return;
 
-      const run = () => {
+      const run = async () => {
         st._deferredStreamRichHandle = null;
         if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        st._deferredStreamRichRunning = true;
         const maxChunk = this._isMobileLayout() ? 1 : 2;
         const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
         const started = performance.now();
@@ -5248,12 +5287,17 @@ function portal() {
           const message = queue.shift();
           if (!message || !this._containsPaneMessage(st, message)
               || !message._deferredRichReady || !message.text) continue;
-          message.html = this._renderHistoryMessage(message);
+          const html = await this._renderHistoryMessageAsync(message, () =>
+            this.tabState[sid] === st && sid === this.currentId
+            && this._containsPaneMessage(st, message));
+          if (html === null) continue;
+          message.html = html;
           message._streamPlain = false;
           message._deferredRichReady = false;
           st._streamRichRenderCount++;
           rendered++;
         }
+        st._deferredStreamRichRunning = false;
         if (queue.length) {
           this._scheduleDeferredStreamRich(sid, st);
           return;
@@ -5329,6 +5373,68 @@ function portal() {
     // each tick re-walked the entire rendered DOM for code/anchor nodes and
     // re-ran KaTeX over the whole bubble. File-links + math only need to be
     // live once the message is complete.
+    _prepareMarkdown(text) {
+      let parseInput = text;
+      const tripleCount = (text.match(/```/g) || []).length;
+      if (tripleCount % 2 === 1) parseInput += "\n```";
+      const tildeCount = (text.match(/~~~/g) || []).length;
+      if (tildeCount % 2 === 1) parseInput += "\n~~~";
+      // Protect math spans ($$..$$, $..$, \(..\), \[..\]) from marked BEFORE
+      // parsing. marked treats LaTeX underscores/asterisks as markdown
+      // emphasis and silently eats them — e.g. `\sum_{i=1}` becomes
+      // `\sum{i=1}` and `\mathcal{L}_{\text{NTP}}` loses its `_`, so KaTeX
+      // later renders wrong math (or the raw `$$` shows through). We swap each
+      // span for an opaque alphanumeric placeholder, run markdown, then
+      // restore the original LaTeX (HTML-escaped) for KaTeX to typeset.
+      const _mathStore = [];
+      parseInput = this._maskMath(parseInput, _mathStore);
+      return { input: parseInput, math: _mathStore };
+    },
+    async _renderHistoryMessageAsync(m, valid = () => true) {
+      if (!m || !m.text || !valid()) return null;
+      if (m.html && m._htmlSourceText === m.text) return m.html;
+      let pending = museRichMessages.get(m);
+      if (!pending || pending.text !== m.text) {
+        pending = { text: m.text };
+        const owned = pending;
+        pending.promise = this._computeHistoryMessageAsync(m, valid).finally(() => {
+          if (museRichMessages.get(m) === owned) museRichMessages.delete(m);
+        });
+        museRichMessages.set(m, pending);
+      }
+      const html = await pending.promise;
+      return valid() && m.text === pending.text ? html : null;
+    },
+    async _computeHistoryMessageAsync(m, valid = () => true) {
+      if (!m || !m.text || !valid()) return null;
+      const source = m.text;
+      if (source.length < 16 * 1024) return this._renderHistoryMessage(m);
+      const started = performance.now();
+      let html, status = "ok";
+      // Bound the DOM sanitizer/typesetter too. Oversized answers stay complete
+      // and selectable; no expensive synchronous retry after a worker timeout.
+      if (source.length > 256 * 1024) {
+        html = "<pre>" + this.escape(source) + "</pre>";
+        status = "plain";
+      } else {
+        const prepared = this._prepareMarkdown(source);
+        const raw = await museRichWorker({ kind: "markdown", text: prepared.input },
+          () => valid() && m.text === source);
+        if (!valid() || m.text !== source) return null;
+        if (raw === null || raw.length > 512 * 1024) {
+          html = "<pre>" + this.escape(source) + "</pre>";
+          status = "plain";
+        } else {
+          try { html = this._mdRenderUncached(source, { raw, prepared }); }
+          catch (_) { html = "<pre>" + this.escape(source) + "</pre>"; status = "plain"; }
+        }
+      }
+      if (!valid() || m.text !== source) return null;
+      m._htmlSourceText = source;
+      this._reportRenderPerf({ phase: "markdown", status,
+        total_ms: performance.now() - started, chars: source.length });
+      return html;
+    },
     _mdRenderUncached(text, opts = {}) {
       if (!text) return "";
       const streaming = !!opts.streaming;
@@ -5367,27 +5473,17 @@ function portal() {
       // then dumped the rest on completion". Patches a *copy* fed to
       // marked; the source `text` stays the truth. Both fence kinds covered;
       // already-balanced text is untouched.
-      let parseInput = text;
-      const tripleCount = (text.match(/```/g) || []).length;
-      if (tripleCount % 2 === 1) parseInput += "\n```";
-      const tildeCount = (text.match(/~~~/g) || []).length;
-      if (tildeCount % 2 === 1) parseInput += "\n~~~";
-      // Protect math spans ($$..$$, $..$, \(..\), \[..\]) from marked BEFORE
-      // parsing. marked treats LaTeX underscores/asterisks as markdown
-      // emphasis and silently eats them — e.g. `\sum_{i=1}` becomes
-      // `\sum{i=1}` and `\mathcal{L}_{\text{NTP}}` loses its `_`, so KaTeX
-      // later renders wrong math (or the raw `$$` shows through). We swap each
-      // span for an opaque alphanumeric placeholder, run markdown, then
-      // restore the original LaTeX (HTML-escaped) for KaTeX to typeset.
-      const _mathStore = [];
-      parseInput = this._maskMath(parseInput, _mathStore);
+      const prepared = opts.prepared || this._prepareMarkdown(text);
+      const parseInput = prepared.input;
+      const _mathStore = prepared.math;
       // marked occasionally throws on partial markdown mid-stream (unclosed
       // fenced block, half-typed table row, etc). Catch and fall through to
       // escaped raw text so the bubble keeps showing SOMETHING instead of
       // briefly clearing while the next chunk arrives.
       let raw;
       try {
-        raw = window.marked ? window.marked.parse(parseInput) : parseInput;
+        raw = opts.raw !== undefined ? opts.raw
+          : window.marked ? window.marked.parse(parseInput) : parseInput;
       } catch (e) {
         raw = "<pre>" + this.escape(text) + "</pre>";
       }
@@ -5512,13 +5608,19 @@ function portal() {
     _rerenderMathMessages() {
       if (!window.renderMathInElement) return;
       const RE = /\$\$|\\\(|\\\[|\$[^$\n]+\$/;
-      const messages = this.activeSessionPane().messages;
+      const owner = this.activeSessionPane();
+      const messages = owner.messages;
       if (Array.isArray(messages)) {
         for (const m of messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
             this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
             this._historyHtmlDelete(m);
-            m.html = this._renderHistoryMessage(m);
+            if (m.text.length >= 16 * 1024) {
+              m._htmlSourceText = "";
+              void this._renderHistoryMessageAsync(m, () =>
+                this.activeSessionPane() === owner && owner.messages.includes(m))
+                .then(html => { if (html !== null) m.html = html; }).catch(() => {});
+            } else m.html = this._renderHistoryMessage(m);
           }
         }
       }
@@ -7447,6 +7549,7 @@ function portal() {
           if (r.ok) {
             const d = await r.json();
             this.availableModels = d.models || [];
+            this._queueModelCatalogRefresh(d.catalog_pending);
             this._modelsLoaded = true;
             if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
             if (d.default_permission) {
@@ -11883,13 +11986,48 @@ function portal() {
         && Array.isArray(st.messages)
         && !st.messages.length;
     },
+    _finishTranscriptPerf(token, status, reason = "none") {
+      const rec = token && museTranscriptPerf.get(token.sid);
+      if (!rec || rec.generation !== token.generation || rec.token.state !== token.state) return;
+      museTranscriptPerf.delete(token.sid);
+      clearTimeout(rec.timer);
+      if (rec.observer) {
+        rec.collect(rec.observer.takeRecords());
+        rec.observer.disconnect();
+      }
+      this._reportRenderPerf({ phase: "transcript", status, cancel_reason: reason,
+        sid8: token.sid.slice(0, 8), generation: token.generation,
+        total_ms: performance.now() - rec.started,
+        settle_ms: rec.settling ? performance.now() - rec.settling : 0,
+        long_task_count: rec.count, longest_task_ms: rec.longest,
+        block_count: token.state.messages.length,
+        mounted_count: Math.max(0, token.state.messageRange.visibleEnd
+          - token.state.messageRange.visibleStart) });
+    },
     _beginTranscriptLoad(sid, st, phase = "fetching") {
       if (!sid || !st || this.tabState[sid] !== st || st._sid !== sid) return null;
       if ((st.streaming || st.es) && phase !== "mounting") return null;
+      const previousPerf = museTranscriptPerf.get(sid);
+      if (previousPerf) this._finishTranscriptPerf(previousPerf.token, "cancelled", "superseded");
       st.transcriptLoadGeneration =
         (Number(st.transcriptLoadGeneration) || 0) + 1;
       st.transcriptLoadPhase = phase === "mounting" ? "mounting" : "fetching";
-      return { sid, state: st, generation: st.transcriptLoadGeneration };
+      const token = { sid, state: st, generation: st.transcriptLoadGeneration };
+      const rec = { token, generation: token.generation, started: performance.now(), count: 0, longest: 0 };
+      rec.collect = entries => {
+        for (const entry of entries) {
+          if (entry.startTime < rec.started) continue;
+          rec.count++;
+          rec.longest = Math.max(rec.longest, entry.duration);
+        }
+      };
+      try {
+        rec.observer = new PerformanceObserver(list => rec.collect(list.getEntries()));
+        rec.observer.observe({ type: "longtask", buffered: false });
+      } catch (_) { rec.observer = null; }
+      rec.timer = setTimeout(() => this._finishTranscriptPerf(token, "cancelled", "timeout"), 90000);
+      museTranscriptPerf.set(sid, rec);
+      return token;
     },
     _ownsTranscriptLoad(token) {
       return !!token
@@ -11900,6 +12038,8 @@ function portal() {
     async _settleTranscriptLoad(token, options = {}) {
       if (!this._ownsTranscriptLoad(token)) return false;
       token.state.transcriptLoadPhase = "settling";
+      const perf = museTranscriptPerf.get(token.sid);
+      if (perf) perf.settling = performance.now();
       try {
         if (!options.skipNextTick) {
           await new Promise(resolve => this.$nextTick(resolve));
@@ -11919,6 +12059,7 @@ function portal() {
           if (!this._ownsTranscriptLoad(token)) return false;
         }
         token.state.transcriptLoadPhase = "idle";
+        this._finishTranscriptPerf(token, "ok");
         return true;
       } catch (_) {
         this._failTranscriptLoad(token);
@@ -11933,10 +12074,13 @@ function portal() {
       token.state.messagesLoading = false;
       token.state.messagesReady = true;
       token.state.transcriptLoadPhase = "error";
+      this._finishTranscriptPerf(token, "error", "failed");
       return true;
     },
     _releaseTranscriptLoadForLive(st) {
       if (!st) return;
+      this._finishTranscriptPerf({ sid: st._sid, state: st, generation: st.transcriptLoadGeneration },
+        "cancelled", "live_owner");
       st.transcriptLoadGeneration =
         (Number(st.transcriptLoadGeneration) || 0) + 1;
       st.transcriptLoadPhase = "idle";
@@ -11962,7 +12106,13 @@ function portal() {
       // State handoff/clone paths can outlive the load generation that would
       // normally repair an interrupted reveal; a non-empty repository must
       // never derive an empty mounted pane.
-      this._ensureNonEmptyMessageRange(st);
+      // Repair only invalid handoffs. Normal projection is a pure read; the pane
+      // owns one reactive projection, shared by every row expression.
+      if (st.messages.length && (range.visibleStart < 0
+          || range.visibleEnd > st.messages.length
+          || range.visibleEnd <= range.visibleStart)) {
+        this._ensureNonEmptyMessageRange(st);
+      }
       if (range.visibleStart === 0 && range.visibleEnd === st.messages.length) {
         return st.messages;
       }
@@ -11995,11 +12145,29 @@ function portal() {
       if (!tid) return [];
       return this._visiblePaneMessages(this.tabState && this.tabState[tid]);
     },
-    paneMessageIndex(tid, message) {
+    paneMessageIndex(tid, message, visibleRows = null) {
+      // A row's index and its neighbours must come from the same projection.
+      // Canonical storage can advance one Alpine flush before paneMsgs updates.
+      if (Array.isArray(visibleRows)) {
+        let indexes = _paneMessageIndexCache.get(visibleRows);
+        if (!indexes) {
+          indexes = new Map();
+          for (let i = 0; i < visibleRows.length; i++) {
+            if (visibleRows[i]?._k) indexes.set(visibleRows[i]._k, i);
+          }
+          _paneMessageIndexCache.set(visibleRows, indexes);
+        }
+        const index = message?._k ? indexes.get(message._k) : undefined;
+        return Number.isInteger(index) ? index : visibleRows.indexOf(message);
+      }
       const st = tid && this.tabState && this.tabState[tid];
       if (!st || !message) return -1;
       const rows = Array.isArray(st.messages) ? st.messages : [];
-      if (rows.length) this._ensureNonEmptyMessageRange(st);
+      if (rows.length && st.messageRange
+          && (st.messageRange.visibleStart < 0 || st.messageRange.visibleEnd > rows.length
+            || st.messageRange.visibleEnd <= st.messageRange.visibleStart)) {
+        this._ensureNonEmptyMessageRange(st);
+      }
       const start = st.messageRange
         ? Math.max(0, Math.min(st.messageRange.visibleStart, rows.length)) : 0;
       const end = st.messageRange
@@ -15082,8 +15250,7 @@ function portal() {
     _scheduleHistoryRichRender() {
       if (this._historyRichRenderScheduled) return;
       this._historyRichRenderScheduled = true;
-      const run = () => {
-        this._historyRichRenderScheduled = false;
+      const run = async () => {
         let pending = null;
         while (this._historyRichRenderQueue.length && !pending) {
           const candidate = this._historyRichRenderQueue.shift();
@@ -15102,9 +15269,18 @@ function portal() {
           if (!st || !st.messages.includes(m)) continue;
           pending = candidate;
         }
-        if (!pending) return;
+        if (!pending) { this._historyRichRenderScheduled = false; return; }
         const m = pending.message;
-        m.html = this._renderHistoryMessage(m);
+        const owner = this.tabState[pending.sid];
+        const html = await this._renderHistoryMessageAsync(m, () =>
+          this.tabState[pending.sid] === owner && owner.messages.includes(m)
+          && (!pending.el || pending.el.isConnected));
+        this._historyRichRenderScheduled = false;
+        if (html === null) {
+          if (this._historyRichRenderQueue.length) this._scheduleHistoryRichRender();
+          return;
+        }
+        m.html = html;
         if (m._canonicalPlainUntilRich) {
           m._streamPlain = false;
           delete m._canonicalPlainUntilRich;
@@ -18337,6 +18513,26 @@ function portal() {
       if (typeof requestAnimationFrame !== "function") { setTimeout(fn, 0); return; }
       requestAnimationFrame(() => requestAnimationFrame(fn));
     },
+    _reportRenderPerf(fields) {
+      if (fields.phase !== "transcript" && fields.total_ms < 50 && fields.chars < 16 * 1024) return;
+      const payload = {
+        phase: fields.phase,
+        status: fields.status,
+        cancel_reason: fields.cancel_reason || "none",
+        sid8: /^[0-9a-f]{8}$/.test(fields.sid8) ? fields.sid8 : "none",
+        asset_version: String(document.querySelector(
+          'meta[name="muselab-asset-version"]')?.content || "").slice(0, 32),
+      };
+      for (const name of ["total_ms", "settle_ms", "chars", "long_task_count",
+        "longest_task_ms", "block_count", "mounted_count", "generation"]) {
+        payload[name] = Math.max(0, Math.min(Math.round(Number(fields[name]) || 0), 100_000_000));
+      }
+      try {
+        fetch("/api/log/chat-render", { method: "POST", keepalive: true,
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(payload) }).catch(() => {});
+      } catch (_) { /* diagnostics never affect rendering */ }
+    },
     _reportHistoryLoadPerf(fields) {
       // One privacy-bounded summary per canonical history load. Never include a
       // full session id, message text, URL, model name, or error string.
@@ -18357,7 +18553,7 @@ function portal() {
           ? fields.mode : "cold",
         foreground: !!fields.foreground,
         visibility: ["visible", "hidden"].includes(fields.visibility) ? fields.visibility : "unknown",
-        cancel_reason: ["none", "superseded", "live_owner", "revision_changed", "anchor_missing", "aborted"]
+        cancel_reason: ["none", "superseded", "live_owner", "revision_changed", "anchor_missing", "aborted", "unstable_snapshot", "older_snapshot", "shorter_snapshot", "missing_terminal_boundary"]
           .includes(fields.cancel_reason) ? fields.cancel_reason : "none",
       };
       for (const name of numeric) {
@@ -19007,7 +19203,9 @@ function portal() {
         const quietRangeResolved = quiet
           ? (followTailAtInstall
             ? {
-              start: Math.max(0, all.length - this._liveMessageDomCap()),
+              start: Math.max(0, all.length - Math.max(this._historyMountWindowSize(),
+                Math.min(this._liveMessageDomCap(),
+                  st.messageRange.visibleEnd - st.messageRange.visibleStart))),
               end: all.length,
             }
             : this._resolveMessageRangeSnapshot(
@@ -19432,8 +19630,9 @@ function portal() {
         if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
         return;
       }
-      const finalStart = st.messageRange.visibleStart;
-      const finalEnd = finalStart + visible.length;
+      const finalEnd = st.messageRange.visibleStart + visible.length;
+      const finalStart = Math.max(st.messageRange.visibleStart,
+        finalEnd - this._historyMountWindowSize());
       let cursor = finalEnd;
       while (cursor > finalStart) {
         const nextStart = Math.max(finalStart, cursor - CH);
@@ -20109,6 +20308,9 @@ function portal() {
     // Phones use a smaller explicit page because parsing and installing 100 rich
     // tool/Markdown blocks can monopolize their main thread. Desktop keeps 100.
     _historyWindowSize() { return this._isMobileLayout() ? 20 : 100; },
+    // Fetch ahead independently of DOM work. Older resident rows remain
+    // reachable through history paging without another network request.
+    _historyMountWindowSize() { return 20; },
     _liveMessageDomCap() { return this._isMobileLayout() ? 40 : 100; },
     _liveMessageHistoryStep() { return Math.max(1, Math.floor(this._liveMessageDomCap() / 2)); },
     _isLiveMessagePane(st) { return !!(st && (st.streaming || st.es)); },
@@ -20575,7 +20777,7 @@ function portal() {
         }
         const liveWindow = this._isLiveMessagePane(st);
         const batchSize = liveWindow
-          ? this._liveMessageHistoryStep() : this._historyWindowSize();
+          ? this._liveMessageHistoryStep() : this._historyMountWindowSize();
         const previousEnd = range.visibleEnd;
         const nextStart = Math.max(0, range.visibleStart - batchSize);
         const batch = st.messages.slice(nextStart, range.visibleStart);
@@ -20585,7 +20787,9 @@ function portal() {
           for (let k = j; k < chunkEnd; k++) {
             const m = batch[k];
             if (m.role === "assistant" && m.text && !m.html) {
-              m.html = this._renderHistoryMessage(m);
+              const html = await this._renderHistoryMessageAsync(m, () =>
+                this.tabState[sid] === st && st.messages.includes(m));
+              if (html !== null) m.html = html;
             }
             m._noAnim = true;
           }
@@ -20638,7 +20842,7 @@ function portal() {
         if (!loaded || this.tabState[sid] !== st) return false;
       } else {
         const windowSize = this._isLiveMessagePane(st)
-          ? this._liveMessageDomCap() : this._historyWindowSize();
+          ? this._liveMessageDomCap() : this._historyMountWindowSize();
         range.visibleEnd = st.messages.length;
         range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
         this._scheduleHistoryViewport(st, "newer");
@@ -22490,12 +22694,21 @@ function portal() {
 
     // Refresh the available model list from backend — called when provider
     // visibility changes so the model picker dropdown stays in sync.
-    async _fetchModels() {
+    _queueModelCatalogRefresh(pending) {
+      if (!pending || this._modelCatalogRefreshTimer) return;
+      const token = this.token;
+      this._modelCatalogRefreshTimer = setTimeout(() => {
+        this._modelCatalogRefreshTimer = null;
+        if (this.authed && this.token === token) void this._fetchModels(false);
+      }, 2250);
+    },
+    async _fetchModels(catalogRetry = true) {
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
           const d = await r.json();
           this.availableModels = d.models || [];
+          if (catalogRetry) this._queueModelCatalogRefresh(d.catalog_pending);
           this._modelsLoaded = true;
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           if (d.default_permission) {
@@ -22572,6 +22785,8 @@ function portal() {
     // a long-lived tab slowly leaks entries. Call wherever a session is
     // permanently removed (delete) or its tab state is torn down.
     _clearSessionWarnFlags(sid) {
+      const perf = museTranscriptPerf.get(sid);
+      if (perf) this._finishTranscriptPerf(perf.token, "cancelled", "superseded");
       if (this._budgetWarned) delete this._budgetWarned[sid];
       if (this._ctxWarned) delete this._ctxWarned[sid];
       if (this._autoCompacted) delete this._autoCompacted[sid];
@@ -22835,7 +23050,9 @@ function portal() {
         // 刷新可用 provider 列表
         const r2 = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r2.ok) {
-          this.availableModels = (await r2.json()).models || [];
+          const providers = await r2.json();
+          this.availableModels = providers.models || [];
+          this._queueModelCatalogRefresh(providers.catalog_pending);
           // 关键：先校正 this.model 再 rebind。否则 default_model 仍是
           // 出厂值 claude-sonnet-4-6（GET /api/settings 在 MUSELAB_MODEL 未设
           // 时回退到它），而用户只配了 DeepSeek、没有 Anthropic 鉴权 → claude
@@ -28170,14 +28387,6 @@ function portal() {
         return Promise.resolve();
       };
       if (!nodes.length) { return Promise.resolve(runArtifacts()); }
-      if (!window.hljs) {
-        // We have blocks to highlight → NOW lazy-load hljs, then re-call.
-        // The re-call re-collects (cheap) and idempotently highlights any
-        // blocks that appeared since the last paint (data-hl="1" sentinel
-        // prevents double work).
-        return this._loadHljs().then(() => this.highlightCode(root, scopeEls))
-          .catch(e => console.warn("[muselab] hljs lazy-load failed:", e));
-      }
       // We DON'T highlight all blocks in one synchronous forEach: on a long
       // history (re)entered cold this can be 150+ blocks, and hljs auto-detect
       // on big ones takes many ms each — the sum locked the main thread for
@@ -28195,11 +28404,11 @@ function portal() {
       const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
       let i = 0;
       return new Promise((resolve) => {
-        const pump = () => {
+        const pump = async () => {
           const started = performance.now();
           const end = Math.min(i + maxChunk, nodes.length);
           for (; i < end; i++) {
-            this._highlightOne(nodes[i]);
+            await this._highlightOne(nodes[i]);
             if (performance.now() - started >= frameBudgetMs) {
               i++;
               break;
@@ -28265,7 +28474,7 @@ function portal() {
     // Highlight a single <code> block (extracted from highlightCode so the
     // chunked pump can call it per element). Idempotent via the data-hl
     // sentinel — see highlightCode for why dedup matters during streaming.
-    _highlightOne(el) {
+    async _highlightOne(el) {
       // Dedup: every stream chunk re-runs flushRender → highlightCode, and
       // without this guard we'd re-highlight every code block on every chunk.
       // The `data-hl="1"` sentinel is cleared by the preview-reload paths
@@ -28304,19 +28513,24 @@ function portal() {
       }
       const m = el.className.match(/language-([\w+#-]+)/);
       const lang = m && m[1];
+      if (el.dataset.hlPending === "1") return;
+      el.dataset.hlPending = "1";
+      const started = performance.now();
       try {
-        const r = (lang && window.hljs.getLanguage(lang))
-          ? window.hljs.highlight(text, { language: lang, ignoreIllegals: true })
-          // No explicit language → auto-detect, but RESTRICTED to a subset of
-          // common languages. Plain highlightAuto(text) tries every one of the
-          // ~39 registered grammars (and compiles them all on first use); the
-          // subset cuts that to ~15 likely candidates, which is both faster and
-          // less prone to mis-detecting prose-y blocks as some exotic language.
-          : window.hljs.highlightAuto(text, this._hlAutoSubset());
-        el.innerHTML = r.value;
+        const html = await museRichWorker({ kind: "highlight", text,
+          language: lang, languages: Array.from(this._hlAutoSubset()) },
+          () => el.isConnected && el.textContent === text);
+        if (!el.isConnected || el.textContent !== text) return;
+        if (html !== null && window.DOMPurify) {
+          el.innerHTML = window.DOMPurify.sanitize(html, {
+            ALLOWED_TAGS: ["span"], ALLOWED_ATTR: ["class"],
+          });
+        }
         el.classList.add("hljs");
         el.dataset.hl = "1";
-      } catch (e) { console.warn("[muselab] highlight failed:", e); }
+        this._reportRenderPerf({ phase: "highlight", status: html === null ? "plain" : "ok",
+          total_ms: performance.now() - started, chars: text.length });
+      } finally { delete el.dataset.hlPending; }
       // Attach copy button to every <pre> wrapping a code block — only once.
       this._attachCopyBtn(el);
     },
@@ -34260,6 +34474,11 @@ function portal() {
         cancelPendingPaint();
         curBubble.text = acc;
         curBubble._streamText = acc;
+        if (acc.length >= 16 * 1024) {
+          this._queueDeferredStreamRich(streamSid, streamState, curBubble);
+          _scrollIfActive();
+          return;
+        }
         curBubble.html = this._renderHistoryMessage(curBubble);
         curBubble._streamPlain = false;
         curBubble._deferredRichReady = false;

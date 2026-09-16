@@ -2069,9 +2069,10 @@
                x-cloak
                :aria-hidden="tid === currentId ? null : 'true'"
                :data-tid="tid"
-               x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) } }">
+               x-data="{ get pane(){ return paneState(tid) }, paneMsgs: [] }"
+               x-effect="paneMsgs = paneMessages(tid)">
           <template x-for="m in paneMsgs" :key="m._k">
-            <div x-data="{ get i(){ return paneMessageIndex(tid, m) } }"
+            <div x-data="{ get i(){ return paneMessageIndex(tid, m, paneMsgs) } }"
                  :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
                  :data-uuid="m.uuid || ''"
                  :data-message-key="m._k"

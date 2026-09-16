@@ -495,3 +495,26 @@ def test_replayed_creation_cannot_move_an_existing_native_job(stream_env):
         assert "fixture01" not in chat._sdk_cron_jobs.get(other[0], {})
 
     asyncio.run(run())
+
+
+def test_native_delivery_diagnoses_foreign_receipt_without_rerouting(stream_env):
+    chat = stream_env
+    owner = ("11111111-owner-a", "model", "auto", "")
+    other = ("22222222-runtime-b", "model", "auto", "")
+    prompt = "Check the fixture status"
+    async def run():
+        await create_job(chat, owner)
+        chat._sdk_cron_jobs[owner[0]]["fixture01"]["runtime_state"] = "interrupted"
+        identity = chat._native_cron_delivery_identity(other[0], prompt)
+        assert identity == {"ownership": "foreign_candidate", "candidate_owner": "11111111", "candidate_count": 1}
+        assert prompt not in repr(identity)
+        # An SDK-native trigger in B remains B's execution. A fingerprint match
+        # must never silently copy B's context/results into A's conversation.
+        assert chat._is_sdk_scheduled_trigger(other, UserMessage(content=prompt, origin={
+            "kind": "task-notification", "subkind": "scheduled-trigger"}))
+        assert not chat._matching_sdk_cron_job(other, prompt)
+        await create_job(chat, other, result="Scheduled recurring job other02. Session-only.")
+        assert chat._native_cron_delivery_identity(other[0], prompt)["ownership"] == "local"
+        assert chat._native_cron_delivery_identity("third-runtime", prompt)["ownership"] == "ambiguous"
+        assert chat._native_cron_delivery_identity(other[0], "unrelated")["ownership"] == "unknown"
+    asyncio.run(run())
