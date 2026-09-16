@@ -3313,8 +3313,8 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     assert "currentForkSource()?.name || ''" in html
     assert ':key="transcriptPaneKey(tid)"' in html
     assert 'x-for="m in paneMsgs" :key="m._k"' in html
-    assert "paneMessageIndex(tid, m)" in html
-    assert 'get i(){ return paneMessageIndex(tid, m) }' in html
+    assert "paneMessageIndex(tid, m, paneMsgs)" in html
+    assert 'get i(){ return paneMessageIndex(tid, m, paneMsgs) }' in html
     assert ':data-message-key="m._k"' in html
 
 
@@ -3425,7 +3425,7 @@ def test_history_rich_render_never_blocks_canonical_install_or_batches_one_frame
     assert "_historyRichRenderQueue.push" in queue
     assert "m._richRenderQueued" in queue
     assert "window.requestIdleCallback(run, { timeout: 250 })" in queue
-    assert "this._renderHistoryMessage(m)" in queue
+    assert "await this._renderHistoryMessageAsync(m," in queue
     assert "if (this._historyRichRenderQueue.length) this._scheduleHistoryRichRender()" in queue
     assert "forEach" not in queue
     assert "const fenced = text.match(" in app
@@ -3971,7 +3971,7 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     earlier_end = app.index("    async returnToLatest(sid)", earlier_start)
     earlier = app[earlier_start:earlier_end]
     assert "const liveWindow = this._isLiveMessagePane(st)" in earlier
-    assert "this._liveMessageHistoryStep() : this._historyWindowSize()" in earlier
+    assert "this._liveMessageHistoryStep() : this._historyMountWindowSize()" in earlier
     assert "nextStart + this._liveMessageDomCap()" in earlier
     assert "await this._fetchOlderWindow(sid)" in earlier
     assert "this._captureViewportMessageAnchor(scrollEl, sid)" in earlier
@@ -4153,7 +4153,7 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "Intentionally no-op" in virtual
     assert 'querySelectorAll(".msg[data-message-key]")' in virtual
     assert "st._virtualHeights[key] = height" in virtual
-    index_start = app.index("    paneMessageIndex(tid, message) {")
+    index_start = app.index("    paneMessageIndex(tid, message, visibleRows = null) {")
     index_end = app.index("    _hasPendingAdmission(st) {", index_start)
     pane_index = app[index_start:index_end]
     assert "_visiblePaneMessages" not in pane_index
@@ -4214,7 +4214,7 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "return { bubble: completedBubble, text: completedText };" in terminal
     assert ':data-tid="tid"' in pane
     assert 'x-for="m in paneMsgs" :key="m._k"' in pane
-    assert "paneMessageIndex(tid, m)" in pane
+    assert "paneMessageIndex(tid, m, paneMsgs)" in pane
     assert "paneMessageRows(tid)" not in pane
     assert "msg-virtual-spacer" not in pane
     assert ".msg-virtual-spacer" not in css
@@ -4260,7 +4260,7 @@ def test_cold_history_reveal_never_marks_a_nonempty_session_with_an_empty_range(
     assignment = reveal.index("st.messageRange.visibleStart = nextStart")
     cancellation = reveal.index(
         "if (this.tabState[sid] !== st || st.streaming || st.es) return",
-        reveal.index("const finalStart = st.messageRange.visibleStart"),
+        reveal.index("const finalStart = Math.max(st.messageRange.visibleStart"),
     )
     assert assignment < cancellation
     assert "st.messageRange.visibleStart = finalEnd" not in reveal

@@ -1505,3 +1505,34 @@ def test_recall_store_reports_queue_execution_and_busy_retries(tmp_path, monkeyp
     assert timing["busy_retries"] == 2
     assert timing["duration_ms"] >= timing["queue_ms"] + timing["execution_ms"] - 1
     assert "SYNTHETIC_PRIVATE" not in repr(events)
+
+
+@pytest.mark.parametrize("dense_delay", [0, 0.03])
+def test_recall_hydrates_shared_candidates_once(recall_case, monkeypatch, dense_delay):
+    instance, cfg, memory, vector = recall_case
+    cfg.retrieval.soft_timeout_ms = 1500
+    store = instance._resolve_recall_store()
+    original = store.memories_with_stats_by_ids
+    calls = []
+
+    def hydrate(owner, ids):
+        calls.extend(ids)
+        time.sleep(0.02)
+        return original(owner, ids)
+
+    async def dense(*args, **kwargs):
+        await asyncio.sleep(dense_delay)
+        return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(store, "memories_with_stats_by_ids", hydrate)
+    monkeypatch.setattr(vector, "search", dense)
+
+    async def scenario():
+        try:
+            rows = await instance.recall("清淡饮食", "shared-candidate")
+            assert [row["id"] for row in rows] == [memory["id"]]
+            assert set(rows[0]["channels"]) == {"dense", "lexical"}
+            assert calls == [memory["id"]]
+        finally:
+            await instance.stop()
+    _run(scenario())

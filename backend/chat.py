@@ -2494,6 +2494,9 @@ _CONTEXT_CAPABILITY_FAILURE_TTL = max(
 _CONTEXT_CAPABILITY_CACHE: dict[tuple[str, str, str], tuple[float, dict | None]] = {}
 _CONTEXT_CAPABILITY_FAILURES: dict[tuple[str, str, str], float] = {}
 _CONTEXT_CAPABILITY_PROBES = SharedCalls()
+_CONTEXT_CATALOG_PROBES = SharedCalls()
+_CONTEXT_CATALOG_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_CONTEXT_CATALOG_FAILURES: dict[tuple[str, str], float] = {}
 _CONTEXT_CAPABILITY_STALE_TTL = max(_CONTEXT_CAPABILITY_CACHE_TTL,
     env_float("MUSELAB_CONTEXT_CATALOG_STALE_TTL_S", 3600.0))
 
@@ -2801,6 +2804,48 @@ async def _post_turn_context_usage(client) -> dict:
     return await asyncio.wait_for(client.get_context_usage(), timeout=3.0)
 
 
+def _context_route_key(cache_key) -> tuple[str, str]:
+    return cache_key[0], cache_key[2]
+
+
+def _context_route_failed(cache_key) -> bool:
+    failed = _CONTEXT_CATALOG_FAILURES.get(_context_route_key(cache_key))
+    return failed is not None and time.monotonic() - failed < _CONTEXT_CAPABILITY_FAILURE_TTL
+
+
+async def _gateway_context_catalog(base: str, credential: str, cache_key) -> dict:
+    route = _context_route_key(cache_key)
+    cached = _CONTEXT_CATALOG_CACHE.get(route)
+    if cached and time.monotonic() - cached[0] < _CONTEXT_CAPABILITY_CACHE_TTL:
+        return cached[1]
+
+    async def request_catalog():
+        import httpx
+        headers = ({"x-api-key": credential, "Authorization": f"Bearer {credential}"}
+                   if credential else {})
+        timeout = max(0.2, env_float("MUSELAB_CONTEXT_CATALOG_TIMEOUT_S", 2.0))
+        try:
+            async with asyncio.timeout(timeout), httpx.AsyncClient(timeout=timeout) as hc:
+                response = await hc.get(f"{base}/v1/models?client_version", headers=headers)
+                if response.status_code in {401, 403, 429} or response.status_code >= 500:
+                    response.raise_for_status()
+                catalog = (_parse_codex_gateway_catalog(response.json())
+                           if response.status_code < 400 else {})
+        except Exception:
+            _CONTEXT_CATALOG_FAILURES[route] = time.monotonic()
+            raise
+        completed = time.monotonic()
+        _CONTEXT_CATALOG_FAILURES.pop(route, None)
+        _CONTEXT_CATALOG_CACHE[route] = (completed, catalog)
+        for slug, capability in catalog.items():
+            for model in {_canonical_context_model(slug), f"codex:{slug}"}:
+                _CONTEXT_CAPABILITY_CACHE[_context_capability_key(base, model, credential)] = (
+                    completed, dict(capability))
+        return catalog
+
+    return await _CONTEXT_CATALOG_PROBES.run(route, request_catalog)
+
+
 async def _detect_gateway_context_capability(model: str) -> dict | None:
     """Resolve capacity through one cancellable probe per routing identity."""
     if not _is_codex_gateway_model(model):
@@ -2816,7 +2861,8 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
     if cached and time.monotonic() - cached[0] < _CONTEXT_CAPABILITY_CACHE_TTL:
         return dict(cached[1]) if cached[1] else None
     failed_at = _CONTEXT_CAPABILITY_FAILURES.get(cache_key)
-    if failed_at is not None and time.monotonic() - failed_at < _CONTEXT_CAPABILITY_FAILURE_TTL:
+    if (_context_route_failed(cache_key) or (failed_at is not None
+            and time.monotonic() - failed_at < _CONTEXT_CAPABILITY_FAILURE_TTL)):
         return _last_known_gateway_capability(cache_key)
     return await _CONTEXT_CAPABILITY_PROBES.run(cache_key,
         lambda: _load_gateway_context_capability(canonical, base, credential, cache_key))
@@ -2833,25 +2879,11 @@ async def _load_gateway_context_capability(canonical: str, base: str, key: str,
         import httpx
         timeout = max(0.2, env_float("MUSELAB_CONTEXT_CATALOG_TIMEOUT_S", 2.0))
         async with asyncio.timeout(timeout), httpx.AsyncClient(timeout=timeout) as hc:
-            # Query-string presence selects CLIProxyAPI's Codex-client catalog.
-            r = await hc.get(f"{base}/v1/models?client_version", headers=headers)
-            if r.status_code < 400:
-                catalog = _parse_codex_gateway_catalog(r.json())
-                if catalog:
-                    for item_slug, capability in catalog.items():
-                        item_model = _canonical_context_model(item_slug)
-                        _CONTEXT_CAPABILITY_CACHE[_context_capability_key(base, item_model, key)] = (
-                            time.monotonic(), dict(capability))
-                        # Keep the routing-prefixed cache key too. This makes
-                        # newly-added gateway models cache correctly before
-                        # muselab's static fallback table learns their slug.
-                        _CONTEXT_CAPABILITY_CACHE[
-                            _context_capability_key(base, f"codex:{item_slug}", key)
-                        ] = (time.monotonic(), dict(capability))
-                    found = catalog.get(slug)
-                    if found:
-                        _log_context_probe_recovery(canonical)
-                        return dict(found)
+            catalog = await _gateway_context_catalog(base, key, cache_key)
+            found = catalog.get(slug)
+            if found:
+                _log_context_probe_recovery(canonical)
+                return dict(found)
 
             # Compatibility path for gateways that expose limits on ordinary
             # OpenAI/Anthropic model endpoints instead of the Codex catalog.
@@ -2880,6 +2912,7 @@ async def _load_gateway_context_capability(canonical: str, base: str, key: str,
                         _log_context_probe_recovery(canonical)
                         return capability
     except Exception as e:
+        _CONTEXT_CATALOG_FAILURES[_context_route_key(cache_key)] = time.monotonic()
         _log_context_probe_failure(canonical, e)
     _CONTEXT_CAPABILITY_FAILURES[cache_key] = time.monotonic()
     fallback = _last_known_gateway_capability(cache_key)
@@ -2908,7 +2941,8 @@ def _cached_gateway_context_capability(model: str) -> dict | None:
     if time.monotonic() - cached_at >= ttl:
         # Match the detector during its negative-cache window.
         failed_at = _CONTEXT_CAPABILITY_FAILURES.get(cache_key)
-        if failed_at is not None and time.monotonic() - failed_at < _CONTEXT_CAPABILITY_FAILURE_TTL:
+        if (_context_route_failed(cache_key) or (failed_at is not None
+                and time.monotonic() - failed_at < _CONTEXT_CAPABILITY_FAILURE_TTL)):
             return _last_known_gateway_capability(cache_key)
         return None
     return dict(capability) if capability else None
@@ -3482,6 +3516,15 @@ async def _build_and_connect_client(
     subprocess spawn must not block sibling requests. Caller is responsible
     for serialising concurrent misses on the same key via _creation_lock_for().
     """
+    phase_started = time.monotonic()
+
+    def phase_done(phase: str):
+        nonlocal phase_started
+        now = time.monotonic()
+        obs.perf_event("chat.client_build", session=obs.short_id(session_id),
+                       phase=phase, duration_ms=round((now - phase_started) * 1000, 1))
+        phase_started = now
+
     def _load_session_runtime() -> tuple[dict, Path]:
         return (
             sess.get_session(session_id) or {},
@@ -3493,6 +3536,7 @@ async def _build_and_connect_client(
         session_id,
         _load_session_runtime,
     )
+    phase_done("session_read")
     side_question_runtime = (
         sess_data.get("runtime_profile") == "side_question"
     )
@@ -3884,7 +3928,9 @@ async def _build_and_connect_client(
             # own tokenizer, /context output, and native autocompaction agree
             # with CLIProxyAPI's live model catalog. This is a local CLI knob;
             # it does not alter or over-claim the gateway's raw model ceiling.
+            phase_done("options_before_catalog")
             capability = await _detect_gateway_context_capability(model)
+            phase_done("context_catalog")
             details = _context_limit_details(model, capability=capability)
             effective_limit = _positive_int(details.get("context_limit"))
             # A generic meter estimate is not evidence of this model's limit.
@@ -4064,9 +4110,12 @@ async def _build_and_connect_client(
     )
     try:
         client = client_cls(options=ClaudeAgentOptions(**opts_kwargs))
+        phase_done("options_and_client")
         try:
             await client.connect()
+            phase_done("sdk_connect")
         except BaseException:
+            phase_done("sdk_connect_failed")
             # connect() may already have spawned the CLI before it becomes
             # cancellable. Until this function returns, the client is not in
             # the pool and no other cleanup path can reach it.
@@ -20865,15 +20914,20 @@ async def submit_permission_decision_api(
 
 
 @router.get("/providers", dependencies=[Depends(require_token)])
-async def providers_list() -> dict:
+async def providers_list(background_tasks: BackgroundTasks = None) -> dict:
     """Available model groups based on which provider API keys are configured."""
     groups = endpoints.available_groups()
-    codex_capabilities = await _detect_gateway_context_capabilities(
-        i["model"]
-        for group in groups
-        for i in group["items"]
-        if _is_codex_gateway_model(i["model"])
-    )
+    models = [item["model"] for group in groups for item in group["items"]
+              if _is_codex_gateway_model(item["model"])]
+    if background_tasks is None:
+        codex_capabilities = await _detect_gateway_context_capabilities(models)
+    else:
+        # UI discovery returns immediately; the response owns the bounded refresh.
+        # Actual SDK startup still awaits authoritative capacity before setting knobs.
+        codex_capabilities = {model: cap for model in models
+                              if (cap := _cached_gateway_context_capability(model)) is not None}
+        if len(codex_capabilities) < len(models):
+            background_tasks.add_task(_detect_gateway_context_capabilities, models)
     # Flatten to the {group, label, model} shape the frontend expects.
     # supports_thinking / supports_effort are provider-level (see
     # available_groups) — the FE uses them to show/hide per-session controls so
@@ -20920,6 +20974,7 @@ async def providers_list() -> dict:
         busy_send_mode = "adjust"
     return {
         "models": flat,
+        "catalog_pending": background_tasks is not None and len(codex_capabilities) < len(models),
         "default_model": _resolve_default_model(""),
         "default_permission": default_permission,
         "busy_send_mode": busy_send_mode,
@@ -21685,6 +21740,31 @@ def _retain_maintenance_task(task: asyncio.Task) -> None:
     task.add_done_callback(_maintenance_tasks.discard)
 
 
+def _native_cron_delivery_identity(session_id: str, prompt: str) -> dict:
+    """Diagnose possible workspace-level takeover; text never authorizes rerouting.
+
+    Independently created tasks may use identical prompts. Only the actual SDK
+    runtime owns execution and canonical history; receipts provide a candidate
+    creation owner for incident correlation, never a replacement destination.
+    """
+    safe = _safe_sdk_cron_prompt(prompt)
+    candidates = set()
+    if safe is not None:
+        with _sdk_cron_state_lock:
+            for sid, jobs in _sdk_cron_jobs.items():
+                for job_id, raw in jobs.items():
+                    owner = raw.get("owner_session_id") or (sid if raw.get("created_at_ms") else "")
+                    if (owner and raw.get("prompt_sha256") == safe[1]
+                            and raw.get("runtime_state", "active") not in {"finished", "expired", "missing", "paused"}):
+                        candidates.add((str(owner), str(job_id)))
+    local = {item for item in candidates if item[0] == session_id}
+    possible = local or candidates
+    owner = next(iter(possible))[0] if len(possible) == 1 else ""
+    return {"ownership": "local" if local else "foreign_candidate" if len(candidates) == 1
+            else "ambiguous" if candidates else "unknown",
+            "candidate_owner": obs.short_id(owner) or "none", "candidate_count": len(possible)}
+
+
 async def _begin_sdk_delivery(
     key: chat_runtime.ClientKey,
     message: UserMessage,
@@ -21692,6 +21772,9 @@ async def _begin_sdk_delivery(
     scheduled: bool = True,
 ) -> _SDKDelivery:
     prompt = _scheduled_trigger_text(message)
+    if scheduled:
+        obs.perf_event("chat.native_cron_delivery_owner", session=obs.short_id(key[0]),
+                       **_native_cron_delivery_identity(key[0], prompt))
     broadcast = TurnBroadcast(session_id=key[0], model=key[1] or MODEL)
     broadcast.user_text = prompt
     broadcast.is_scheduled_delivery = scheduled

@@ -108,3 +108,66 @@ def test_batch_catalog_discovery_isolates_credentials_on_same_route(app_module, 
         assert {row.headers["authorization"] for row in requests} == {
             "Bearer fixture-a", "Bearer fixture-b"}
     asyncio.run(run())
+
+
+def test_sibling_models_share_catalog_and_route_outage(app_module, monkeypatch):
+    from backend import chat
+    requests = []
+    broken = False
+    async def handler(request):
+        requests.append(request)
+        await asyncio.sleep(.02)
+        if broken:
+            raise httpx.ReadTimeout("fixture", request=request)
+        return httpx.Response(200, json={"models": [
+            {"slug": "fixture-a", "context_window": 256000},
+            {"slug": "fixture-b", "context_window": 128000}]})
+    route = configure(chat, monkeypatch, handler)
+    async def run():
+        nonlocal broken
+        results = await asyncio.gather(*(chat._detect_gateway_context_capability(model)
+            for model in ["codex:fixture-a", "codex:fixture-b"]))
+        assert [result["context_limit"] for result in results] == [243200, 121600]
+        assert len(requests) == 1
+        broken = True
+        route["ANTHROPIC_API_KEY"] = "fixture-outage"
+        assert await chat._detect_gateway_context_capability("codex:fixture-a") is None
+        assert await chat._detect_gateway_context_capability("codex:fixture-b") is None
+        assert len(requests) == 2
+    asyncio.run(run())
+
+
+def test_model_specific_absence_does_not_poison_sibling_fallback(app_module, monkeypatch):
+    from backend import chat
+    requests = []
+    async def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("fixture-b"):
+            return httpx.Response(200, json={"id": "fixture-b", "context_window": 128000})
+        return httpx.Response(404)
+    configure(chat, monkeypatch, handler)
+    async def run():
+        assert await chat._detect_gateway_context_capability("codex:fixture-a") is None
+        result = await chat._detect_gateway_context_capability("codex:fixture-b")
+        assert result and result["context_raw_limit"] == 128000
+        assert sum(bool(request.url.query) for request in requests) == 1
+    asyncio.run(run())
+
+
+def test_provider_ui_defers_catalog_refresh_to_response_owner(app_module, monkeypatch):
+    from backend import chat
+    from fastapi import BackgroundTasks
+    monkeypatch.setattr(chat.endpoints, "available_groups", lambda: [
+        {"group": "fixture", "items": [{"model": "codex:fixture-a", "label": "fixture"}]}])
+    calls = []
+    async def refresh(models):
+        calls.append(list(models))
+        return {}
+    monkeypatch.setattr(chat, "_detect_gateway_context_capabilities", refresh)
+    async def run():
+        tasks = BackgroundTasks()
+        await chat.providers_list(tasks)
+        assert calls == []
+        await tasks()
+        assert calls == [["codex:fixture-a"]]
+    asyncio.run(run())

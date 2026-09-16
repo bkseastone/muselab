@@ -347,3 +347,29 @@ def test_registry_operations_release_connections_without_waiting_for_gc(tmp_path
     finally:
         for conn in opened:
             conn.close()
+
+
+def test_lexical_candidates_match_full_search_without_decoding_bodies(tmp_path, monkeypatch):
+    store = MemoryStore(tmp_path / "registry.sqlite3")
+    first = store.create_memory("owner", "fact", "fixture searchable memory", attributes={"large": "x" * 10000})
+    store.create_memory("other", "fact", "fixture searchable memory")
+    full = store.lexical_search("owner", "searchable")
+    assert [row["memory"]["id"] for row in full] == [first["id"]]
+    monkeypatch.setattr(store, "_row", lambda _row: (_ for _ in ()).throw(AssertionError("decoded body")))
+    candidates = store.lexical_candidates("owner", "searchable")
+    assert candidates == [{"id": first["id"], "score": full[0]["score"], "channel": "lexical"}]
+
+
+def test_storage_timings_split_sql_fetch_and_decode_without_content(tmp_path, monkeypatch):
+    from backend import observability as obs
+    store = MemoryStore(tmp_path / "registry.sqlite3")
+    item = store.create_memory("owner", "fact", "private fixture text")
+    events = []
+    monkeypatch.setattr(obs, "is_slow", lambda *args, **kwargs: True)
+    monkeypatch.setattr(obs, "perf_event", lambda name, **fields: events.append((name, fields)))
+    assert store.memories_with_stats_by_ids("owner", [item["id"]])[0]["id"] == item["id"]
+    fields = events[-1][1]
+    assert all(fields[name] >= 0 for name in ("execute_ms", "fetch_ms", "decode_ms"))
+    assert fields["rows"] >= 1
+    assert "private fixture text" not in repr(events)
+    assert item["id"] not in repr(events)

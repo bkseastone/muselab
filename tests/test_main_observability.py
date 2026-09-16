@@ -382,3 +382,28 @@ def test_history_perf_keeps_receive_parse_and_cancel_reason_private(app_module, 
         assert client.post("/api/log/client-perf", headers=headers,
                            json={**payload, field: "private detail"}).status_code == 422
     assert len(events) == 1
+
+
+def test_render_telemetry_is_bounded_and_rejects_content(app_module, client, monkeypatch):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    payload = {"phase": "transcript", "status": "ok", "cancel_reason": "none",
+               "sid8": "1234abcd", "asset_version": "fixture", "total_ms": 400,
+               "settle_ms": 200, "mounted_count": 20, "generation": 1}
+    assert client.post("/api/log/chat-render", headers=headers, json=payload).status_code == 200
+    assert events[-1][1]["settle_ms"] == 200
+    for extra in ({"text": "private"}, {"phase": "private"}, {"sid8": "full-session-id"}):
+        assert client.post("/api/log/chat-render", headers=headers, json={**payload, **extra}).status_code == 422
+    assert len(events) == 1
+
+
+@pytest.mark.parametrize("reason", ["unstable_snapshot", "older_snapshot", "shorter_snapshot", "missing_terminal_boundary"])
+def test_snapshot_rejection_reason_survives_telemetry(app_module, client, monkeypatch, reason):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append(fields))
+    assert client.post("/api/log/client-perf", headers={"X-Auth-Token": TEST_TOKEN},
+                       json={"status": "cancelled", "mode": "quiet", "cancel_reason": reason}).status_code == 200
+    assert events[0]["cancel_reason"] == reason

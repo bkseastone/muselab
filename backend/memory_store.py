@@ -225,6 +225,46 @@ def _fts_text(content: str) -> str:
     return " ".join(_fts_terms(content))
 
 
+class _TimedReadCursor:
+    def __init__(self, cursor, timings):
+        self._cursor = cursor
+        self._timings = timings
+
+    def fetchall(self):
+        started = time.perf_counter()
+        try:
+            rows = self._cursor.fetchall()
+            self._timings["rows"] += len(rows)
+            return rows
+        finally:
+            self._timings["fetch_ms"] += (time.perf_counter() - started) * 1000
+
+    def fetchone(self):
+        started = time.perf_counter()
+        try:
+            row = self._cursor.fetchone()
+            self._timings["rows"] += int(row is not None)
+            return row
+        finally:
+            self._timings["fetch_ms"] += (time.perf_counter() - started) * 1000
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _TimedReadConnection:
+    def __init__(self, connection, timings):
+        self._connection = connection
+        self._timings = timings
+
+    def execute(self, *args):
+        started = time.perf_counter()
+        try:
+            return _TimedReadCursor(self._connection.execute(*args), self._timings)
+        finally:
+            self._timings["execute_ms"] += (time.perf_counter() - started) * 1000
+
+
 class MemoryStore:
     def __init__(self, path: Path, *, read_only: bool = False):
         self.path = Path(path)
@@ -373,6 +413,7 @@ class MemoryStore:
           ON memories(owner_id, updated_at DESC, id ASC);
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status_id
           ON memories(owner_id, status, id);
+                CREATE INDEX IF NOT EXISTS idx_memories_owner_id ON memories(owner_id,id);
         CREATE TABLE IF NOT EXISTS memory_sources (
           memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
           source_type TEXT NOT NULL, source_id TEXT NOT NULL, relation TEXT NOT NULL,
@@ -929,13 +970,14 @@ class MemoryStore:
         started = time.perf_counter()
         acquired = connected = finished = None
         status = "error"
+        timings = {"execute_ms": 0.0, "fetch_ms": 0.0, "rows": 0}
         try:
             with self._lock:
                 acquired = time.perf_counter()
                 with self._connect() as conn:
                     connected = time.perf_counter()
                     try:
-                        yield conn
+                        yield _TimedReadConnection(conn, timings)
                         status = "ok"
                     finally:
                         finished = time.perf_counter()
@@ -949,7 +991,11 @@ class MemoryStore:
                     lock_ms=((acquired or ended) - started) * 1000,
                     connect_ms=((connected or ended) - acquired) * 1000 if acquired else 0,
                     read_decode_ms=((finished or ended) - connected) * 1000 if connected else 0,
-                    close_ms=(ended - finished) * 1000 if finished else 0)
+                    close_ms=(ended - finished) * 1000 if finished else 0,
+                    execute_ms=timings["execute_ms"], fetch_ms=timings["fetch_ms"],
+                    decode_ms=max(0, ((finished or ended) - connected) * 1000
+                                  - timings["execute_ms"] - timings["fetch_ms"])
+                    if connected else 0, rows=timings["rows"])
 
     def memories_with_stats_by_ids(self, owner_id: str,
                                    memory_ids: list[str]) -> list[dict]:
@@ -1208,9 +1254,13 @@ class MemoryStore:
         self.audit(owner_id, "delete", "memory", memory_id)
         return True
 
+    def lexical_candidates(self, owner_id: str, query: str, *, limit: int = 20) -> list[dict]:
+        """Recall only needs ranks and IDs; hydrate each selected memory once."""
+        return self.lexical_search(owner_id, query, limit=limit, _ids_only=True)
+
     def lexical_search(self, owner_id: str, query: str, *, limit: int = 20,
                        include_status: str | None = "active",
-                       kind: str | None = None) -> list[dict]:
+                       kind: str | None = None, _ids_only: bool = False) -> list[dict]:
         # Expand the query the same way the index was written (_fts_text), so
         # Chinese input turns into the bigrams actually stored instead of one
         # unmatchable whole-sentence token. Deduplicate while preserving order:
@@ -1231,7 +1281,7 @@ class MemoryStore:
         with self._observed_read("lexical") as conn:
             try:
                 rows = conn.execute(
-                    f"""SELECT m.*, bm25(memory_fts) AS lexical_rank
+                    f"""SELECT {"m.id" if _ids_only else "m.*"}, bm25(memory_fts) AS lexical_rank
                         FROM memory_fts JOIN memories m ON m.id=memory_fts.memory_id
                         WHERE memory_fts MATCH ? AND m.owner_id=?
                         {status_clause} {kind_clause}
@@ -1246,7 +1296,7 @@ class MemoryStore:
                                     sqlite3.SQLITE_LOCKED}:
                     raise
                 return []
-            return [{"memory": self._row(row) or {},
+            return [{**({"id": row["id"]} if _ids_only else {"memory": self._row(row) or {}}),
                      "score": 1.0 / (1.0 + abs(float(row["lexical_rank"]))),
                      "channel": "lexical"} for row in rows]
 
