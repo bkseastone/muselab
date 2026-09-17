@@ -67,8 +67,14 @@ cmd_status() {
   echo "  后端   : ./backend                    -> /app/backend   (改后自动 reload)"
   echo "  前端   : ./frontend                   -> /app/frontend  (改后刷新浏览器)"
   echo "  skills : ./skills                     -> /app/skills"
-  echo "  配置   : ./provider_overrides.json,"
-  echo "           ./mcp.json                   -> /app/"
+  echo "  配置   : ./config                     -> /app/sessions/config"
+  echo "                                           (provider_overrides.json / mcp.json;"
+  echo "                                            UI 保存的 key 落 config/.env)"
+  echo "  claude : \${CLAUDE_HOME} (见 .env)     -> /home/muse/.claude"
+  echo
+  echo "  根 .env 不经 ./config 挂载: 由 env_file 注入进程 env (改后需"
+  echo "  ./muse.sh up 重新 create 才生效, restart 无效); 若 config/.env 存在,"
+  echo "  其同名变量会覆盖根 .env (MUSELAB_ENV_OVERRIDE=1)"
 }
 
 cmd_health() {
@@ -100,9 +106,9 @@ cmd_backup() {
   ts=$(date +%Y%m%d-%H%M%S)
   dest="backups/muselab-$ts.tar.gz"
   mkdir -p backups
-  tar czf "$dest" data sessions provider_overrides.json mcp.json .env 2>/dev/null
+  tar czf "$dest" data sessions config .env 2>/dev/null
   ok "已备份: $dest"
-  echo "  内容: data/ sessions/ provider_overrides.json mcp.json .env"
+  echo "  内容: data/ sessions/ config/ .env"
   echo "  恢复: tar xzf $dest  (在项目根解压覆盖)"
 }
 

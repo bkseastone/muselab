@@ -24,7 +24,8 @@ services:
       - ./backend:/app/backend
       - ./frontend:/app/frontend
       - ./skills:/app/skills
-      # UI 配的 provider/MCP 持久化: 这俩写在容器内 /app,
-      # 不挂载的话 `docker rm` 重建会丢.
-      - ./provider_overrides.json:/app/provider_overrides.json
-      - ./mcp.json:/app/mcp.json
+      # UI 配的 provider/MCP 持久化: base 设 MUSELAB_CONFIG_DIR=/app/sessions/config,
+      # backend 从这里读 provider_overrides.json / mcp.json / .env.
+      # 目录挂载按路径解析: 宿主机任何编辑方式实时生效, UI 保存(rename)也正常.
+      # (单文件挂载有 inode 失效坑: rename 式编辑后容器仍读旧文件.)
+      - ./config:/app/sessions/config
