@@ -2318,7 +2318,10 @@ async def test_reconcile_failures_back_off_coalesce_and_reset(
                         if event == "files.reconcile"]
     assert [fields["attempt"] for fields in reconcile_events] == [1, 2, 3]
     assert [fields["failures"] for fields in reconcile_events] == [1, 2, 0]
-    assert [fields["backoff_ms"] for fields in reconcile_events] == [20, 40, 0]
+    # A slow runner can spend longer than the base delay in the failed scan.
+    # Retry also accounts for that elapsed work, bounded by the configured cap.
+    assert 20 <= reconcile_events[0]["backoff_ms"] <= 40
+    assert [fields["backoff_ms"] for fields in reconcile_events[1:]] == [40, 0]
     assert {fields["phase"] for fields in reconcile_events} == {"initial"}
     captured = repr(reconcile_events)
     assert str(temp_root) not in captured

@@ -1491,9 +1491,15 @@ async def client_chat_render_log(payload: dict = Body(...)) -> dict:
     """Closed-set diagnostics for the full visual transaction and deferred work."""
     numeric = {"total_ms", "settle_ms", "chars", "long_task_count", "longest_task_ms",
                "block_count", "mounted_count", "generation"}
-    labels = {"phase": {"transcript", "markdown", "highlight"},
+    labels = {"phase": {"transcript", "markdown", "highlight", "tail"},
               "status": {"ok", "plain", "error", "cancelled"},
               "cancel_reason": {"none", "superseded", "live_owner", "timeout", "failed"}}
+    if payload.get("phase") == "tail":
+        numeric.update({"visible_start", "visible_end", "range_offset", "canonical_total",
+                        "known_canonical_count", "bottom_distance", "following", "streaming",
+                        "pending_sync", "history_fetch", "progress_age_ms", "transport_age_ms"})
+        labels["status"].add("start")
+        labels["trigger"] = {"jump", "scroll", "programmatic"}
     invalid = any(key not in numeric | labels.keys() | {"sid8", "asset_version"}
                   for key in payload)
     invalid |= any(not isinstance(payload.get(key), str) or payload[key] not in values

@@ -1972,7 +1972,7 @@
                || transcriptLoadingVisible()">
         <div class="chat-body" x-ref="chatBody"
              :inert="transcriptLoadingVisible()"
-             @scroll="onChatScroll()" @wheel.passive="_userScrollIntent($event)" @touchstart.passive="_chatTouchStart($event)" @touchmove.passive="_userScrollIntent($event)" @pointerdown.passive="_userScrollIntent($event)" @click="onChatClick($event)">
+             @scroll="onChatScroll()" @wheel.passive="_userScrollIntent($event)" @touchstart.passive="_chatTouchStart($event)" @touchmove.passive="_userScrollIntent($event)" @pointerdown.passive="_userScrollIntent($event)" @pointerup.window="_chatPointerScroll = null" @pointercancel.window="_chatPointerScroll = null" @keydown="_userScrollIntent($event)" @click="onChatClick($event)">
           <div x-show="transcriptLoadFailed()"
                class="chat-load-error"
                :class="{ 'has-resident': activeSession.messages.length }"
@@ -3265,7 +3265,7 @@
             <span x-text="t('chat.loading_session')"></span>
           </div>
         </div>
-        <button class="jump-bottom" x-show="isAwayFromLatest()" @click="returnToLatest()" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
+        <button class="jump-bottom" x-show="isAwayFromLatest()" @click="returnToLatest(currentId, 'jump')" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
         <!-- Outline FAB — sits right above jump-bottom in the same chat pane.
              All three controls stay available whenever the reader is physically
              away from the tail or the bounded range still hides later messages. -->

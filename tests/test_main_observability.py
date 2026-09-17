@@ -407,3 +407,24 @@ def test_snapshot_rejection_reason_survives_telemetry(app_module, client, monkey
     assert client.post("/api/log/client-perf", headers={"X-Auth-Token": TEST_TOKEN},
                        json={"status": "cancelled", "mode": "quiet", "cancel_reason": reason}).status_code == 200
     assert events[0]["cancel_reason"] == reason
+
+
+def test_tail_navigation_telemetry_separates_received_and_visible_counts(app_module, client, monkeypatch):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    payload = {"phase":"tail", "trigger":"jump", "status":"start", "cancel_reason":"none",
+               "sid8":"1234abcd", "asset_version":"fixture", "block_count":132,
+               "mounted_count":100, "visible_start":2, "visible_end":102,
+               "range_offset":0, "canonical_total":132, "bottom_distance":0,
+               "following":0, "streaming":1, "history_fetch":0, "progress_age_ms":250}
+    assert client.post("/api/log/chat-render", headers=headers, json=payload).status_code == 200
+    event, data = events[-1]
+    assert event == "client.chat_render"
+    assert data["block_count"] == 132 and data["visible_end"] == 102
+    assert data["history_fetch"] == 0 and data["bottom_distance"] == 0
+    for extra in ({"text":"private"}, {"trigger":"private"}, {"sid8":"full-session-id"},
+                  {"phase":"transcript"}, {"path":"private"}):
+        assert client.post("/api/log/chat-render", headers=headers, json={**payload,**extra}).status_code == 422
+    assert len(events) == 1

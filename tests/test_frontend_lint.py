@@ -423,7 +423,7 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert "calc(100vh - 24px)" in desktop_resize
     for edge in ("n", "ne", "e", "se", "s", "sw", "w", "nw"):
         assert f".preview-selection-resize-handle.is-{edge}" in desktop_resize
-    scroll_intent_start = app.index("\n    _userScrollIntent(ev) {")
+    scroll_intent_start = app.index("\n    _applyChatScrollIntent(direction) {")
     scroll_intent_end = app.index("\n    scrollToBottom(", scroll_intent_start)
     scroll_intent = app[scroll_intent_start:scroll_intent_end]
     assert "this.dismissPreviewQuote(false)" in scroll_intent
@@ -3943,11 +3943,11 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     assert 'tail.scrollIntoView({ block: "end"' in controller
     assert 'x-ref="chatBottom"' in html
 
-    intent_start = app.index("    _userScrollIntent(ev) {")
+    intent_start = app.index("    _applyChatScrollIntent(direction) {")
     intent_end = app.index("    _ensureChatTailObserver() {", intent_start)
     intent = app[intent_start:intent_end]
-    assert 'ev.type === "wheel"' in intent
-    assert "Number(ev.deltaY) < 0" in intent
+    assert 'ev?.type === "wheel"' in intent
+    assert "Math.sign(Number(ev.deltaY) || 0)" in intent
     assert "st.atBottom = false" in intent
     assert "this._settleToken = (this._settleToken || 0) + 1" in intent
 
@@ -3970,7 +3970,7 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     assert "this._scheduleTransparentHistory(st, false)" not in load
 
     earlier_start = app.index("    async loadEarlierMessages(sid) {")
-    earlier_end = app.index("    async returnToLatest(sid)", earlier_start)
+    earlier_end = app.index("    async returnToLatest(", earlier_start)
     earlier = app[earlier_start:earlier_end]
     assert "const liveWindow = this._isLiveMessagePane(st)" in earlier
     assert "this._liveMessageHistoryStep() : this._historyMountWindowSize()" in earlier
@@ -4021,7 +4021,7 @@ def test_live_turn_bounds_dom_and_indexes_task_status_without_linear_scans():
     assert send.index("sendState.atBottom = true") < send.index(
         "stageQueueAdmission();")
 
-    assert '@click="returnToLatest()"' in html
+    assert "@click=\"returnToLatest(currentId, 'jump')\"" in html
     assert html.count('x-show="isAwayFromLatest()"') >= 3
     assert "summary_truncated" in html
 
