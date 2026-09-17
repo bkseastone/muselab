@@ -1186,6 +1186,7 @@ function portal() {
     // History presentation uses it to detect newer reader navigation across
     // async work. _userScrollIntent immediately pauses auto-follow.
     _userScrollAt: 0,
+    _chatPointerScroll: null,
     theme: "dark",
     // Eyecare level 2 is the historical palette, so existing users keep the
     // exact same appearance until they deliberately choose softer/warmer.
@@ -8896,6 +8897,8 @@ function portal() {
         atBottom: true,
         scrollTop: 0,
         _userScrollAt: 0,
+        _pausedTailKey: "",
+        _scrollTowardLatestAt: 0,
         _autoScrolling: false,
         // True when this tab's turn finished while the user was looking at a
         // different tab — drives a green dot on the tab strip so the user
@@ -18563,7 +18566,8 @@ function portal() {
       requestAnimationFrame(() => requestAnimationFrame(fn));
     },
     _reportRenderPerf(fields) {
-      if (fields.phase !== "transcript" && fields.total_ms < 50 && fields.chars < 16 * 1024) return;
+      if (!["transcript", "tail"].includes(fields.phase)
+          && fields.total_ms < 50 && fields.chars < 16 * 1024) return;
       const payload = {
         phase: fields.phase,
         status: fields.status,
@@ -18572,8 +18576,16 @@ function portal() {
         asset_version: String(document.querySelector(
           'meta[name="muselab-asset-version"]')?.content || "").slice(0, 32),
       };
-      for (const name of ["total_ms", "settle_ms", "chars", "long_task_count",
-        "longest_task_ms", "block_count", "mounted_count", "generation"]) {
+      const numeric = ["total_ms", "settle_ms", "chars", "long_task_count",
+        "longest_task_ms", "block_count", "mounted_count", "generation"];
+      if (fields.phase === "tail") {
+        payload.trigger = ["jump", "scroll", "programmatic"].includes(fields.trigger)
+          ? fields.trigger : "programmatic";
+        numeric.push("visible_start", "visible_end", "range_offset", "canonical_total",
+          "known_canonical_count", "bottom_distance", "following", "streaming",
+          "pending_sync", "history_fetch", "progress_age_ms", "transport_age_ms");
+      }
+      for (const name of numeric) {
         payload[name] = Math.max(0, Math.min(Math.round(Number(fields[name]) || 0), 100_000_000));
       }
       try {
@@ -20911,42 +20923,78 @@ function portal() {
         st._loadingEarlier = false;
       }
     },
-    async returnToLatest(sid) {
+    _reportChatTail(st, trigger, status, historyFetch, started) {
+      try {
+        const el = st._sid === this.currentId ? this._chatBodyElement() : null;
+        const pane = this._paneElement(st._sid);
+        const meta = (this.sessions || []).find(row => row.id === st._sid);
+        const age = value => value ? Math.max(0, Date.now() - value) : 0;
+        this._reportRenderPerf({
+          phase: "tail", trigger, status, sid8: String(st._sid || "").slice(0, 8),
+          total_ms: performance.now() - started,
+          block_count: st.messages.length,
+          mounted_count: pane?.querySelectorAll(".msg").length || 0,
+          visible_start: st.messageRange.visibleStart, visible_end: st.messageRange.visibleEnd,
+          range_offset: st.messageRange.offset, canonical_total: st.messageRange.total,
+          known_canonical_count: Number(meta?.message_count) || 0,
+          bottom_distance: el ? el.scrollHeight - el.scrollTop - el.clientHeight : 0,
+          following: Number(st.atBottom !== false), streaming: Number(!!(st.streaming || st.es)),
+          pending_sync: Number(!!st._pendingExternalUpdate), history_fetch: Number(historyFetch),
+          progress_age_ms: age(st._lastSseProgressAt), transport_age_ms: age(st._lastSseTransportAt),
+        });
+      } catch (_) { /* diagnostics must never change navigation */ }
+    },
+    async returnToLatest(sid, trigger = "programmatic") {
       sid = sid || this.currentId;
       const st = sid && this.tabState[sid];
       if (!st) return false;
-      const range = st.messageRange;
-      const navigationUserScrollAt = Number(st._userScrollAt) || 0;
-      st.atBottom = false;
-      const meta = (this.sessions || []).find(row => row.id === sid);
-      const needsFreshTail = st._pendingExternalUpdate || st._historyAnchorRecovery
-        || (Number(st._reconcileTargetUpdated) || 0) > (Number(st._seenUpdated) || 0)
-        || (Number(meta?.updated_at) || 0) > (Number(st._seenUpdated) || 0)
-        || (Number(meta?.message_count) || 0) > (Number(st._installedCanonicalCount) || 0);
-      if (!st.streaming && !st.es
-          && (needsFreshTail || range.offset + st.messages.length < range.total)) {
-        const loaded = await this.loadSession(sid, {
-          quiet: sid === this.currentId,
-          followTail: true,
+      const report = trigger !== "programmatic" || this._messageRangeHasLater(st)
+        || st._pendingExternalUpdate;
+      const started = performance.now();
+      let status = "cancelled", historyFetch = false;
+      if (report) this._reportChatTail(st, trigger, "start", historyFetch, started);
+      try {
+        const range = st.messageRange;
+        const navigationUserScrollAt = Number(st._userScrollAt) || 0;
+        st.atBottom = false;
+        const meta = (this.sessions || []).find(row => row.id === sid);
+        const needsFreshTail = st._pendingExternalUpdate || st._historyAnchorRecovery
+          || (Number(st._reconcileTargetUpdated) || 0) > (Number(st._seenUpdated) || 0)
+          || (Number(meta?.updated_at) || 0) > (Number(st._seenUpdated) || 0)
+          || (Number(meta?.message_count) || 0) > (Number(st._installedCanonicalCount) || 0);
+        if (!st.streaming && !st.es
+            && (needsFreshTail || range.offset + st.messages.length < range.total)) {
+          historyFetch = true;
+          const loaded = await this.loadSession(sid, {
+            quiet: sid === this.currentId,
+            followTail: true,
+          });
+          if (!loaded || this.tabState[sid] !== st
+              || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return false;
+        } else {
+          const windowSize = this._isLiveMessagePane(st)
+            ? this._liveMessageDomCap() : this._historyMountWindowSize();
+          range.visibleEnd = st.messages.length;
+          range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
+          this._scheduleHistoryViewport(st, "newer");
+        }
+        this._enforceMessageRangeInvariant(st);
+        if (this._messageRangeHasLater(st)) return false;
+        st.atBottom = true;
+        if (sid === this.currentId) this.$nextTick(() => {
+          if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false
+              || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return;
+          this.scrollToBottom(true);
         });
-        if (!loaded || this.tabState[sid] !== st
-            || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return false;
-      } else {
-        const windowSize = this._isLiveMessagePane(st)
-          ? this._liveMessageDomCap() : this._historyMountWindowSize();
-        range.visibleEnd = st.messages.length;
-        range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
-        this._scheduleHistoryViewport(st, "newer");
+        status = "ok";
+        return true;
+      } finally {
+        if (report) this.$nextTick(() => {
+          if (this.tabState[sid] === st) {
+            this._reportChatTail(st, trigger, status, historyFetch, started);
+          }
+        });
       }
-      this._enforceMessageRangeInvariant(st);
-      if (this._messageRangeHasLater(st)) return false;
-      st.atBottom = true;
-      if (sid === this.currentId) this.$nextTick(() => {
-        if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false
-            || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return;
-        this.scrollToBottom(true);
-      });
-      return true;
     },
     hasLaterMessages(sid) {
       return this._messageRangeHasLater(this.tabState[sid || this.currentId]);
@@ -32958,12 +33006,21 @@ function portal() {
       const el = this._chatBodyElement();
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      const pointer = this._chatPointerScroll;
+      let movedTowardLatest = false;
+      if (st && pointer?.sid === this.currentId
+          && Math.abs(el.scrollTop - pointer.top) > 1) {
+        const direction = el.scrollTop > pointer.top ? 1 : -1;
+        pointer.top = el.scrollTop;
+        this._applyChatScrollIntent(direction);
+      }
       if (st) {
         const now = (typeof performance !== "undefined" && performance.now)
           ? performance.now() : Date.now();
         const previousTop = Number(st._lastVirtualScrollTop) || 0;
         const previousAt = Number(st._lastVirtualScrollAt) || now;
         const delta = el.scrollTop - previousTop;
+        movedTowardLatest = delta > 1;
         const elapsed = Math.max(8, now - previousAt);
         st._virtualScrollDirection = delta < -1 ? -1 : (delta > 1 ? 1 : st._virtualScrollDirection);
         st._virtualScrollVelocity = Math.min(20000, Math.abs(delta) * 1000 / elapsed);
@@ -32987,10 +33044,12 @@ function portal() {
       // mis-classify and never re-engage auto-follow).
       const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
       if (nearBottom) {
-        // The physical bottom of a frozen range is not the logical transcript
-        // tail. Keep the jump affordance until hidden later messages are restored.
+        // Returning through a real downward gesture resumes a paused live tail.
+        // Layout scrolls and explicitly paged historical windows keep their range.
+        if (movedTowardLatest && this._resumePausedChatTail(st, el)) return;
         if (st) {
           st.atBottom = !this.hasLaterMessages(this.currentId);
+          if (st.atBottom) st._pausedTailKey = "";
           st.scrollTop = el.scrollTop;
         }
         return;
@@ -33007,57 +33066,83 @@ function portal() {
       const touch = ev && ev.touches && ev.touches[0];
       this._chatTouchY = touch ? touch.clientY : null;
     },
+    _resumePausedChatTail(st, el) {
+      if (!st || !el || st._sid !== this.currentId || st.atBottom !== false
+          || !st._pausedTailKey || !this._messageRangeHasLater(st)
+          || st._pausedTailKey !== st.messages[st.messageRange.visibleEnd - 1]?._k
+          || !st._scrollTowardLatestAt
+          || st._scrollTowardLatestAt !== st._userScrollAt
+          || el.scrollHeight - el.scrollTop - el.clientHeight >= 2) return false;
+      // The reader reached the same tail where follow was paused, not the end
+      // of a different history page. A momentum scroll can outlive its input
+      // event; newer input direction, rather than a timer, owns that decision.
+      st._pausedTailKey = "";
+      void this.returnToLatest(st._sid, "scroll");
+      return true;
+    },
+    _applyChatScrollIntent(direction) {
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      if (!st || !direction) return;
+      this._userScrollAt = Date.now();
+      st._userScrollAt = this._userScrollAt;
+      if (direction > 0) {
+        st._scrollTowardLatestAt = st._userScrollAt;
+        // At the physical bottom another wheel/touch gesture need not produce
+        // a scroll event. It must still be able to reveal pending local messages.
+        this._resumePausedChatTail(st, this._chatBodyElement());
+        return;
+      }
+      st._scrollTowardLatestAt = 0;
+      if (st.atBottom !== false && !this._messageRangeHasLater(st)) {
+        st._pausedTailKey = st.messages[st.messageRange.visibleEnd - 1]?._k || "";
+      }
+      if (this.previewQuote.show && this.previewQuote.source === "chat"
+          && this.previewQuote.mode !== "ask") this.dismissPreviewQuote(false);
+      st.atBottom = false;
+      this._settleToken = (this._settleToken || 0) + 1;
+      this._autoScrolling = false;
+    },
     _userScrollIntent(ev) {
       const el = this._chatBodyElement();
-      let movesTowardHistory = true;
-      if (ev && ev.type === "wheel") {
-        movesTowardHistory = Number(ev.deltaY) < 0;
-      } else if (ev && ev.type === "touchmove") {
-        const touch = ev.touches && ev.touches[0];
-        const previousY = Number(this._chatTouchY);
-        const currentY = touch ? touch.clientY : previousY;
-        movesTowardHistory = Number.isFinite(previousY) && currentY > previousY;
-        this._chatTouchY = currentY;
-      } else if (ev && ev.type === "pointerdown" && el) {
-        // A pointer press inside message content is selection/clicking, not a
-        // scroll request. Only the scrollbar gutter claims pointerdown as a
-        // possible reader-controlled scroll; wheel/touch paths know direction.
-        const rect = el.getBoundingClientRect();
-        movesTowardHistory = Number(ev.clientX) >= rect.right - 20;
+      let direction = -1;
+      if (ev?.type === "wheel") {
+        direction = Math.sign(Number(ev.deltaY) || 0);
+      } else if (ev?.type === "touchmove") {
+        const currentY = ev.touches?.[0]?.clientY;
+        const previousY = this._chatTouchY;
+        this._chatTouchY = Number.isFinite(currentY) ? currentY : null;
+        if (!Number.isFinite(previousY) || !Number.isFinite(currentY)) return;
+        direction = Math.sign(previousY - currentY);
+      } else if (ev?.type === "keydown") {
+        if (ev.target?.closest("input,textarea,[contenteditable=true]")) return;
+        if (["ArrowUp", "PageUp", "Home"].includes(ev.key)) direction = -1;
+        else if (["ArrowDown", "PageDown", "End"].includes(ev.key)) direction = 1;
+        else return;
+      } else if (ev?.type === "pointerdown") {
+        if (!el || Number(ev.clientX) < el.getBoundingClientRect().right - 20) return;
+        direction = 0;
       }
-      if (!movesTowardHistory) return;
-      // Tool output/code panels have their own scroll containers. Their
-      // bubbling gestures do not mean the reader left the conversation tail.
-      // At an inner boundary allow normal scroll chaining to claim the outer
-      // viewport, unless the panel explicitly contains that chain.
+      if (!direction && ev?.type !== "pointerdown") return;
+      // A scrollable inner thinking/code/tool panel consumes its own gestures.
+      // Only chaining past the relevant boundary belongs to the conversation.
       for (let node = ev?.target instanceof Element ? ev.target : null;
         node && node !== el; node = node.parentElement) {
         const style = getComputedStyle(node);
         if (!/(auto|scroll|overlay)/.test(style.overflowY)
             || node.scrollHeight <= node.clientHeight + 1) continue;
-        if (ev.type === "pointerdown" || node.scrollTop > 0
+        const innerCanScroll = direction < 0 ? node.scrollTop > 0
+          : node.scrollTop + node.clientHeight < node.scrollHeight - 1;
+        if (ev.type === "pointerdown" || innerCanScroll
             || /^(contain|none)$/.test(style.overscrollBehaviorY)) return;
       }
-      if (this.previewQuote.show && this.previewQuote.source === "chat"
-          && this.previewQuote.mode !== "ask") {
-        // Hide the contextual actions while the transcript moves, but preserve
-        // the browser selection. Clearing it here made wheel-assisted text
-        // selection impossible: once the actions popover appeared, the next
-        // wheel tick called removeAllRanges() even while the mouse button was
-        // still held, so users could not extend a selection across viewports.
-        this.dismissPreviewQuote(false);
+      if (ev?.type === "pointerdown") {
+        // Pressing the scrollbar (or nearby content) is not itself scrolling.
+        // Observe actual movement before pausing, so a stationary click cannot
+        // freeze all subsequent messages while the reader remains at the bottom.
+        this._chatPointerScroll = { sid: this.currentId, top: el.scrollTop };
+        return;
       }
-      this._userScrollAt = Date.now();
-      const st = this.currentId && this.tabState && this.tabState[this.currentId];
-      if (st) {
-        st._userScrollAt = this._userScrollAt;
-        st.atBottom = false;
-      }
-      // A real upward gesture immediately owns the viewport. Cancel any tail
-      // settle that was still realizing content-visibility rows; waiting for its
-      // next synthetic scroll event would let it yank the reader back down.
-      this._settleToken = (this._settleToken || 0) + 1;
-      this._autoScrolling = false;
+      this._applyChatScrollIntent(direction);
     },
     _ensureChatTailObserver() {
       const body = this._chatBodyElement();
@@ -33158,6 +33243,7 @@ function portal() {
           return;
         }
         st.atBottom = true;
+        st._pausedTailKey = "";
         this._syncMessageViewport(sid, true);
         this.$nextTick(() => {
           if (this.currentId !== sid || this.tabState[sid] !== st) return;
