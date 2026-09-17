@@ -3250,7 +3250,9 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
     reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true, onFirstReveal = null)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
-    assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
+    assert "if (this.tabState[sid] !== st) return false" in reveal
+    assert "if (st.streaming || st.es)" in reveal
+    assert "this._historyReplaceStillOwns(st, owner)" in reveal
     assert "const CH = this._isMobileLayout() ? 1 : 2" in reveal
     assert "let cursor = finalEnd" in reveal
     assert "st.messageRange.visibleStart = nextStart" in reveal
@@ -3274,7 +3276,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
     assert "all = this._preserveCanonicalMessageIdentity(st, all, completedBoundary)" in load
-    assert "const quietRangeSnapshot = quiet" in load
+    assert "let quietRangeSnapshot = quiet" in load
     assert re.search(r"this\._resolveMessageRangeSnapshot\(\s*all, quietRangeSnapshot, allowRemovedAnchors\)", load)
     assert "this._historyReplaceStillOwns(st, historyReplaceToken)" in load
     assert "await new Promise(resolve => this.$nextTick(resolve))" in load
@@ -3495,7 +3497,7 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
     )
     mutation_re = re.compile(
         r"\b(?:st|sendState|ownerState|newSt|child)\.messages"
-        r"(?:\.(?:push|unshift|splice|pop|shift)\s*\(|\.length\s*=|\s*=)"
+        r"(?:\.(?:push|unshift|splice|pop|shift)\s*\(|\.length\s*=(?!=)|\s*=(?!=))"
     )
     for line in app.splitlines():
         declaration = method_re.match(line)
@@ -4259,10 +4261,13 @@ def test_cold_history_reveal_never_marks_a_nonempty_session_with_an_empty_range(
     reveal = app[reveal_start:reveal_end]
     assignment = reveal.index("st.messageRange.visibleStart = nextStart")
     cancellation = reveal.index(
-        "if (this.tabState[sid] !== st || st.streaming || st.es) return",
+        "if (!ownsReveal()) return",
         reveal.index("const finalStart = Math.max(st.messageRange.visibleStart"),
     )
-    assert assignment < cancellation
+    # A live handoff repairs an empty range inside the ownership guard, before
+    # a stale batch can overwrite the valid range extended by new SSE messages.
+    assert "this._ensureNonEmptyMessageRange(st);" in reveal
+    assert cancellation < assignment
     assert "st.messageRange.visibleStart = finalEnd" not in reveal
     assert "st.messageRange.visibleEnd = finalEnd" in reveal
     assert "await this._yieldHistoryInstall();" in reveal
