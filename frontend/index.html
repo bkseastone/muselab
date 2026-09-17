@@ -2358,7 +2358,13 @@
                       <span class="thinking-label-text">thinking</span>
                       <span x-show="!isMsgExpanded(i, m, false, pane, paneMsgs)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
                     </div>
-                    <pre x-show="isMsgExpanded(i, m, false, pane, paneMsgs)" x-text="m.text"></pre>
+                    <pre x-data="thinkingViewport()"
+                         x-show="isMsgExpanded(i, m, false, pane, paneMsgs)" x-text="m.text"
+                         x-effect="syncThinking(m.text, isMsgExpanded(i, m, false, pane, paneMsgs), pane && pane.streaming)"
+                         @scroll.passive="onThinkingScroll()" @wheel.passive="onThinkingWheel($event)"
+                         @touchstart.passive="onThinkingTouchStart($event)" @touchmove.passive="onThinkingTouchMove($event)"
+                         @pointerdown.passive="onThinkingPointer($event)" @keydown="onThinkingKey($event)"
+                         tabindex="0"></pre>
                   </div>
                 </div>
               </template>

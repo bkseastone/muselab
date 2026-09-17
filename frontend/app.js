@@ -1183,8 +1183,8 @@ function portal() {
     // backend is not evidence of a missing provider either.
     _modelsLoaded: false,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
-    // onChatScroll uses it to disengage auto-follow ONLY on user-driven
-    // scroll-up, never on layout-induced scroll events. See _userScrollIntent.
+    // History presentation uses it to detect newer reader navigation across
+    // async work. _userScrollIntent immediately pauses auto-follow.
     _userScrollAt: 0,
     theme: "dark",
     // Eyecare level 2 is the historical palette, so existing users keep the
@@ -16896,6 +16896,55 @@ function portal() {
         this.retryFailedMessage(m);
       }
     },
+    thinkingViewport() {
+      // Each thinking block owns its inner scroll intent. Data updates queue one
+      // post-Alpine frame; an upward reader gesture pauses only this block.
+      let following = true, eligible = false, touchY = null;
+      let frame = null, disposed = false;
+      return {
+        syncThinking(_text, expanded, streaming) {
+          eligible = !!expanded && !!streaming
+            && this.pane?.messages?.at(-1) === this.m;
+          if (!eligible || !following || disposed) return;
+          const el = this.$el;
+          this.$nextTick(() => {
+            if (frame !== null || disposed || !eligible || !following) return;
+            frame = requestAnimationFrame(() => {
+              frame = null;
+              if (disposed || !eligible || !following || !el.isConnected
+                  || !el.getClientRects().length) return;
+              el.scrollTop = el.scrollHeight;
+            });
+          });
+        },
+        onThinkingScroll() {
+          const el = this.$el;
+          // Layout growth is not a user decision to stop following.
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 2) following = true;
+        },
+        onThinkingWheel(event) {
+          if (Number(event.deltaY) < 0) following = false;
+        },
+        onThinkingTouchStart(event) {
+          touchY = event.touches?.[0]?.clientY ?? null;
+        },
+        onThinkingTouchMove(event) {
+          const nextY = event.touches?.[0]?.clientY;
+          if (touchY !== null && Number.isFinite(nextY) && nextY > touchY) following = false;
+          touchY = Number.isFinite(nextY) ? nextY : null;
+        },
+        onThinkingPointer(event) {
+          if (Number(event.clientX) >= this.$el.getBoundingClientRect().right - 20) following = false;
+        },
+        onThinkingKey(event) {
+          if (["ArrowUp", "PageUp", "Home"].includes(event.key)) following = false;
+        },
+        destroy() {
+          disposed = true;
+          if (frame !== null) cancelAnimationFrame(frame);
+        },
+      };
+    },
     thinkingClass(i, m, paneState = null, paneMsgs = null) {
       return this.isMsgExpanded(i, m, false, paneState, paneMsgs)
         ? "thinking" : "thinking collapsed";
@@ -18907,8 +18956,10 @@ function portal() {
       // deferred instead of recursively treating it as completed.
       if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
       const historyReplaceToken = this._beginHistoryReplace(st);
-      const quietRangeSnapshot = quiet
+      let quietRangeSnapshot = quiet
         ? this._captureMessageRangeSnapshot(st) : null;
+      const requestedUserScrollAt = Number(st._userScrollAt) || 0;
+      const requestedAtBottom = st.atBottom !== false;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -18918,9 +18969,9 @@ function portal() {
       // mid-load corrupts the now-active tab (messages not assigned / skeleton
       // stuck / model/effort overwritten by the old session). See loadSession race.
       const isCurrent = sid === this.currentId;
-      const quietScrollEl = quiet && isCurrent ? this._chatBodyElement() : null;
-      const quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
-      const quietAnchor = quietScrollEl && !st.atBottom
+      let quietScrollEl = quiet && isCurrent ? this._chatBodyElement() : null;
+      let quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
+      let quietAnchor = quietScrollEl && !st.atBottom
         ? this._captureViewportMessageAnchor(quietScrollEl, sid) : null;
       // Quiet refresh keeps the existing bubbles on screen (morph swap below) —
       // raising the skeleton would defeat the point, so only cold/switch loads
@@ -19181,10 +19232,25 @@ function portal() {
         // points the DOM at entirely different (usually much earlier) messages.
         // Snapshot stable keys before replacing the range and synchronously
         // rebase after it, so Alpine never paints one frame with invalid indices.
+        const quietNavigationChanged = quiet && (
+          (Number(st._userScrollAt) || 0) !== requestedUserScrollAt
+          || (st.atBottom !== false) !== requestedAtBottom
+        );
+        if (quietNavigationChanged) {
+          // Network and Markdown work can outlive a jump-to-latest or an upward
+          // gesture. Rebase against the user's current position before publishing
+          // the new repository, not the position saved when the request started.
+          quietRangeSnapshot = this._captureMessageRangeSnapshot(st);
+          quietScrollEl = sid === this.currentId ? this._chatBodyElement() : null;
+          quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
+          quietAnchor = quietScrollEl && st.atBottom === false
+            ? this._captureViewportMessageAnchor(quietScrollEl, sid) : null;
+        }
         const virtualWindowBeforeInstall = quiet
           ? this._captureMessageVirtualWindow(st) : null;
         const followTailAtInstall = quiet && (
-          opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
+          (opts.followTail === true && !quietNavigationChanged)
+          || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
         );
         // Only a complete, stable snapshot of the retired turn can prove a
         // missing reader anchor was removed, rather than merely outside a tail
@@ -19404,15 +19470,26 @@ function portal() {
           if (quiet) {
             // Already swapped in place above (no skeleton, no reveal). Just
             // re-highlight the freshly-added tail and re-pin to the bottom IF the
-            // user was following it — _reconcileOpenSession only quiet-reloads
-            // when atBottom, so this won't yank anyone reading history.
+            // user is still following it. Quiet refresh also runs while reading
+            // history; preserve that reader's anchor without pausing new data.
             const _wasAtBottom = st.atBottom !== false;
+            const presentationUserScrollAt = Number(st._userScrollAt) || 0;
+            const ownsPresentation = () => this.currentId === sid
+              && this.tabState[sid] === st && !st.streaming && !st.es
+              && this._historyReplaceStillOwns(st, historyReplaceToken)
+              && (Number(st._userScrollAt) || 0) === presentationUserScrollAt
+              && (st.atBottom !== false) === _wasAtBottom;
             this.$nextTick(async () => {
-              try { await this.highlightCode(".chat-body"); st._highlighted = true; }
+              if (!ownsPresentation()) return;
+              try { await this.highlightCode(".chat-body"); }
               catch (_e) { /* highlight best-effort */ }
-              if (sid === this.currentId && _wasAtBottom) {
-                st.atBottom = true; this.scrollToBottom(true);
-              } else if (sid === this.currentId && quietScrollEl) {
+              // Decoration can finish after a new send, navigation or scroll.
+              // Its old anchor must never revoke the new owner's tail-follow.
+              if (!ownsPresentation()) return;
+              st._highlighted = true;
+              if (_wasAtBottom) {
+                this.scrollToBottom(false);
+              } else if (quietScrollEl) {
                 const restored = this._restoreMessageAnchor(
                   quietScrollEl, quietAnchor);
                 if (!restored) quietScrollEl.scrollTop = quietScrollTop;
@@ -19608,6 +19685,18 @@ function portal() {
       // commit deliberately small so transcript installation yields to shell
       // buttons and the composer between batches instead of freezing the app.
       const CH = this._isMobileLayout() ? 1 : 2;
+      const repository = st.messages;
+      const owner = { seq: st._historyReplaceOwner, epoch: st._historyEpoch };
+      const ownsReveal = () => {
+        if (this.tabState[sid] !== st) return false;
+        if (st.streaming || st.es) {
+          // A live handoff may inherit an empty first batch. Repair only that
+          // invalid range; never replace a valid live tail with old coordinates.
+          this._ensureNonEmptyMessageRange(st);
+          return false;
+        }
+        return st.messages === repository && this._historyReplaceStillOwns(st, owner);
+      };
       if (!tailFirst) {
         // Quiet canonical reconciliation preserves an existing viewport anchor.
         // Keep its established chronological expansion; exposing only the tail
@@ -19615,10 +19704,11 @@ function portal() {
         const start = st.messageRange.visibleStart;
         let i = 0;
         while (i < visible.length) {
-          if (this.tabState[sid] !== st || st.streaming || st.es) return;
+          if (!ownsReveal()) return;
           i = Math.min(visible.length, i + CH);
           st.messageRange.visibleEnd = start + i;
           await new Promise(resolve => this.$nextTick(resolve));
+          if (!ownsReveal()) return;
           if (!this._paneElement(sid)) {
             st.messageRange.visibleEnd = start + visible.length;
             break;
@@ -19627,7 +19717,7 @@ function portal() {
             await this._yieldHistoryInstall();
           }
         }
-        if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
+        if (ownsReveal()) this._scheduleHistoryViewport(st, "older");
         return;
       }
       const finalEnd = st.messageRange.visibleStart + visible.length;
@@ -19636,14 +19726,12 @@ function portal() {
       let cursor = finalEnd;
       while (cursor > finalStart) {
         const nextStart = Math.max(finalStart, cursor - CH);
-        // Establish a real tail batch before any ownership/cancellation exit.
-        // The previous order first collapsed the range to [finalEnd, finalEnd]
-        // and only expanded it after this guard. If SSE claimed the tab in that
-        // interval, finally marked the pane ready with a permanently empty slice.
+        // Check ownership before every write after yielding. A late batch from
+        // a cold load must not hide messages appended by an adopted live stream.
+        if (!ownsReveal()) return;
         st.messageRange.visibleStart = nextStart;
         st.messageRange.visibleEnd = finalEnd;
         cursor = nextStart;
-        if (this.tabState[sid] !== st || st.streaming || st.es) return;
         const active = sid === this.currentId;
         const scrollEl = active ? this._chatBodyElement() : null;
         const anchor = scrollEl && st.atBottom === false
@@ -19653,6 +19741,7 @@ function portal() {
         // the physical scroller; the remaining resident rows continue prepending
         // between frames without blocking the composer or surrounding controls.
         await new Promise(resolve => this.$nextTick(resolve));
+        if (!ownsReveal()) return;
         if (active && sid === this.currentId && this.tabState[sid] === st) {
           if (!st.messagesReady) st.messagesReady = true;
           if (onFirstReveal) { onFirstReveal(); onFirstReveal = null; }
@@ -19670,7 +19759,7 @@ function portal() {
           await this._yieldHistoryInstall();
         }
       }
-      if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
+      if (ownsReveal()) this._scheduleHistoryViewport(st, "older");
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
     // markdown loadSession skipped so first paint wasn't blocked on the whole
@@ -20827,6 +20916,7 @@ function portal() {
       const st = sid && this.tabState[sid];
       if (!st) return false;
       const range = st.messageRange;
+      const navigationUserScrollAt = Number(st._userScrollAt) || 0;
       st.atBottom = false;
       const meta = (this.sessions || []).find(row => row.id === sid);
       const needsFreshTail = st._pendingExternalUpdate || st._historyAnchorRecovery
@@ -20839,7 +20929,8 @@ function portal() {
           quiet: sid === this.currentId,
           followTail: true,
         });
-        if (!loaded || this.tabState[sid] !== st) return false;
+        if (!loaded || this.tabState[sid] !== st
+            || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return false;
       } else {
         const windowSize = this._isLiveMessagePane(st)
           ? this._liveMessageDomCap() : this._historyMountWindowSize();
@@ -20850,7 +20941,11 @@ function portal() {
       this._enforceMessageRangeInvariant(st);
       if (this._messageRangeHasLater(st)) return false;
       st.atBottom = true;
-      if (sid === this.currentId) this.$nextTick(() => this.scrollToBottom(true));
+      if (sid === this.currentId) this.$nextTick(() => {
+        if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false
+            || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return;
+        this.scrollToBottom(true);
+      });
       return true;
     },
     hasLaterMessages(sid) {
@@ -32900,27 +32995,14 @@ function portal() {
         }
         return;
       }
-      // Not at the bottom. ONLY a genuine user gesture (wheel / touch / scrollbar
-      // drag) may disengage follow. The previous code flipped atBottom=false on
-      // ANY scroll event whose geometry read > 2px — but several NON-user events
-      // fire scroll with a transiently-wrong distance and silently broke
-      // mid-stream follow ("某些 block 导致停止追随"):
-      //   1. A measured virtual-window shift replaces estimated spacer height;
-      //      the distance read can briefly exceed 2px during that correction.
-      //   2. A late-realizing block (image / iframe / mermaid / highlighted code)
-      //      growing height triggers the browser's scroll-anchoring, which moves
-      //      scrollTop without any user input.
-      // Both must NOT stop following. Gate disengagement on a recent real
-      // pointer/wheel gesture; layout-induced scrolls leave atBottom untouched
-      // so the next streaming tick re-pins to the bottom.
-      const userDriven = (Date.now() - ((st && st._userScrollAt)
-        || this._userScrollAt || 0)) < 400;
-      if (userDriven && st) st.atBottom = false;
+      // Upward wheel/touch/scrollbar intent already disengages follow in
+      // _userScrollIntent. A later layout scroll must not reuse that old gesture:
+      // sending or jumping to latest may have explicitly resumed follow since.
       if (st) st.scrollTop = el.scrollTop;
     },
     // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
-    // pointerdown on the chat body (see index.html) so onChatScroll can tell a
-    // user scroll-up apart from a layout-induced scroll event.
+    // pointerdown on the chat body (see index.html). Only real reader input
+    // can disengage follow; layout-induced scroll events preserve that choice.
     _chatTouchStart(ev) {
       const touch = ev && ev.touches && ev.touches[0];
       this._chatTouchY = touch ? touch.clientY : null;
