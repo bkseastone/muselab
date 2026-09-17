@@ -367,13 +367,64 @@ def test_history_perf_keeps_receive_parse_and_cancel_reason_private(app_module, 
     headers = {"X-Auth-Token": TEST_TOKEN}
     payload = {"status": "cancelled", "mode": "quiet", "visibility": "hidden",
                "cancel_reason": "anchor_missing", "receive_ms": 400,
-               "parse_ms": 2, "first_reveal_ms": 20}
+               "parse_ms": 2, "first_reveal_ms": 20,
+               "sid8": "1234abcd", "recovery": "expand", "requested_tail": 202,
+               "local_total": 2, "response_total": 202, "generation_changed": True}
     assert client.post("/api/log/client-perf", headers=headers, json=payload).status_code == 200
     assert events[0]["receive_ms"] == 400
     assert events[0]["parse_ms"] == 2
     assert events[0]["visibility"] == "hidden"
     assert events[0]["cancel_reason"] == "anchor_missing"
-    for field in ("visibility", "cancel_reason"):
+    assert events[0]["sid8"] == "1234abcd"
+    assert events[0]["requested_tail"] == 202
+    assert events[0]["generation_changed"] is True
+    for field in ("visibility", "cancel_reason", "sid8", "recovery", "generation_changed"):
         assert client.post("/api/log/client-perf", headers=headers,
                            json={**payload, field: "private detail"}).status_code == 422
+    assert len(events) == 1
+
+
+def test_render_telemetry_is_bounded_and_rejects_content(app_module, client, monkeypatch):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    payload = {"phase": "transcript", "status": "ok", "cancel_reason": "none",
+               "sid8": "1234abcd", "asset_version": "fixture", "total_ms": 400,
+               "settle_ms": 200, "mounted_count": 20, "generation": 1}
+    assert client.post("/api/log/chat-render", headers=headers, json=payload).status_code == 200
+    assert events[-1][1]["settle_ms"] == 200
+    for extra in ({"text": "private"}, {"phase": "private"}, {"sid8": "full-session-id"}):
+        assert client.post("/api/log/chat-render", headers=headers, json={**payload, **extra}).status_code == 422
+    assert len(events) == 1
+
+
+@pytest.mark.parametrize("reason", ["unstable_snapshot", "older_snapshot", "shorter_snapshot", "missing_terminal_boundary"])
+def test_snapshot_rejection_reason_survives_telemetry(app_module, client, monkeypatch, reason):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append(fields))
+    assert client.post("/api/log/client-perf", headers={"X-Auth-Token": TEST_TOKEN},
+                       json={"status": "cancelled", "mode": "quiet", "cancel_reason": reason}).status_code == 200
+    assert events[0]["cancel_reason"] == reason
+
+
+def test_tail_navigation_telemetry_separates_received_and_visible_counts(app_module, client, monkeypatch):
+    events = []
+    monkeypatch.setattr(app_module, "_perf_enabled", lambda: False)
+    monkeypatch.setattr(app_module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    payload = {"phase":"tail", "trigger":"jump", "status":"start", "cancel_reason":"none",
+               "sid8":"1234abcd", "asset_version":"fixture", "block_count":132,
+               "mounted_count":100, "visible_start":2, "visible_end":102,
+               "range_offset":0, "canonical_total":132, "bottom_distance":0,
+               "following":0, "streaming":1, "history_fetch":0, "progress_age_ms":250}
+    assert client.post("/api/log/chat-render", headers=headers, json=payload).status_code == 200
+    event, data = events[-1]
+    assert event == "client.chat_render"
+    assert data["block_count"] == 132 and data["visible_end"] == 102
+    assert data["history_fetch"] == 0 and data["bottom_distance"] == 0
+    for extra in ({"text":"private"}, {"trigger":"private"}, {"sid8":"full-session-id"},
+                  {"phase":"transcript"}, {"path":"private"}):
+        assert client.post("/api/log/chat-render", headers=headers, json={**payload,**extra}).status_code == 422
     assert len(events) == 1

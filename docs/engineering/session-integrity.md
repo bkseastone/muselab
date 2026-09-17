@@ -1,0 +1,223 @@
+# Session integrity and latency checks
+
+A quiet history refresh is still a destructive UI replacement. Before installing
+it, check the server's completion stability, the last observed update time, and
+the committed final message boundary within the same history generation. Compare
+counts against installed canonical history, not provisional streaming bubbles.
+Compaction and explicit full-history navigation may legitimately change the window.
+A rejected response leaves the displayed messages intact and pending reconciliation.
+
+Native schedules follow the Claude Agent SDK contract. MuseLab stores observation
+receipts; it does not interpret cron expressions, recreate tasks, redirect fires,
+or change native persistence and expiration. Successful creation establishes the
+receipt owner. A later CronList result or replayed creation cannot transfer an
+existing job to another session. Startup loads all receipts before deciding which
+session to resume, removing legacy list-only copies before recovery starts.
+
+SDK `origin.kind=task-notification` with `subkind=scheduled-trigger` remains
+valid even when MuseLab missed the original creation. Do not reject a native fire
+merely because its local receipt is absent. `senderTaskId` identifies peer agents,
+not cron jobs. For older runtimes that omit origin, exact prompt matching is only
+a fallback for a live task in the receiving session outside a foreground turn.
+The public contract is described in [Claude Code scheduled tasks](https://code.claude.com/docs/en/scheduled-tasks)
+and the pinned Python SDK's `MessageOrigin` type documentation.
+
+For startup latency, prepare full memory recall concurrently with native context
+preflight. Both must finish before query commit; cancellation or early failure
+must join the recall producer before clearing its receipt. Keep the configured
+recall timeout, result limit, and native context/compaction behavior intact.
+Capability reads must not prepare CLI configuration directories. Bounded memory
+extraction uses the native output-token budget and disabled thinking.
+
+Repeated task observations that only change `updated_at` should not rewrite a
+sidecar. Failed expensive filesystem scans use a bounded retry delay at least as
+large as the preceding pass, capped at 30 seconds; healthy partial continuations
+keep their short yield. The logged retry duration is the actual retry deadline.
+`sessions.rename_index` separates index lock, read, and write time without logging
+session names, paths, or contents. These timings distinguish local filesystem
+latency from SDK/network latency in a deployment that cannot be inspected directly.
+
+Focused regressions are in `test_history_snapshot_integrity.py`,
+`test_completion_visibility.py`, `test_native_cron_reliability.py`, and
+`test_turn_startup_overlap.py`. Browser coverage requires `RUN_E2E=1`; always use a
+temporary `MUSELAB_ROOT` and a synthetic authentication token for local tests.
+
+
+## SDK transcript ownership
+
+The CLI owns canonical transcript writes for its entire process lifetime. A
+ResultMessage releases a turn's receive lane; it does not close the transcript
+writer or prove that all file appends have finished. Turn completion must not
+rewrite, replace, or sanitize the canonical JSONL. An atomic replacement can
+leave a retained SDK descriptor pointing at an unlinked inode, losing later
+assistant output even when it was already delivered over SSE. A subsequent
+turn's parent UUID can then point at a missing final record.
+
+Keep provider parser compatibility in memory and MuseLab presentation metadata
+in sidecars. Unsigned thinking stays in canonical history. The legacy
+`fix-thinking-signatures.py` utility is an explicit offline migration only:
+stop every writer, preserve a backup, and inspect its heuristic removals first.
+Automatic cross-provider transcript sanitization is not part of turn completion.
+
+`test_transcript_writer_ownership.py` holds the SDK append descriptor across
+Result, flushes the final answer late, optionally appends a follow-up turn, then
+checks the real history endpoint. Both answers and original thinking must remain
+visible in order without replacing the SDK's file. Browser coverage in
+`test_live_subagent_updates.py` reloads the page after subagent continuations and
+checks that the earlier parent final and the continuation suffix still render.
+
+## SDK output ownership
+
+Every pooled client has exactly one SDK reader. A foreground command/turn or a
+background watcher owns a bounded receive queue. Releasing that queue transfers
+its pending tail under the same barrier as wire delivery, and joins the transfer
+even if the caller is repeatedly cancelled. A watcher reserves its queue before
+its coroutine is scheduled; the foreground consumer selects that successor
+before acknowledging Result to its producer. Startup metadata reads therefore
+cannot create a gap in message ownership. Idle messages are consumed in the
+originating session: telemetry is observed without retention, while assistant,
+tool, and result output uses a durable continuation broadcast. There is no orphan
+mailbox for a later human turn to inherit. Direct observers retain the per-message
+byte guard; bounded queues still fail explicitly and retire the exact client.
+
+A continuation is not evidence of a scheduled trigger. Native origin establishes
+scheduled attribution; an unannounced continuation never acquires a job ID merely
+because the session has native schedules. Both kinds retain terminal assistant
+identity, tool results, replay, activity completion, and canonical-history refresh.
+
+Native control commands share receive ownership and cancellation cleanup. Cancel
+requests interrupt through the SDK and drain to its actual Result before releasing
+the lane. An unconfirmed terminal state retires that exact client before reuse.
+
+## Native compaction visibility
+
+CLI-owned automatic compaction runs inside an ordinary query, independently of
+MuseLab's preflight command. Forward explicit SDK `status: compacting`, cleared
+status, and `compact_boundary` signals into the same per-session
+`compact_progress` lifecycle. Keep only the phase and server start time; raw SDK
+metadata must not enter browser state. Ignore duplicate starts and unrelated
+status rows. A terminal event closes any remaining animation before completion.
+
+Progress belongs in the normal broadcast replay so a reconnect or page reload
+restores both the animation and its elapsed time. Browser acceptance checks the
+visible animated placeholder, session switching, replay, terminal cleanup, and
+subsequent live output, rather than only checking that a listener exists.
+
+## Bounded I/O lifecycle
+
+Concurrent identical catalog probes and memory status reads share one producer.
+Cancelling one waiter leaves other waiters intact; the final waiter cancels and
+joins the producer. Gateway catalog keys include the route, model, and credential
+digest. All compatibility requests share one deadline, and cache age starts when
+a response completes. A failed probe preserves a bounded-age last known capacity.
+An unknown model's generic fallback is display metadata only: it cannot reject
+a prompt, force preflight compaction, or set native SDK context-window overrides.
+The browser also requires a positive backend `auto_compact_threshold` before
+automatically compacting or warning about the limit after a successful turn.
+A displayed percentage alone cannot authorize compaction, and failed/cancelled
+turns cannot schedule another command from their completion event.
+Unavailable capacity metadata therefore leaves the ordinary query and SDK-native
+behavior available. Catalog data, explicit overrides, and known model budgets
+still control preflight; actual runtime context rejections retain their recovery
+path. Native compaction reports separate SDK, measurement, and history phases.
+
+Memory status reads select pending IDs and bounded job summaries through dedicated
+indexes, within one read snapshot. Artifact payload size must not affect status
+polling. Queue wait, connection resolution, and SQLite execution share a cancellable
+deadline. The memory engine owns reusable HTTP connections; each request owns its
+credentials and timeout, cookies are disabled, and shutdown joins active users
+before closing the transport. Timings expose phases, never URLs or payloads.
+
+A detached filesystem scan may overlap watcher events. A complete cursor interval
+and bounded native mutation journal let the commit preserve newer indexed paths
+and apply unrelated scan observations. Directory add/delete protects descendants;
+directory modification protects only its own metadata. Missing/pruned history or
+a changed lifecycle rejects the scan. One reconciliation call performs one scan;
+the lifecycle scheduler owns retry timing instead of immediately repeating walks.
+
+The root SSE mux subscribes at admission but serializes delivery within each
+session. It sends the predecessor's terminal before the successor's state and
+replay, including turns discovered by periodic reconciliation. A delivered
+terminal releases this wire ownership without waiting for slow post-turn
+bookkeeping. Watcher-only state obeys the same boundary. Sessions retain
+independent pumps, and pending successor subscribers are disposed on disconnect.
+Real HTTP/SSE browser coverage keeps one transcript selected across Agent bursts
+and rapid continuations, then checks its final suffix against indexed history.
+
+A closed browser session channel must be retired even when its turn ID still
+matches the server. Root transport recovery alone cannot reopen a closed logical
+channel: matching state frames must rebuild its reducer and consume replay from
+the retained event cursor. The browser regression closes one channel while the
+root remains healthy, advances the backend, and verifies new output without a
+page refresh.
+
+## Evidence and diagnostics
+
+Regressions cover long idle output, cancellation-safe ordered handoff, native
+command cancellation, account-isolated catalog sharing, payload-free status reads,
+cancelled SQLite execution, HTTP reuse/cleanup, and scans during continuous native
+changes. See `test_idle_sdk_delivery.py`, `test_shared_calls.py`,
+`test_gateway_catalog_concurrency.py`, `test_memory_status_reads.py`,
+`test_memory_http_transport.py`, and `test_reconcile_rebase.py`.
+
+Alpine may rethrow an expression error from its vendor bundle. The vendor line
+alone does not locate the original expression. Browser error telemetry includes
+a digest of the attached expression, alongside reason/stack digests and owned
+asset revision; raw expressions and stacks remain only in the local error ring.
+The browser suite exercises a real Alpine `undefined.length` error to verify this
+boundary. A historical stack fingerprint alone does not prove its source or fix.
+
+## History window recovery
+
+A quiet history refresh must preserve the reader's stable message identity. If a
+new tail does not contain that identity, the revision coordinator expands the
+next request toward the previous offset, bounded to 2,000 blocks (or the already
+loaded window size, if larger). An exhausted window keeps the current viewport
+and the pending-update marker; the same revision must not repeatedly fetch an
+identical rejected tail. A new metadata revision/count can restart recovery.
+“Return to latest” must fetch when an external update or newer metadata remains
+unapplied, even when the local offset/total says the tail is already loaded.
+Streaming ownership, generation fencing, and stable completion checks still
+apply to every installation.
+
+## Startup recall ownership and timing
+
+Finalize attachment preparation and its prompt manifest before starting recall.
+The admitted turn owns that producer while SDK connection proceeds concurrently;
+context preflight follows connection and joins recall at the query gate. Stop,
+connection failure, and preflight failure must retire the producer before clearing
+its receipt or releasing the turn. Only the exact prompt digest can consume the
+receipt; canonical user text and configured recall completeness remain unchanged.
+
+`chat.startup.recall_ms` measures preparation, while `recall_wait_ms` measures only
+the remaining wait at the query gate. These overlap `client_ms` and `preflight_ms`
+and must not be added together to calculate total startup latency.
+`chat.recall_prepare` links the preparation duration/status to `sid8` and `turn8`.
+
+`memory.recall_store` links each local read to `recall_id`, `stage`, and `channel`.
+It separates `queue_ms`, `resolve_ms`, and `execution_ms`. `busy_retry_ms` is the
+subset of execution spent in failed BUSY/LOCKED attempts plus backoff, not a direct
+measurement of SQLite's internal lock wait. Cancellation reports the observed
+elapsed work and phase; a running worker may still be unwinding. The configured
+recall deadline still applies to queue and execution; zero retains unlimited wait.
+
+`client.history_load` adds a validated eight-hex session prefix, requested/local/
+response window sizes, generation-change flag, retry count, and the closed-set
+recovery result. Never include prompts, memory content, attachment paths, full
+session identifiers, raw generations, or exception/protocol payloads in these logs.
+
+
+## DUCC workspace identity
+
+The SDK launches in the session's resolved workspace. Its DUCC wrapper must
+read the actual physical cwd, compare it with the expected session workspace,
+and explicitly preserve that path as `PWD` across `env -i`. Missing or stale
+inherited `PWD` must never turn a valid workspace into `/` in environment-based
+runtime context. A mismatch or unreadable cwd aborts before DUCC starts; stderr
+records only the `workspace` category, without paths or provider payloads.
+The wrapper-only expected workspace is not forwarded to DUCC.
+
+`test_ducc_runtime.py` checks a real subprocess's cwd, `PWD`, and shell `pwd -P`
+with missing/stale environment values, spaces, Unicode, and symlinks. These
+checks establish the launch contract; they do not inspect a vendor runtime's
+private System Context or prove how a remote model renders it.

@@ -225,6 +225,46 @@ def _fts_text(content: str) -> str:
     return " ".join(_fts_terms(content))
 
 
+class _TimedReadCursor:
+    def __init__(self, cursor, timings):
+        self._cursor = cursor
+        self._timings = timings
+
+    def fetchall(self):
+        started = time.perf_counter()
+        try:
+            rows = self._cursor.fetchall()
+            self._timings["rows"] += len(rows)
+            return rows
+        finally:
+            self._timings["fetch_ms"] += (time.perf_counter() - started) * 1000
+
+    def fetchone(self):
+        started = time.perf_counter()
+        try:
+            row = self._cursor.fetchone()
+            self._timings["rows"] += int(row is not None)
+            return row
+        finally:
+            self._timings["fetch_ms"] += (time.perf_counter() - started) * 1000
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _TimedReadConnection:
+    def __init__(self, connection, timings):
+        self._connection = connection
+        self._timings = timings
+
+    def execute(self, *args):
+        started = time.perf_counter()
+        try:
+            return _TimedReadCursor(self._connection.execute(*args), self._timings)
+        finally:
+            self._timings["execute_ms"] += (time.perf_counter() - started) * 1000
+
+
 class MemoryStore:
     def __init__(self, path: Path, *, read_only: bool = False):
         self.path = Path(path)
@@ -373,6 +413,7 @@ class MemoryStore:
           ON memories(owner_id, updated_at DESC, id ASC);
         CREATE INDEX IF NOT EXISTS idx_memories_owner_status_id
           ON memories(owner_id, status, id);
+                CREATE INDEX IF NOT EXISTS idx_memories_owner_id ON memories(owner_id,id);
         CREATE TABLE IF NOT EXISTS memory_sources (
           memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
           source_type TEXT NOT NULL, source_id TEXT NOT NULL, relation TEXT NOT NULL,
@@ -461,6 +502,20 @@ class MemoryStore:
                 "ALTER TABLE jobs ADD COLUMN operation_key TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_operation "
                      "ON jobs(owner_id, operation_key, status)")
+
+        # Status polling must touch index entries and a bounded job footer,
+        # never historical job/artifact payload pages.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner_updated "
+                     "ON jobs(owner_id, updated_at DESC, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner_status_updated "
+                     "ON jobs(owner_id, status, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner_reindex "
+                     "ON jobs(owner_id, created_at DESC, operation_key) "
+                     "WHERE kind='reindex_memories' AND operation_key!=''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_owner_status_updated "
+                     "ON artifacts(owner_id, status, updated_at DESC, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_pending_index "
+                     "ON memories(owner_id, embedding_state) WHERE status='active'")
 
     def _migrate_fts(self, conn: sqlite3.Connection) -> None:
         """Reindex memory_fts when the tokenization scheme changes.
@@ -908,15 +963,81 @@ class MemoryStore:
                     }
         return grouped
 
+    @contextmanager
+    def _observed_read(self, operation: str):
+        """Measure storage phases without logging SQL, identities or content."""
+        from . import observability as obs
+        started = time.perf_counter()
+        acquired = connected = finished = None
+        status = "error"
+        timings = {"execute_ms": 0.0, "fetch_ms": 0.0, "rows": 0}
+        try:
+            with self._lock:
+                acquired = time.perf_counter()
+                with self._connect() as conn:
+                    connected = time.perf_counter()
+                    try:
+                        yield _TimedReadConnection(conn, timings)
+                        status = "ok"
+                    finally:
+                        finished = time.perf_counter()
+        finally:
+            ended = time.perf_counter()
+            elapsed = (ended - started) * 1000
+            if obs.is_slow(elapsed, threshold_ms=obs.slow_io_ms()):
+                obs.perf_event(
+                    "memory.storage_read", operation=operation, status=status,
+                    read_only=self._read_only, duration_ms=elapsed,
+                    lock_ms=((acquired or ended) - started) * 1000,
+                    connect_ms=((connected or ended) - acquired) * 1000 if acquired else 0,
+                    read_decode_ms=((finished or ended) - connected) * 1000 if connected else 0,
+                    close_ms=(ended - finished) * 1000 if finished else 0,
+                    execute_ms=timings["execute_ms"], fetch_ms=timings["fetch_ms"],
+                    decode_ms=max(0, ((finished or ended) - connected) * 1000
+                                  - timings["execute_ms"] - timings["fetch_ms"])
+                    if connected else 0, rows=timings["rows"])
+
     def memories_with_stats_by_ids(self, owner_id: str,
                                    memory_ids: list[str]) -> list[dict]:
-        rows = self.memories_by_ids(memory_ids)
-        stats = self.memory_recall_stats(owner_id, [row["id"] for row in rows])
-        sources = self.memory_sources([row["id"] for row in rows])
-        for row in rows:
-            row["recall_stats"] = stats[row["id"]]
-            row["sources"] = sources.get(row["id"], [])
-        return rows
+        unique_ids = list(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return []
+        found = {}
+        # One connection and read snapshot, instead of three connection/setup/
+        # close cycles per channel. Filter ownership before reading provenance.
+        with self._observed_read("hydrate") as conn:
+            conn.execute("BEGIN")
+            for start in range(0, len(unique_ids), 500):
+                chunk = unique_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM memories WHERE owner_id=? AND id IN ({placeholders})",
+                    (owner_id, *chunk)).fetchall()
+                for row in rows:
+                    item = self._row(row) or {}
+                    item["recall_stats"] = {
+                        "recall_count": 0, "first_recalled_at": None,
+                        "last_recalled_at": None, "helpful_count": 0,
+                        "unhelpful_count": 0}
+                    item["sources"] = []
+                    found[row["id"]] = item
+                ids = [row["id"] for row in rows]
+                if not ids:
+                    continue
+                placeholders = ",".join("?" for _ in ids)
+                for row in conn.execute(
+                    f"SELECT * FROM memory_recall_stats WHERE owner_id=? "
+                    f"AND memory_id IN ({placeholders})", (owner_id, *ids)):
+                    found[row["memory_id"]]["recall_stats"] = {
+                        name: row[name] for name in (
+                            "recall_count", "first_recalled_at", "last_recalled_at",
+                            "helpful_count", "unhelpful_count")}
+                for row in conn.execute(
+                    f"SELECT memory_id,source_type,source_id,relation FROM memory_sources "
+                    f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id,source_type,source_id", ids):
+                    found[row["memory_id"]]["sources"].append({
+                        name: row[name] for name in ("source_type", "source_id", "relation")})
+        return [found[item_id] for item_id in unique_ids if item_id in found]
 
     def mark_memories_indexed(
         self,
@@ -1133,9 +1254,13 @@ class MemoryStore:
         self.audit(owner_id, "delete", "memory", memory_id)
         return True
 
+    def lexical_candidates(self, owner_id: str, query: str, *, limit: int = 20) -> list[dict]:
+        """Recall only needs ranks and IDs; hydrate each selected memory once."""
+        return self.lexical_search(owner_id, query, limit=limit, _ids_only=True)
+
     def lexical_search(self, owner_id: str, query: str, *, limit: int = 20,
                        include_status: str | None = "active",
-                       kind: str | None = None) -> list[dict]:
+                       kind: str | None = None, _ids_only: bool = False) -> list[dict]:
         # Expand the query the same way the index was written (_fts_text), so
         # Chinese input turns into the bigrams actually stored instead of one
         # unmatchable whole-sentence token. Deduplicate while preserving order:
@@ -1153,10 +1278,10 @@ class MemoryStore:
         if kind:
             params.append(kind)
         params.append(limit)
-        with self._lock, self._connect() as conn:
+        with self._observed_read("lexical") as conn:
             try:
                 rows = conn.execute(
-                    f"""SELECT m.*, bm25(memory_fts) AS lexical_rank
+                    f"""SELECT {"m.id" if _ids_only else "m.*"}, bm25(memory_fts) AS lexical_rank
                         FROM memory_fts JOIN memories m ON m.id=memory_fts.memory_id
                         WHERE memory_fts MATCH ? AND m.owner_id=?
                         {status_clause} {kind_clause}
@@ -1171,7 +1296,7 @@ class MemoryStore:
                                     sqlite3.SQLITE_LOCKED}:
                     raise
                 return []
-            return [{"memory": self._row(row) or {},
+            return [{**({"id": row["id"]} if _ids_only else {"memory": self._row(row) or {}}),
                      "score": 1.0 / (1.0 + abs(float(row["lexical_rank"]))),
                      "channel": "lexical"} for row in rows]
 
@@ -1565,6 +1690,13 @@ class MemoryStore:
 
     def stats(self, owner_id: str) -> dict:
         with self._lock, self._connect() as conn:
+            # IDs and counters describe one read snapshot even during review
+            # or background writes. No artifact body is fetched or decoded.
+            conn.execute("BEGIN")
+            pending_ids = [row[0] for row in conn.execute(
+                "SELECT id FROM artifacts WHERE owner_id=? "
+                "AND status='pending_review' ORDER BY updated_at DESC LIMIT 100",
+                (owner_id,))]
             def count(table: str, where: str = "owner_id=?") -> int:
                 return int(conn.execute(
                     f"SELECT count(*) AS n FROM {table} WHERE {where}",
@@ -1620,6 +1752,7 @@ class MemoryStore:
                     "FROM jobs WHERE owner_id=? AND operation_key=? AND created_at=?",
                     (owner_id, last_op["operation_key"], last_op["created_at"])).fetchone())
             return {
+                "pending_artifact_ids": pending_ids,
                 "memories": count("memories", "owner_id=? AND status='active'"),
                 "episodes": count("episodes"),
                 "pending_artifacts": count(

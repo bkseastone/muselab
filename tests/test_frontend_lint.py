@@ -423,7 +423,7 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert "calc(100vh - 24px)" in desktop_resize
     for edge in ("n", "ne", "e", "se", "s", "sw", "w", "nw"):
         assert f".preview-selection-resize-handle.is-{edge}" in desktop_resize
-    scroll_intent_start = app.index("\n    _userScrollIntent(ev) {")
+    scroll_intent_start = app.index("\n    _applyChatScrollIntent(direction) {")
     scroll_intent_end = app.index("\n    scrollToBottom(", scroll_intent_start)
     scroll_intent = app[scroll_intent_start:scroll_intent_end]
     assert "this.dismissPreviewQuote(false)" in scroll_intent
@@ -3250,7 +3250,9 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "this.tabState[sid] !== st || st.streaming || st.es" in load
     reveal_start = app.index("async _revealMessagesChunked(sid, st, visible, tailFirst = true, onFirstReveal = null)")
     reveal = app[reveal_start:app.index("async _fillDeferredHead", reveal_start)]
-    assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
+    assert "if (this.tabState[sid] !== st) return false" in reveal
+    assert "if (st.streaming || st.es)" in reveal
+    assert "this._historyReplaceStillOwns(st, owner)" in reveal
     assert "const CH = this._isMobileLayout() ? 1 : 2" in reveal
     assert "let cursor = finalEnd" in reveal
     assert "st.messageRange.visibleStart = nextStart" in reveal
@@ -3274,7 +3276,7 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
     assert "all = this._preserveCanonicalMessageIdentity(st, all, completedBoundary)" in load
-    assert "const quietRangeSnapshot = quiet" in load
+    assert "let quietRangeSnapshot = quiet" in load
     assert re.search(r"this\._resolveMessageRangeSnapshot\(\s*all, quietRangeSnapshot, allowRemovedAnchors\)", load)
     assert "this._historyReplaceStillOwns(st, historyReplaceToken)" in load
     assert "await new Promise(resolve => this.$nextTick(resolve))" in load
@@ -3313,8 +3315,8 @@ def test_fork_banner_and_message_template_are_null_and_key_safe():
     assert "currentForkSource()?.name || ''" in html
     assert ':key="transcriptPaneKey(tid)"' in html
     assert 'x-for="m in paneMsgs" :key="m._k"' in html
-    assert "paneMessageIndex(tid, m)" in html
-    assert 'get i(){ return paneMessageIndex(tid, m) }' in html
+    assert "paneMessageIndex(tid, m, paneMsgs)" in html
+    assert 'get i(){ return paneMessageIndex(tid, m, paneMsgs) }' in html
     assert ':data-message-key="m._k"' in html
 
 
@@ -3425,7 +3427,7 @@ def test_history_rich_render_never_blocks_canonical_install_or_batches_one_frame
     assert "_historyRichRenderQueue.push" in queue
     assert "m._richRenderQueued" in queue
     assert "window.requestIdleCallback(run, { timeout: 250 })" in queue
-    assert "this._renderHistoryMessage(m)" in queue
+    assert "await this._renderHistoryMessageAsync(m," in queue
     assert "if (this._historyRichRenderQueue.length) this._scheduleHistoryRichRender()" in queue
     assert "forEach" not in queue
     assert "const fenced = text.match(" in app
@@ -3495,7 +3497,7 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
     )
     mutation_re = re.compile(
         r"\b(?:st|sendState|ownerState|newSt|child)\.messages"
-        r"(?:\.(?:push|unshift|splice|pop|shift)\s*\(|\.length\s*=|\s*=)"
+        r"(?:\.(?:push|unshift|splice|pop|shift)\s*\(|\.length\s*=(?!=)|\s*=(?!=))"
     )
     for line in app.splitlines():
         declaration = method_re.match(line)
@@ -3941,11 +3943,11 @@ def test_tab_selection_and_layout_changes_share_one_tail_follow_controller():
     assert 'tail.scrollIntoView({ block: "end"' in controller
     assert 'x-ref="chatBottom"' in html
 
-    intent_start = app.index("    _userScrollIntent(ev) {")
+    intent_start = app.index("    _applyChatScrollIntent(direction) {")
     intent_end = app.index("    _ensureChatTailObserver() {", intent_start)
     intent = app[intent_start:intent_end]
-    assert 'ev.type === "wheel"' in intent
-    assert "Number(ev.deltaY) < 0" in intent
+    assert 'ev?.type === "wheel"' in intent
+    assert "Math.sign(Number(ev.deltaY) || 0)" in intent
     assert "st.atBottom = false" in intent
     assert "this._settleToken = (this._settleToken || 0) + 1" in intent
 
@@ -3968,10 +3970,10 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     assert "this._scheduleTransparentHistory(st, false)" not in load
 
     earlier_start = app.index("    async loadEarlierMessages(sid) {")
-    earlier_end = app.index("    async returnToLatest(sid)", earlier_start)
+    earlier_end = app.index("    async returnToLatest(", earlier_start)
     earlier = app[earlier_start:earlier_end]
     assert "const liveWindow = this._isLiveMessagePane(st)" in earlier
-    assert "this._liveMessageHistoryStep() : this._historyWindowSize()" in earlier
+    assert "this._liveMessageHistoryStep() : this._historyMountWindowSize()" in earlier
     assert "nextStart + this._liveMessageDomCap()" in earlier
     assert "await this._fetchOlderWindow(sid)" in earlier
     assert "this._captureViewportMessageAnchor(scrollEl, sid)" in earlier
@@ -4019,7 +4021,7 @@ def test_live_turn_bounds_dom_and_indexes_task_status_without_linear_scans():
     assert send.index("sendState.atBottom = true") < send.index(
         "stageQueueAdmission();")
 
-    assert '@click="returnToLatest()"' in html
+    assert "@click=\"returnToLatest(currentId, 'jump')\"" in html
     assert html.count('x-show="isAwayFromLatest()"') >= 3
     assert "summary_truncated" in html
 
@@ -4153,7 +4155,7 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "Intentionally no-op" in virtual
     assert 'querySelectorAll(".msg[data-message-key]")' in virtual
     assert "st._virtualHeights[key] = height" in virtual
-    index_start = app.index("    paneMessageIndex(tid, message) {")
+    index_start = app.index("    paneMessageIndex(tid, message, visibleRows = null) {")
     index_end = app.index("    _hasPendingAdmission(st) {", index_start)
     pane_index = app[index_start:index_end]
     assert "_visiblePaneMessages" not in pane_index
@@ -4214,7 +4216,7 @@ def test_long_chat_state_keeps_complete_normalized_history_and_generation_safety
     assert "return { bubble: completedBubble, text: completedText };" in terminal
     assert ':data-tid="tid"' in pane
     assert 'x-for="m in paneMsgs" :key="m._k"' in pane
-    assert "paneMessageIndex(tid, m)" in pane
+    assert "paneMessageIndex(tid, m, paneMsgs)" in pane
     assert "paneMessageRows(tid)" not in pane
     assert "msg-virtual-spacer" not in pane
     assert ".msg-virtual-spacer" not in css
@@ -4259,10 +4261,13 @@ def test_cold_history_reveal_never_marks_a_nonempty_session_with_an_empty_range(
     reveal = app[reveal_start:reveal_end]
     assignment = reveal.index("st.messageRange.visibleStart = nextStart")
     cancellation = reveal.index(
-        "if (this.tabState[sid] !== st || st.streaming || st.es) return",
-        reveal.index("const finalStart = st.messageRange.visibleStart"),
+        "if (!ownsReveal()) return",
+        reveal.index("const finalStart = Math.max(st.messageRange.visibleStart"),
     )
-    assert assignment < cancellation
+    # A live handoff repairs an empty range inside the ownership guard, before
+    # a stale batch can overwrite the valid range extended by new SSE messages.
+    assert "this._ensureNonEmptyMessageRange(st);" in reveal
+    assert cancellation < assignment
     assert "st.messageRange.visibleStart = finalEnd" not in reveal
     assert "st.messageRange.visibleEnd = finalEnd" in reveal
     assert "await this._yieldHistoryInstall();" in reveal

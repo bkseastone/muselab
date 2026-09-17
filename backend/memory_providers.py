@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .memory_http import provider_http_client
+
 from .memory_config import (
     EmbeddingConfig,
     MemoryConfig,
@@ -79,8 +81,8 @@ class EmbeddingProvider:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         vectors: list[list[float]] = []
         batch_size = max(1, int(self.config.batch_size))
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
+        async with provider_http_client(
+            _request_timeout(self.config.timeout_seconds), operation="embedding"
         ) as client:
             for start in range(0, len(texts), batch_size):
                 chunk = texts[start:start + batch_size]
@@ -162,8 +164,8 @@ class QdrantVectorStore(VectorStore):
         return str(uuid.uuid5(self._NAMESPACE, item_id))
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
+        async with provider_http_client(
+            _request_timeout(self.config.timeout_seconds), operation="vector"
         ) as client:
             response = await client.request(
                 method, f"{self.base}{path}", headers=self.headers, **kwargs)
@@ -382,8 +384,8 @@ class Reranker:
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_request_timeout(self.config.timeout_seconds))
+        async with provider_http_client(
+            _request_timeout(self.config.timeout_seconds), operation="rerank"
         ) as client:
             response = await client.post(url, headers=headers, json={
                 "model": self.config.model, "query": query,
@@ -628,7 +630,7 @@ class GenerationProvider:
                 if route is None:
                     route_kind = "ducc" if configured_model.startswith("ducc:") else "sdk"
                     phases["phase"] = "awaiting_sdk_event"
-                    result = await self._complete_with_sdk(system, prompt)
+                    result = await self._complete_with_sdk(system, prompt, max_tokens)
                     response_chars, outcome = len(result), "done"
                     return result
                 route_kind = "http"
@@ -637,7 +639,7 @@ class GenerationProvider:
                 payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
                            "system": system,
                            "messages": [{"role": "user", "content": prompt}]}
-                async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+                async with provider_http_client(timeout, operation="generation") as client:
                     response = await client.post(
                         url,
                         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
@@ -744,7 +746,7 @@ class GenerationProvider:
             )
             _generation_phases.reset(phase_token)
 
-    async def _complete_with_sdk(self, system: str, prompt: str) -> str:
+    async def _complete_with_sdk(self, system: str, prompt: str, max_tokens: int = 3000) -> str:
         from claude_agent_sdk import ClaudeAgentOptions, query
         from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
@@ -770,8 +772,11 @@ class GenerationProvider:
             options_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
             model = endpoints.ducc_cli_model(model)
 
+        # Apply the same output budget as the HTTP provider through the native
+        # CLI setting. Extraction is a bounded text transform, not an agent task.
+        options_kwargs.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
         workdir = memory_dir() / "generator"
-        workdir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(workdir.mkdir, parents=True, exist_ok=True)
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=system,
@@ -783,6 +788,8 @@ class GenerationProvider:
             setting_sources=[],
             skills=[],
             max_turns=1,
+            thinking={"type": "disabled"},
+            effort="low",
             permission_mode="default",
             cwd=workdir,
             include_partial_messages=False,
@@ -843,31 +850,56 @@ class GenerationProvider:
                 category="malformed_response", reason="empty_output")
         return text
 
+    @staticmethod
+    def _json_value(text: str):
+        """Accept one unambiguous JSON document, including a Markdown fence.
+
+        Never salvage a nested object from an array or a truncated document.
+        Wrapping prose is allowed only when it contains no competing document.
+        """
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        fences = re.findall(r"```(?:json)?\s*\n?(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fences:
+            if len(fences) != 1:
+                raise ValueError("ambiguous_json")
+            prefix, _, suffix = text.partition("```")
+            suffix = suffix.partition("```")[2]
+            if any(char in prefix + suffix for char in "{}[]"):
+                raise ValueError("ambiguous_json")
+            return json.loads(fences[0])
+        start = text.find("{")
+        if start < 0 or any(char in text[:start] for char in '["'):
+            raise ValueError("invalid_json")
+        value, end = json.JSONDecoder().raw_decode(text, start)
+        if any(char in text[end:] for char in "{}[]"):
+            raise ValueError("ambiguous_json")
+        return value
+
     async def complete_json(self, system: str, prompt: str) -> dict:
         # A syntactically valid array/string is still the wrong schema. Make
         # one bounded format-repair attempt instead of losing the job at once.
         instruction = "\nReturn exactly one JSON object. No arrays, quoted JSON, Markdown or prose."
         for attempt in range(2):
             text = (await self.complete(system + instruction, prompt)).strip()
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
             reason = "invalid_json"
+            error_offset = None
             try:
-                try:
-                    value = json.loads(text)
-                except json.JSONDecodeError:
-                    start, end = text.find("{"), text.rfind("}")
-                    if start < 0 or end <= start:
-                        raise
-                    value = json.loads(text[start:end + 1])
+                value = self._json_value(text)
                 if isinstance(value, dict):
                     return value
                 reason = "non_object_json"
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                error_offset = exc.pos
+            except ValueError:
                 pass
             from .observability import perf_event
             perf_event("memory.generation_format", job_ref=generation_job_ref.get(),
-                       reason=reason, attempt=attempt + 1, retrying=attempt == 0)
+                       reason=reason, attempt=attempt + 1, retrying=attempt == 0,
+                       response_chars=len(text), error_offset=error_offset,
+                       fenced="```" in text)
             instruction += "\nThe prior response had the wrong format. Follow the requested object schema strictly."
         provider, model = self.metadata()
         raise GenerationError(retryable=False, provider=provider, model=model,

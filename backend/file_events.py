@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import asyncio
 import contextlib
 import errno
@@ -50,15 +51,12 @@ _RECONCILE_RETRY_MAX_S = 30.0
 _MAX_WATCHED_ROOTS = 16
 _MAX_EVENT_SUBSCRIBERS = 64
 _MAX_CONCURRENT_RECONCILES = 4
-_RECONCILE_MAX_STALE_SCANS = 3
 _SCAN_CANCEL_GRACE_S = 0.25
 _SCAN_EXCHANGE_TIMEOUT_S = max(30.0, _SCAN_MAX_SECONDS * 3)
 _PARTIAL_RECONCILE_YIELD_S = 0.01
 _NATIVE_DIRECTORY_WATCH_HARD_CAP = 131_072
 _WATCH_LINGER_S = 30.0
 _MAX_IDLE_WATCHERS = 3
-_RECONCILE_BACKOFF_START_S = 0.25
-_RECONCILE_BACKOFF_CAP_S = 5.0
 _EVENT_TICKET_TTL_S = 45
 _DATABASE_MAINTENANCE_DELAY_S = 30.0
 _EXCLUDED_DIRS = frozenset({TRASH_DIR_NAME, INTERNAL_DIR_NAME})
@@ -220,6 +218,8 @@ class _WatchState:
     lifecycle_generation: int = 0
     watch_revision: int = 0
     native_mutation_revision: int = 0
+    native_mutation_floor: int = 0
+    native_mutations: deque = field(default_factory=deque)
     watch_stop_event: asyncio.Event | None = None
     watch_ready: asyncio.Event = field(default_factory=asyncio.Event)
     watch_paths: tuple[Path, ...] = ()
@@ -454,15 +454,16 @@ class FileWatchManager:
         return True
 
     @staticmethod
-    def _record_reconcile_retry(state: _WatchState) -> None:
+    def _record_reconcile_retry(state: _WatchState, *, elapsed_s: float = 0.0) -> float:
         """Apply workspace-local exponential backoff after a failed/partial pass."""
         state.reconcile_failures += 1
         delay = min(
             _RECONCILE_RETRY_MAX_S,
-            _RECONCILE_RETRY_BASE_S
-            * (2 ** min(state.reconcile_failures - 1, 16)),
+            max(elapsed_s, _RECONCILE_RETRY_BASE_S
+                * (2 ** min(state.reconcile_failures - 1, 16))),
         )
         state.reconcile_retry_at = monotonic() + delay
+        return delay
 
     @staticmethod
     def _reset_reconcile_retry(state: _WatchState) -> None:
@@ -1605,12 +1606,11 @@ class FileWatchManager:
         except Exception as exc:
             error_type = type(exc).__name__
             state.reconcile_error = exc
-            self._record_reconcile_retry(state)
-            backoff_ms = round(min(
-                _RECONCILE_BACKOFF_START_S
-                * (2 ** min(state.reconcile_failures - 1, 20)),
-                _RECONCILE_BACKOFF_CAP_S,
-            ) * 1000)
+            # Expensive failed scans must not immediately consume another scan
+            # slot. Bound retry duty cycle as well as repeated-failure frequency.
+            delay = self._record_reconcile_retry(
+                state, elapsed_s=monotonic() - started)
+            backoff_ms = round(delay * 1000)
             raise
         finally:
             # Keep this true through replay, broadcast, and watcher-path
@@ -1630,6 +1630,7 @@ class FileWatchManager:
                 mutation_lock_wait_ms=metrics["mutation_lock_wait_ms"],
                 scan_ms=metrics["scan_ms"],
                 stale_scans=metrics["stale_scans"],
+                rebased_paths=metrics.get("rebased_paths", 0),
                 replay_ms=metrics["replay_ms"],
                 manager_lock_wait_ms=metrics["manager_lock_wait_ms"],
                 store_apply_ms=metrics["store_apply_ms"],
@@ -1685,14 +1686,44 @@ class FileWatchManager:
             and state.root == token.root
             and state.lifecycle_generation == token.lifecycle_generation
             and state.watch_revision == token.watch_revision
-            and state.native_mutation_revision
-            == token.native_mutation_revision
             and not state.reconcile_cancel.is_set()
             and (
                 state.task is None
                 or state.watch_ready.is_set()
             )
         )
+
+    @staticmethod
+    def _record_native_mutation(state: _WatchState, rows) -> None:
+        state.native_mutation_revision += 1
+        paths: dict[str, bool] = {}
+        for row in rows:
+            path = row["path"]
+            paths[path] = paths.get(path, False) or row["type"] in {"added", "deleted"}
+        state.native_mutations.append((state.native_mutation_revision, paths))
+        # This journal covers no-op watcher batches too, which have no durable
+        # event cursor. Overflow invalidates older scans instead of losing writes.
+        size = sum(len(paths) for _, paths in state.native_mutations)
+        while state.native_mutations and (len(state.native_mutations) > 256 or size > 8192):
+            revision, removed = state.native_mutations.popleft()
+            state.native_mutation_floor = revision
+            size -= len(removed)
+
+    @staticmethod
+    def _mutations_since(state: _WatchState, revision: int) -> dict[str, bool] | None:
+        if revision < state.native_mutation_floor:
+            return None
+        expected = revision + 1
+        paths: dict[str, bool] = {}
+        for current, touched in state.native_mutations:
+            if current <= revision:
+                continue
+            if current != expected:
+                return None
+            expected += 1
+            for path, recursive in touched.items():
+                paths[path] = paths.get(path, False) or recursive
+        return paths if expected == state.native_mutation_revision + 1 else None
 
     async def _reconcile_and_broadcast_impl(
         self,
@@ -1701,123 +1732,116 @@ class FileWatchManager:
     ) -> bool:
         broadcast_payload: dict[str, Any] | None = None
         partial = False
-        while True:
-            if state.task is not None and not state.watch_ready.is_set():
-                if not await self._wait_for_armed_watcher(state):
-                    raise RuntimeError(
-                        "watcher stopped before closing reconciliation"
-                    )
-                continue
-
-            scan_slot_started = monotonic()
-            await self._reconcile_slots.acquire()
-            metrics["scan_slot_wait_ms"] = int(
-                metrics["scan_slot_wait_ms"]
-            ) + elapsed_ms(scan_slot_started)
-            stale_snapshot = False
-            try:
-                mutation_lock_started = monotonic()
-                async with state.mutation_lock:
-                    metrics["mutation_lock_wait_ms"] = int(
-                        metrics["mutation_lock_wait_ms"]
-                    ) + elapsed_ms(mutation_lock_started)
-                    if state.task is not None and not state.watch_ready.is_set():
-                        stale_snapshot = True
-                    else:
-                        token = await self._capture_reconcile_applicability(state)
-
-                if stale_snapshot:
-                    continue
-                state.reconcile_running = True
-                scan_started = monotonic()
-                try:
-                    snapshot, scan_report = await self._scan_workspace(state)
-                finally:
-                    metrics["scan_ms"] = int(
-                        metrics["scan_ms"]
-                    ) + elapsed_ms(scan_started)
-                partial = bool(scan_report.get("partial"))
-                metrics["partial"] = partial
-                metrics["partial_reason"] = scan_report.get(
-                    "partial_reason"
-                )
-                metrics["scanned_files"] = int(
-                    scan_report.get("scanned_files") or 0
-                )
-                metrics["snapshot_files"] = int(
-                    scan_report.get("snapshot_files") or 0
+        if state.task is not None and not state.watch_ready.is_set():
+            if not await self._wait_for_armed_watcher(state):
+                raise RuntimeError(
+                    "watcher stopped before closing reconciliation"
                 )
 
-                mutation_lock_started = monotonic()
-                async with state.mutation_lock:
-                    metrics["mutation_lock_wait_ms"] = int(
-                        metrics["mutation_lock_wait_ms"]
-                    ) + elapsed_ms(mutation_lock_started)
-                    apply_started = monotonic()
-                    try:
-                        # Only state validation belongs under the global lock.
-                        # Per-workspace mutation_lock still serializes writers;
-                        # deletion sets reconcile_cancel and awaits this task.
-                        manager_wait_started = monotonic()
-                        async with self._lock:
-                            metrics["manager_lock_wait_ms"] = int(
-                                metrics["manager_lock_wait_ms"]
-                            ) + elapsed_ms(manager_wait_started)
-                            stale_snapshot = not self._applicability_matches_locked(state, token)
-                        if not stale_snapshot:
-                            store_started = monotonic()
-                            try:
-                                result = await asyncio.to_thread(
-                                    self.store.apply_reconcile_snapshot,
-                                    token.workspace_id,
-                                    token.root,
-                                    state.name,
-                                    snapshot,
-                                    scan_report,
-                                    expected_cursor=token.cursor,
-                                    primary=state.primary,
-                                    cancel_event=state.reconcile_cancel,
-                                )
-                            finally:
-                                for key in ("store_lock_wait_ms", "transaction_wait_ms",
-                                            "transaction_apply_ms", "commit_ms"):
-                                    metrics[key] = int(metrics[key]) + int(scan_report.get(key, 0))
-                                metrics["store_apply_ms"] = int(
-                                    metrics["store_apply_ms"]
-                                ) + elapsed_ms(store_started)
-                            # Watch/lifecycle changes can run while SQLite works.
-                            # Never broadcast a retired generation's payload.
-                            async with self._lock:
-                                stale_snapshot = not self._applicability_matches_locked(state, token)
-                            if state.reconcile_cancel.is_set():
-                                raise WorkspaceScanCancelled("workspace lifecycle changed")
-                    finally:
-                        metrics["replay_ms"] = int(
-                            metrics["replay_ms"]
-                        ) + elapsed_ms(apply_started)
-                    if not stale_snapshot and result.pop("_stale", False):
-                        stale_snapshot = True
-                    if not stale_snapshot:
-                        metrics["changes"] = len(
-                            result.get("changes") or ()
-                        )
-                        metrics["resync"] = bool(result.get("resync"))
-                        if result.get("resync") or result.get("changes"):
-                            broadcast_payload = result
-            finally:
-                self._reconcile_slots.release()
+        scan_slot_started = monotonic()
+        await self._reconcile_slots.acquire()
+        metrics["scan_slot_wait_ms"] = int(
+            metrics["scan_slot_wait_ms"]
+        ) + elapsed_ms(scan_slot_started)
+        stale_snapshot = False
+        try:
+            mutation_lock_started = monotonic()
+            async with state.mutation_lock:
+                metrics["mutation_lock_wait_ms"] = int(
+                    metrics["mutation_lock_wait_ms"]
+                ) + elapsed_ms(mutation_lock_started)
+                if state.task is not None and not state.watch_ready.is_set():
+                    stale_snapshot = True
+                else:
+                    token = await self._capture_reconcile_applicability(state)
+
             if stale_snapshot:
-                # A token change invalidates accumulated resume state; a new
-                # applicability window must establish its own complete snapshot.
-                state.scan_progress.clear()
-                metrics["stale_scans"] = int(metrics["stale_scans"]) + 1
-                if metrics["stale_scans"] >= _RECONCILE_MAX_STALE_SCANS:
-                    # Busy workspaces can invalidate every snapshot. Retain
-                    # the last-good index and let the existing retry backoff
-                    # yield disk/CPU time instead of looping through full walks.
-                    raise WorkspaceScanIncomplete("workspace changed during repeated scans")
-                continue
-            break
+                raise WorkspaceScanIncomplete("watcher changed before scanning")
+            state.reconcile_running = True
+            scan_started = monotonic()
+            try:
+                snapshot, scan_report = await self._scan_workspace(state)
+            finally:
+                metrics["scan_ms"] = int(
+                    metrics["scan_ms"]
+                ) + elapsed_ms(scan_started)
+            partial = bool(scan_report.get("partial"))
+            metrics["partial"] = partial
+            metrics["partial_reason"] = scan_report.get(
+                "partial_reason"
+            )
+            metrics["scanned_files"] = int(
+                scan_report.get("scanned_files") or 0
+            )
+            metrics["snapshot_files"] = int(
+                scan_report.get("snapshot_files") or 0
+            )
+
+            mutation_lock_started = monotonic()
+            async with state.mutation_lock:
+                metrics["mutation_lock_wait_ms"] = int(
+                    metrics["mutation_lock_wait_ms"]
+                ) + elapsed_ms(mutation_lock_started)
+                apply_started = monotonic()
+                try:
+                    # Only state validation belongs under the global lock.
+                    # Per-workspace mutation_lock still serializes writers;
+                    # deletion sets reconcile_cancel and awaits this task.
+                    manager_wait_started = monotonic()
+                    async with self._lock:
+                        metrics["manager_lock_wait_ms"] = int(
+                            metrics["manager_lock_wait_ms"]
+                        ) + elapsed_ms(manager_wait_started)
+                        stale_snapshot = not self._applicability_matches_locked(state, token)
+                        dirty_paths = self._mutations_since(state, token.native_mutation_revision)
+                        stale_snapshot = stale_snapshot or dirty_paths is None
+                    if not stale_snapshot:
+                        store_started = monotonic()
+                        try:
+                            result = await asyncio.to_thread(
+                                self.store.apply_reconcile_snapshot,
+                                token.workspace_id,
+                                token.root,
+                                state.name,
+                                snapshot,
+                                scan_report,
+                                expected_cursor=token.cursor,
+                                dirty_paths=dirty_paths,
+                                primary=state.primary,
+                                cancel_event=state.reconcile_cancel,
+                            )
+                        finally:
+                            for key in ("store_lock_wait_ms", "transaction_wait_ms",
+                                        "transaction_apply_ms", "commit_ms", "rebased_paths"):
+                                metrics[key] = int(metrics.get(key, 0)) + int(scan_report.get(key, 0))
+                            metrics["store_apply_ms"] = int(
+                                metrics["store_apply_ms"]
+                            ) + elapsed_ms(store_started)
+                        # Watch/lifecycle changes can run while SQLite works.
+                        # Never broadcast a retired generation's payload.
+                        async with self._lock:
+                            stale_snapshot = not self._applicability_matches_locked(state, token)
+                        if state.reconcile_cancel.is_set():
+                            raise WorkspaceScanCancelled("workspace lifecycle changed")
+                finally:
+                    metrics["replay_ms"] = int(
+                        metrics["replay_ms"]
+                    ) + elapsed_ms(apply_started)
+                if not stale_snapshot and result.pop("_stale", False):
+                    stale_snapshot = True
+                if not stale_snapshot:
+                    metrics["changes"] = len(
+                        result.get("changes") or ()
+                    )
+                    metrics["resync"] = bool(result.get("resync"))
+                    if result.get("resync") or result.get("changes"):
+                        broadcast_payload = result
+        finally:
+            self._reconcile_slots.release()
+        if stale_snapshot:
+            state.scan_progress.clear()
+            metrics["stale_scans"] = int(metrics["stale_scans"]) + 1
+            raise WorkspaceScanIncomplete("snapshot event interval unavailable")
         state.initialized = True
         state.reconcile_error = None
         if broadcast_payload is not None:
@@ -2149,9 +2173,9 @@ class FileWatchManager:
                     if not rows:
                         continue
                     async with state.mutation_lock:
-                        # Every relevant native batch invalidates a detached scan,
-                        # even when durable deduplication emits no replay event.
-                        state.native_mutation_revision += 1
+                        # Preserve touched paths even for cursor no-ops so a
+                        # detached scan can rebase without overwriting the watcher.
+                        self._record_native_mutation(state, rows)
                         payload = await asyncio.to_thread(
                             self.store.apply_changes,
                             state.workspace_id,

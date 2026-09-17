@@ -1389,7 +1389,7 @@ def _safe_client_error_record(payload: object) -> dict[str, object] | None:
         record["reason_fp"] = reason_fp
     if trace_fp:
         record["trace_fp"] = trace_fp
-    for field in ("reason_fp", "trace_fp"):
+    for field in ("reason_fp", "trace_fp", "expression_fp"):
         value = payload.get(field)
         if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{24}", value):
             record[field] = value
@@ -1434,6 +1434,8 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
         "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms",
         "shape_ms", "markdown_ms", "install_ms", "response_bytes",
         "block_count", "assistant_blocks", "long_task_count", "longest_task_ms",
+        "sid8", "generation_changed", "recovery", "requested_tail", "local_offset",
+        "local_total", "response_offset", "response_total", "retry_n",
     }
     if any(name not in allowed_fields for name in payload):
         return JSONResponse(
@@ -1443,11 +1445,26 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
     if (not isinstance(visibility, str) or not isinstance(cancel_reason, str)
             or visibility not in {"visible", "hidden", "unknown"}
             or cancel_reason not in {"none", "superseded", "live_owner",
-                                     "revision_changed", "anchor_missing", "aborted"}):
+                                     "revision_changed", "anchor_missing", "aborted",
+                                     "unstable_snapshot", "older_snapshot", "shorter_snapshot",
+                                     "missing_terminal_boundary"}):
+        return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
+    sid8 = payload.get("sid8", "none")
+    recovery = payload.get("recovery", "none")
+    if (not isinstance(sid8, str) or not re.fullmatch(r"[0-9a-f]{8}|none", sid8)
+            or not isinstance(recovery, str)
+            or recovery not in {"none", "expand", "exhausted", "restored", "latest"}
+            or not isinstance(payload.get("generation_changed", False), bool)):
         return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
     try:
         perf_event(
             "client.history_load",
+            sid8=sid8, recovery=recovery,
+            generation_changed=payload.get("generation_changed", False),
+            requested_tail=bounded_int("requested_tail"),
+            local_offset=bounded_int("local_offset"), local_total=bounded_int("local_total"),
+            response_offset=bounded_int("response_offset"), response_total=bounded_int("response_total"),
+            retry_n=bounded_int("retry_n"),
             status=status,
             mode=mode,
             visibility=visibility,
@@ -1470,6 +1487,39 @@ async def client_performance_log(payload: dict = Body(...)) -> dict:
     except Exception:
         # Diagnostics must never turn a successful history load into an error.
         pass
+    return {"ok": True}
+
+
+@app.post("/api/log/chat-render", dependencies=[Depends(require_token)])
+async def client_chat_render_log(payload: dict = Body(...)) -> dict:
+    """Closed-set diagnostics for the full visual transaction and deferred work."""
+    numeric = {"total_ms", "settle_ms", "chars", "long_task_count", "longest_task_ms",
+               "block_count", "mounted_count", "generation"}
+    labels = {"phase": {"transcript", "markdown", "highlight", "tail"},
+              "status": {"ok", "plain", "error", "cancelled"},
+              "cancel_reason": {"none", "superseded", "live_owner", "timeout", "failed"}}
+    if payload.get("phase") == "tail":
+        numeric.update({"visible_start", "visible_end", "range_offset", "canonical_total",
+                        "known_canonical_count", "bottom_distance", "following", "streaming",
+                        "pending_sync", "history_fetch", "progress_age_ms", "transport_age_ms"})
+        labels["status"].add("start")
+        labels["trigger"] = {"jump", "scroll", "programmatic"}
+    invalid = any(key not in numeric | labels.keys() | {"sid8", "asset_version"}
+                  for key in payload)
+    invalid |= any(not isinstance(payload.get(key), str) or payload[key] not in values
+                   for key, values in labels.items())
+    sid8, version = payload.get("sid8", "none"), payload.get("asset_version", "")
+    invalid |= (not isinstance(sid8, str) or not re.fullmatch(r"[0-9a-f]{8}|none", sid8))
+    invalid |= (not isinstance(version, str)
+                or not re.fullmatch(r"[A-Za-z0-9._-]{0,32}", version))
+    if invalid:
+        return JSONResponse({"ok": False, "error": "invalid_payload"}, status_code=422)
+    fields = {key: payload[key] for key in labels}
+    fields.update(sid8=sid8, asset_version=version)
+    for key in numeric:
+        value = payload.get(key, 0)
+        fields[key] = min(100_000_000, max(0, value)) if type(value) is int else 0
+    perf_event("client.chat_render", **fields)
     return {"ok": True}
 
 

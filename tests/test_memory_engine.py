@@ -528,18 +528,18 @@ def test_hybrid_recall_fuses_channels_and_exposes_trace(tmp_path, monkeypatch):
         authority="confirmed", confidence=1.0)
     event_loop_thread = threading.get_ident()
     io_threads = {}
-    original_hydrate = instance._resolve_recall_store().memories_by_ids
+    original_hydrate = instance._resolve_recall_store().memories_with_stats_by_ids
     original_log = instance.store.log_recall
 
-    def tracked_hydrate(memory_ids):
+    def tracked_hydrate(owner_id, memory_ids):
         io_threads["hydrate"] = threading.get_ident()
-        return original_hydrate(memory_ids)
+        return original_hydrate(owner_id, memory_ids)
 
     def tracked_log(*args, **kwargs):
         io_threads["log"] = threading.get_ident()
         return original_log(*args, **kwargs)
 
-    monkeypatch.setattr(instance._resolve_recall_store(), "memories_by_ids", tracked_hydrate)
+    monkeypatch.setattr(instance._resolve_recall_store(), "memories_with_stats_by_ids", tracked_hydrate)
     monkeypatch.setattr(instance.store, "log_recall", tracked_log)
 
     class FakeEmbedding:
@@ -1389,7 +1389,11 @@ def test_recall_retries_lexical_lock_contention_instead_of_returning_empty(
 
     async def scenario():
         try:
-            rows = await asyncio.wait_for(instance.recall('清淡饮食', 'busy-read'), 1)
+            # This guard detects a hung test, not a recall latency contract.
+            # A busy CI runner can delay the actor thread beyond one second
+            # before the injected SQLITE_BUSY retries even begin. The configured
+            # recall budget and retry/result assertions still define success.
+            rows = await asyncio.wait_for(instance.recall('清淡饮食', 'busy-read'), 10)
             assert len(attempts) == 3
             assert [row['id'] for row in rows] == [memory['id']]
             assert instance.pop_recall_trace('busy-read')['lexical_status'] == 'ok'
@@ -1450,4 +1454,85 @@ def test_prepared_recall_injects_configured_limit_and_reports_actual_count(
             {"prompt": prompt}, None, None) == {}
         await instance.stop()
 
+    _run(scenario())
+
+
+def test_recall_store_reports_queue_execution_and_busy_retries(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    from backend.memory_store import MemoryStore
+
+    instance = module.MemoryEngine(MemoryStore(tmp_path / "recall-timing.sqlite3"))
+    memory = instance.store.create_memory("default", "fact", "SYNTHETIC_PRIVATE_CONTENT")
+    events = []
+    monkeypatch.setattr(module, "perf_event", lambda event, **fields: events.append((event, fields)))
+    entered, release = threading.Event(), threading.Event()
+    attempts = 0
+
+    def blocked(_store):
+        entered.set()
+        assert release.wait(3)
+
+    def busy_then_read(store):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            exc = sqlite3.OperationalError("SYNTHETIC_PRIVATE_ERROR")
+            exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise exc
+        return store.memories_by_ids([memory["id"]])
+
+    async def scenario():
+        occupying = asyncio.create_task(instance._recall_store_call(blocked))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            read = asyncio.create_task(instance._recall_store_call(
+                busy_then_read, recall_id="synthetic-recall", stage="hydrate", channel="dense"))
+            await asyncio.sleep(.1)
+            assert not read.done()
+            release.set()
+            assert (await read)[0]["id"] == memory["id"]
+            await occupying
+        finally:
+            release.set()
+            await instance.stop()
+
+    _run(scenario())
+    timing = next(fields for event, fields in events
+                  if event == "memory.recall_store" and fields["recall_id"] == "synthetic-recall")
+    assert timing["status"] == "ok" and timing["channel"] == "dense"
+    assert timing["queue_ms"] >= 80
+    assert timing["execution_ms"] >= timing["busy_retry_ms"] >= 15
+    assert timing["busy_retries"] == 2
+    assert timing["duration_ms"] >= timing["queue_ms"] + timing["execution_ms"] - 1
+    assert "SYNTHETIC_PRIVATE" not in repr(events)
+
+
+@pytest.mark.parametrize("dense_delay", [0, 0.03])
+def test_recall_hydrates_shared_candidates_once(recall_case, monkeypatch, dense_delay):
+    instance, cfg, memory, vector = recall_case
+    cfg.retrieval.soft_timeout_ms = 1500
+    store = instance._resolve_recall_store()
+    original = store.memories_with_stats_by_ids
+    calls = []
+
+    def hydrate(owner, ids):
+        calls.extend(ids)
+        time.sleep(0.02)
+        return original(owner, ids)
+
+    async def dense(*args, **kwargs):
+        await asyncio.sleep(dense_delay)
+        return [{"id": memory["id"], "channel": "dense"}]
+
+    monkeypatch.setattr(store, "memories_with_stats_by_ids", hydrate)
+    monkeypatch.setattr(vector, "search", dense)
+
+    async def scenario():
+        try:
+            rows = await instance.recall("清淡饮食", "shared-candidate")
+            assert [row["id"] for row in rows] == [memory["id"]]
+            assert set(rows[0]["channels"]) == {"dense", "lexical"}
+            assert calls == [memory["id"]]
+        finally:
+            await instance.stop()
     _run(scenario())

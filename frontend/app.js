@@ -1,3 +1,41 @@
+const museRichMessages = new WeakMap();
+const museTranscriptPerf = new Map();
+// One bounded worker, shared by history decoration and code highlighting.
+// A stalled parser is terminated; the complete plain text remains readable.
+const museRichWorker = (() => {
+  let worker = null, active = false;
+  const queue = [];
+  function pump() {
+    if (active || !queue.length) return;
+    const job = queue.shift();
+    if (!job.valid()) { job.resolve(null); pump(); return; }
+    active = true;
+    let timer, settled = false;
+    const finish = (result, reset = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (reset && worker) { worker.terminate(); worker = null; }
+      active = false;
+      job.resolve(job.valid() ? result : null);
+      pump();
+    };
+    try {
+      const version = document.querySelector('meta[name="muselab-asset-version"]')?.content || "";
+      if (!worker) worker = new Worker("/static/render-worker.js?v=" + encodeURIComponent(version));
+      worker.onmessage = event => finish(event.data.failed ? null : event.data.html);
+      worker.onerror = () => finish(null, true);
+      timer = setTimeout(() => finish(null, true), 5000);
+      worker.postMessage(job.data);
+    } catch (_) { finish(null, true); }
+  }
+  return (data, valid = () => true) => new Promise(resolve => {
+    if (queue.length >= 32 || typeof Worker !== "function") { resolve(null); return; }
+    queue.push({ data, valid, resolve });
+    pump();
+  });
+})();
+
 // ==========================================================================
 // Global error capture — runs before anything else so we catch errors that
 // happen during boot too (Alpine x-init, vendor scripts, etc).
@@ -73,7 +111,7 @@
       const wireRecord = _clientErrorWireRecord(rec);
       if (!wireRecord) return;
       if (window.crypto?.subtle) {
-        for (const [field, value] of [["reason_fp", rec.message], ["trace_fp", rec.stack]]) {
+        for (const [field, value] of [["reason_fp", rec.message], ["trace_fp", rec.stack], ["expression_fp", rec.expression]]) {
           if (!value) continue;
           const bytes = new TextEncoder().encode(String(value).slice(0, 4096));
           const digest = await window.crypto.subtle.digest("SHA-256", bytes);
@@ -124,6 +162,7 @@
       message: (r && (r.message || String(r))) || "(no reason)",
       name: r && r.name,
       stack: r && r.stack,
+      expression: r && r.expression,
       filename: "", lineno: 0, colno: 0,
     });
   });
@@ -149,6 +188,7 @@
       message: ev.message || (err && err.message) || "(no message)",
       name: err && err.name,
       stack: err && err.stack,
+      expression: err && err.expression,
       filename: ev.filename || "",
       lineno: ev.lineno || 0,
       colno: ev.colno || 0,
@@ -445,6 +485,8 @@ function portal() {
     // window plus a small overscan buffer.
     fileTreeViewport: { start: 0, end: 80 },
     _fileTreeScrollRAF: null,
+    _fileTreeRevealSeq: 0,
+    _pendingFileTreeReveal: null,
     // Measured row height for the virtual scroller. 0 = "remeasure on next
     // read"; see _fileTreeRowHeight / _invalidateFileTreeRowHeight.
     _fileTreeRowHeightCache: 0,
@@ -1146,9 +1188,10 @@ function portal() {
     // backend is not evidence of a missing provider either.
     _modelsLoaded: false,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
-    // onChatScroll uses it to disengage auto-follow ONLY on user-driven
-    // scroll-up, never on layout-induced scroll events. See _userScrollIntent.
+    // History presentation uses it to detect newer reader navigation across
+    // async work. _userScrollIntent immediately pauses auto-follow.
     _userScrollAt: 0,
+    _chatPointerScroll: null,
     theme: "dark",
     // Eyecare level 2 is the historical palette, so existing users keep the
     // exact same appearance until they deliberately choose softer/warmer.
@@ -5235,11 +5278,12 @@ function portal() {
           queue.push(message);
         }
       }
-      if (!queue.length || st._deferredStreamRichHandle) return;
+      if (!queue.length || st._deferredStreamRichHandle || st._deferredStreamRichRunning) return;
 
-      const run = () => {
+      const run = async () => {
         st._deferredStreamRichHandle = null;
         if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        st._deferredStreamRichRunning = true;
         const maxChunk = this._isMobileLayout() ? 1 : 2;
         const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
         const started = performance.now();
@@ -5249,12 +5293,17 @@ function portal() {
           const message = queue.shift();
           if (!message || !this._containsPaneMessage(st, message)
               || !message._deferredRichReady || !message.text) continue;
-          message.html = this._renderHistoryMessage(message);
+          const html = await this._renderHistoryMessageAsync(message, () =>
+            this.tabState[sid] === st && sid === this.currentId
+            && this._containsPaneMessage(st, message));
+          if (html === null) continue;
+          message.html = html;
           message._streamPlain = false;
           message._deferredRichReady = false;
           st._streamRichRenderCount++;
           rendered++;
         }
+        st._deferredStreamRichRunning = false;
         if (queue.length) {
           this._scheduleDeferredStreamRich(sid, st);
           return;
@@ -5330,6 +5379,68 @@ function portal() {
     // each tick re-walked the entire rendered DOM for code/anchor nodes and
     // re-ran KaTeX over the whole bubble. File-links + math only need to be
     // live once the message is complete.
+    _prepareMarkdown(text) {
+      let parseInput = text;
+      const tripleCount = (text.match(/```/g) || []).length;
+      if (tripleCount % 2 === 1) parseInput += "\n```";
+      const tildeCount = (text.match(/~~~/g) || []).length;
+      if (tildeCount % 2 === 1) parseInput += "\n~~~";
+      // Protect math spans ($$..$$, $..$, \(..\), \[..\]) from marked BEFORE
+      // parsing. marked treats LaTeX underscores/asterisks as markdown
+      // emphasis and silently eats them — e.g. `\sum_{i=1}` becomes
+      // `\sum{i=1}` and `\mathcal{L}_{\text{NTP}}` loses its `_`, so KaTeX
+      // later renders wrong math (or the raw `$$` shows through). We swap each
+      // span for an opaque alphanumeric placeholder, run markdown, then
+      // restore the original LaTeX (HTML-escaped) for KaTeX to typeset.
+      const _mathStore = [];
+      parseInput = this._maskMath(parseInput, _mathStore);
+      return { input: parseInput, math: _mathStore };
+    },
+    async _renderHistoryMessageAsync(m, valid = () => true) {
+      if (!m || !m.text || !valid()) return null;
+      if (m.html && m._htmlSourceText === m.text) return m.html;
+      let pending = museRichMessages.get(m);
+      if (!pending || pending.text !== m.text) {
+        pending = { text: m.text };
+        const owned = pending;
+        pending.promise = this._computeHistoryMessageAsync(m, valid).finally(() => {
+          if (museRichMessages.get(m) === owned) museRichMessages.delete(m);
+        });
+        museRichMessages.set(m, pending);
+      }
+      const html = await pending.promise;
+      return valid() && m.text === pending.text ? html : null;
+    },
+    async _computeHistoryMessageAsync(m, valid = () => true) {
+      if (!m || !m.text || !valid()) return null;
+      const source = m.text;
+      if (source.length < 16 * 1024) return this._renderHistoryMessage(m);
+      const started = performance.now();
+      let html, status = "ok";
+      // Bound the DOM sanitizer/typesetter too. Oversized answers stay complete
+      // and selectable; no expensive synchronous retry after a worker timeout.
+      if (source.length > 256 * 1024) {
+        html = "<pre>" + this.escape(source) + "</pre>";
+        status = "plain";
+      } else {
+        const prepared = this._prepareMarkdown(source);
+        const raw = await museRichWorker({ kind: "markdown", text: prepared.input },
+          () => valid() && m.text === source);
+        if (!valid() || m.text !== source) return null;
+        if (raw === null || raw.length > 512 * 1024) {
+          html = "<pre>" + this.escape(source) + "</pre>";
+          status = "plain";
+        } else {
+          try { html = this._mdRenderUncached(source, { raw, prepared }); }
+          catch (_) { html = "<pre>" + this.escape(source) + "</pre>"; status = "plain"; }
+        }
+      }
+      if (!valid() || m.text !== source) return null;
+      m._htmlSourceText = source;
+      this._reportRenderPerf({ phase: "markdown", status,
+        total_ms: performance.now() - started, chars: source.length });
+      return html;
+    },
     _mdRenderUncached(text, opts = {}) {
       if (!text) return "";
       const streaming = !!opts.streaming;
@@ -5368,27 +5479,17 @@ function portal() {
       // then dumped the rest on completion". Patches a *copy* fed to
       // marked; the source `text` stays the truth. Both fence kinds covered;
       // already-balanced text is untouched.
-      let parseInput = text;
-      const tripleCount = (text.match(/```/g) || []).length;
-      if (tripleCount % 2 === 1) parseInput += "\n```";
-      const tildeCount = (text.match(/~~~/g) || []).length;
-      if (tildeCount % 2 === 1) parseInput += "\n~~~";
-      // Protect math spans ($$..$$, $..$, \(..\), \[..\]) from marked BEFORE
-      // parsing. marked treats LaTeX underscores/asterisks as markdown
-      // emphasis and silently eats them — e.g. `\sum_{i=1}` becomes
-      // `\sum{i=1}` and `\mathcal{L}_{\text{NTP}}` loses its `_`, so KaTeX
-      // later renders wrong math (or the raw `$$` shows through). We swap each
-      // span for an opaque alphanumeric placeholder, run markdown, then
-      // restore the original LaTeX (HTML-escaped) for KaTeX to typeset.
-      const _mathStore = [];
-      parseInput = this._maskMath(parseInput, _mathStore);
+      const prepared = opts.prepared || this._prepareMarkdown(text);
+      const parseInput = prepared.input;
+      const _mathStore = prepared.math;
       // marked occasionally throws on partial markdown mid-stream (unclosed
       // fenced block, half-typed table row, etc). Catch and fall through to
       // escaped raw text so the bubble keeps showing SOMETHING instead of
       // briefly clearing while the next chunk arrives.
       let raw;
       try {
-        raw = window.marked ? window.marked.parse(parseInput) : parseInput;
+        raw = opts.raw !== undefined ? opts.raw
+          : window.marked ? window.marked.parse(parseInput) : parseInput;
       } catch (e) {
         raw = "<pre>" + this.escape(text) + "</pre>";
       }
@@ -5513,13 +5614,19 @@ function portal() {
     _rerenderMathMessages() {
       if (!window.renderMathInElement) return;
       const RE = /\$\$|\\\(|\\\[|\$[^$\n]+\$/;
-      const messages = this.activeSessionPane().messages;
+      const owner = this.activeSessionPane();
+      const messages = owner.messages;
       if (Array.isArray(messages)) {
         for (const m of messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
             this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
             this._historyHtmlDelete(m);
-            m.html = this._renderHistoryMessage(m);
+            if (m.text.length >= 16 * 1024) {
+              m._htmlSourceText = "";
+              void this._renderHistoryMessageAsync(m, () =>
+                this.activeSessionPane() === owner && owner.messages.includes(m))
+                .then(html => { if (html !== null) m.html = html; }).catch(() => {});
+            } else m.html = this._renderHistoryMessage(m);
           }
         }
       }
@@ -7533,6 +7640,7 @@ function portal() {
           if (r.ok) {
             const d = await r.json();
             this.availableModels = d.models || [];
+            this._queueModelCatalogRefresh(d.catalog_pending);
             this._modelsLoaded = true;
             if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
             if (d.default_permission) {
@@ -8802,6 +8910,7 @@ function portal() {
         // Post-result work may briefly leave /active or a mux state snapshot
         // stale; never re-attach that already-rendered turn as "running".
         _lastTerminalTurnId: "",
+        _lastTerminalAssistantUuid: "",
         parentTurnId: "",
         lastEventSeq: 0,
         es: null,
@@ -8865,6 +8974,7 @@ function portal() {
         // never advances for optimistic/live bubbles, so a non-empty pane can
         // still detect that the server has committed a newer missing suffix.
         _installedCanonicalCount: 0,
+        _installedHistoryTotal: 0,
         _seenUpdated: undefined,
         _reconcileTargetUpdated: 0,
         _reconcileRetryN: 0,
@@ -8877,6 +8987,8 @@ function portal() {
         atBottom: true,
         scrollTop: 0,
         _userScrollAt: 0,
+        _pausedTailKey: "",
+        _scrollTowardLatestAt: 0,
         _autoScrolling: false,
         // True when this tab's turn finished while the user was looking at a
         // different tab — drives a green dot on the tab strip so the user
@@ -8997,6 +9109,7 @@ function portal() {
       }
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st._lastTerminalTurnId === undefined) st._lastTerminalTurnId = "";
+      if (st._lastTerminalAssistantUuid === undefined) st._lastTerminalAssistantUuid = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (st._streamOwnerToken === undefined) st._streamOwnerToken = "";
       if (!Number.isFinite(Number(st._lastSseTransportAt))) {
@@ -11966,13 +12079,48 @@ function portal() {
         && Array.isArray(st.messages)
         && !st.messages.length;
     },
+    _finishTranscriptPerf(token, status, reason = "none") {
+      const rec = token && museTranscriptPerf.get(token.sid);
+      if (!rec || rec.generation !== token.generation || rec.token.state !== token.state) return;
+      museTranscriptPerf.delete(token.sid);
+      clearTimeout(rec.timer);
+      if (rec.observer) {
+        rec.collect(rec.observer.takeRecords());
+        rec.observer.disconnect();
+      }
+      this._reportRenderPerf({ phase: "transcript", status, cancel_reason: reason,
+        sid8: token.sid.slice(0, 8), generation: token.generation,
+        total_ms: performance.now() - rec.started,
+        settle_ms: rec.settling ? performance.now() - rec.settling : 0,
+        long_task_count: rec.count, longest_task_ms: rec.longest,
+        block_count: token.state.messages.length,
+        mounted_count: Math.max(0, token.state.messageRange.visibleEnd
+          - token.state.messageRange.visibleStart) });
+    },
     _beginTranscriptLoad(sid, st, phase = "fetching") {
       if (!sid || !st || this.tabState[sid] !== st || st._sid !== sid) return null;
       if ((st.streaming || st.es) && phase !== "mounting") return null;
+      const previousPerf = museTranscriptPerf.get(sid);
+      if (previousPerf) this._finishTranscriptPerf(previousPerf.token, "cancelled", "superseded");
       st.transcriptLoadGeneration =
         (Number(st.transcriptLoadGeneration) || 0) + 1;
       st.transcriptLoadPhase = phase === "mounting" ? "mounting" : "fetching";
-      return { sid, state: st, generation: st.transcriptLoadGeneration };
+      const token = { sid, state: st, generation: st.transcriptLoadGeneration };
+      const rec = { token, generation: token.generation, started: performance.now(), count: 0, longest: 0 };
+      rec.collect = entries => {
+        for (const entry of entries) {
+          if (entry.startTime < rec.started) continue;
+          rec.count++;
+          rec.longest = Math.max(rec.longest, entry.duration);
+        }
+      };
+      try {
+        rec.observer = new PerformanceObserver(list => rec.collect(list.getEntries()));
+        rec.observer.observe({ type: "longtask", buffered: false });
+      } catch (_) { rec.observer = null; }
+      rec.timer = setTimeout(() => this._finishTranscriptPerf(token, "cancelled", "timeout"), 90000);
+      museTranscriptPerf.set(sid, rec);
+      return token;
     },
     _ownsTranscriptLoad(token) {
       return !!token
@@ -11983,6 +12131,8 @@ function portal() {
     async _settleTranscriptLoad(token, options = {}) {
       if (!this._ownsTranscriptLoad(token)) return false;
       token.state.transcriptLoadPhase = "settling";
+      const perf = museTranscriptPerf.get(token.sid);
+      if (perf) perf.settling = performance.now();
       try {
         if (!options.skipNextTick) {
           await new Promise(resolve => this.$nextTick(resolve));
@@ -12002,6 +12152,7 @@ function portal() {
           if (!this._ownsTranscriptLoad(token)) return false;
         }
         token.state.transcriptLoadPhase = "idle";
+        this._finishTranscriptPerf(token, "ok");
         return true;
       } catch (_) {
         this._failTranscriptLoad(token);
@@ -12016,10 +12167,13 @@ function portal() {
       token.state.messagesLoading = false;
       token.state.messagesReady = true;
       token.state.transcriptLoadPhase = "error";
+      this._finishTranscriptPerf(token, "error", "failed");
       return true;
     },
     _releaseTranscriptLoadForLive(st) {
       if (!st) return;
+      this._finishTranscriptPerf({ sid: st._sid, state: st, generation: st.transcriptLoadGeneration },
+        "cancelled", "live_owner");
       st.transcriptLoadGeneration =
         (Number(st.transcriptLoadGeneration) || 0) + 1;
       st.transcriptLoadPhase = "idle";
@@ -12045,7 +12199,13 @@ function portal() {
       // State handoff/clone paths can outlive the load generation that would
       // normally repair an interrupted reveal; a non-empty repository must
       // never derive an empty mounted pane.
-      this._ensureNonEmptyMessageRange(st);
+      // Repair only invalid handoffs. Normal projection is a pure read; the pane
+      // owns one reactive projection, shared by every row expression.
+      if (st.messages.length && (range.visibleStart < 0
+          || range.visibleEnd > st.messages.length
+          || range.visibleEnd <= range.visibleStart)) {
+        this._ensureNonEmptyMessageRange(st);
+      }
       if (range.visibleStart === 0 && range.visibleEnd === st.messages.length) {
         return st.messages;
       }
@@ -12078,11 +12238,29 @@ function portal() {
       if (!tid) return [];
       return this._visiblePaneMessages(this.tabState && this.tabState[tid]);
     },
-    paneMessageIndex(tid, message) {
+    paneMessageIndex(tid, message, visibleRows = null) {
+      // A row's index and its neighbours must come from the same projection.
+      // Canonical storage can advance one Alpine flush before paneMsgs updates.
+      if (Array.isArray(visibleRows)) {
+        let indexes = _paneMessageIndexCache.get(visibleRows);
+        if (!indexes) {
+          indexes = new Map();
+          for (let i = 0; i < visibleRows.length; i++) {
+            if (visibleRows[i]?._k) indexes.set(visibleRows[i]._k, i);
+          }
+          _paneMessageIndexCache.set(visibleRows, indexes);
+        }
+        const index = message?._k ? indexes.get(message._k) : undefined;
+        return Number.isInteger(index) ? index : visibleRows.indexOf(message);
+      }
       const st = tid && this.tabState && this.tabState[tid];
       if (!st || !message) return -1;
       const rows = Array.isArray(st.messages) ? st.messages : [];
-      if (rows.length) this._ensureNonEmptyMessageRange(st);
+      if (rows.length && st.messageRange
+          && (st.messageRange.visibleStart < 0 || st.messageRange.visibleEnd > rows.length
+            || st.messageRange.visibleEnd <= st.messageRange.visibleStart)) {
+        this._ensureNonEmptyMessageRange(st);
+      }
       const start = st.messageRange
         ? Math.max(0, Math.min(st.messageRange.visibleStart, rows.length)) : 0;
       const end = st.messageRange
@@ -12682,13 +12860,16 @@ function portal() {
       if (existingState && payload.stopping) {
         existingState._stoppingTurnId = turnId;
       }
+      const closedMuxChannel = !!(existingState && existingState.es
+        && existingState.es._muxChannel && Number(existingState.es.readyState) === 2);
       if (existingState && existingState.es
-          && existingState.activeTurnId === turnId) return;
+          && existingState.activeTurnId === turnId && !closedMuxChannel) return;
       if (existingState && existingState.es && existingState.es._muxChannel
-          && existingState.activeTurnId
-          && existingState.activeTurnId !== turnId) {
-        // The aggregate state frame is authoritative for ABA turn changes. Retire
-        // only the stale logical adapter; the root EventSource remains shared.
+          && (closedMuxChannel || (existingState.activeTurnId
+            && existingState.activeTurnId !== turnId))) {
+        // A matching turn id does not make a closed adapter usable. Rebuild it
+        // on root reconnect so replay has a live sink instead of queuing forever.
+        // ABA turn changes retire the old adapter through the same path.
         this._retireStaleSessionStream(sid, existingState);
         existingState._pendingExternalUpdate = true;
       }
@@ -13552,9 +13733,11 @@ function portal() {
           if (wantsAttach && st._loaded) this._checkActiveTurn(sid);
           continue;
         }
-        if (newU > priorTarget) st._reconcileRetryN = 0;
+        if (newU > priorTarget || messageCountChanged || turnCountChanged) {
+          st._reconcileRetryN = 0;
+          st._historyAnchorRecovery = null;
+        }
         st._reconcileTargetUpdated = Math.max(priorTarget, newU);
-        st._pendingExternalUpdate = false;
         this._requestSessionSync(sid, "history_revision", {
           attach: wantsAttach,
           targetUpdated: st._reconcileTargetUpdated,
@@ -13572,10 +13755,18 @@ function portal() {
         Number(options.targetUpdated) || 0,
       );
       st._reconcileTargetUpdated = targetUpdated;
+      if (st._historyAnchorRecovery?.targetUpdated !== targetUpdated) {
+        st._historyAnchorRecovery = null;
+      }
+      if (st._historyAnchorRecovery?.exhausted) {
+        st._pendingExternalUpdate = true;
+        return false;
+      }
       let succeeded = false;
       try {
         const loaded = await this.loadSession(sid, {
           quiet: true, probeActive: false, signal: options.signal,
+          minimumTail: st._historyAnchorRecovery?.minimumTail || 0,
         });
         if (!loaded) {
           st._pendingExternalUpdate = true;
@@ -13598,7 +13789,8 @@ function portal() {
         else if (succeeded) st._pendingExternalUpdate = false;
         const retries = Number(st._reconcileRetryN) || 0;
         if (!needsRetry) st._reconcileRetryN = 0;
-        if (needsRetry && !st.streaming && !st.es && retries < 30) {
+        if (needsRetry && !st._historyAnchorRecovery?.exhausted
+            && !st.streaming && !st.es && retries < 30) {
           st._reconcileRetryN = retries + 1;
           this._requestSessionSync(sid, "history_revision", {
             attach: !!options.attach,
@@ -15151,8 +15343,7 @@ function portal() {
     _scheduleHistoryRichRender() {
       if (this._historyRichRenderScheduled) return;
       this._historyRichRenderScheduled = true;
-      const run = () => {
-        this._historyRichRenderScheduled = false;
+      const run = async () => {
         let pending = null;
         while (this._historyRichRenderQueue.length && !pending) {
           const candidate = this._historyRichRenderQueue.shift();
@@ -15171,9 +15362,18 @@ function portal() {
           if (!st || !st.messages.includes(m)) continue;
           pending = candidate;
         }
-        if (!pending) return;
+        if (!pending) { this._historyRichRenderScheduled = false; return; }
         const m = pending.message;
-        m.html = this._renderHistoryMessage(m);
+        const owner = this.tabState[pending.sid];
+        const html = await this._renderHistoryMessageAsync(m, () =>
+          this.tabState[pending.sid] === owner && owner.messages.includes(m)
+          && (!pending.el || pending.el.isConnected));
+        this._historyRichRenderScheduled = false;
+        if (html === null) {
+          if (this._historyRichRenderQueue.length) this._scheduleHistoryRichRender();
+          return;
+        }
+        m.html = html;
         if (m._canonicalPlainUntilRich) {
           m._streamPlain = false;
           delete m._canonicalPlainUntilRich;
@@ -16788,6 +16988,55 @@ function portal() {
       if (m && m.role === "user" && m._failed) {
         this.retryFailedMessage(m);
       }
+    },
+    thinkingViewport() {
+      // Each thinking block owns its inner scroll intent. Data updates queue one
+      // post-Alpine frame; an upward reader gesture pauses only this block.
+      let following = true, eligible = false, touchY = null;
+      let frame = null, disposed = false;
+      return {
+        syncThinking(_text, expanded, streaming) {
+          eligible = !!expanded && !!streaming
+            && this.pane?.messages?.at(-1) === this.m;
+          if (!eligible || !following || disposed) return;
+          const el = this.$el;
+          this.$nextTick(() => {
+            if (frame !== null || disposed || !eligible || !following) return;
+            frame = requestAnimationFrame(() => {
+              frame = null;
+              if (disposed || !eligible || !following || !el.isConnected
+                  || !el.getClientRects().length) return;
+              el.scrollTop = el.scrollHeight;
+            });
+          });
+        },
+        onThinkingScroll() {
+          const el = this.$el;
+          // Layout growth is not a user decision to stop following.
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 2) following = true;
+        },
+        onThinkingWheel(event) {
+          if (Number(event.deltaY) < 0) following = false;
+        },
+        onThinkingTouchStart(event) {
+          touchY = event.touches?.[0]?.clientY ?? null;
+        },
+        onThinkingTouchMove(event) {
+          const nextY = event.touches?.[0]?.clientY;
+          if (touchY !== null && Number.isFinite(nextY) && nextY > touchY) following = false;
+          touchY = Number.isFinite(nextY) ? nextY : null;
+        },
+        onThinkingPointer(event) {
+          if (Number(event.clientX) >= this.$el.getBoundingClientRect().right - 20) following = false;
+        },
+        onThinkingKey(event) {
+          if (["ArrowUp", "PageUp", "Home"].includes(event.key)) following = false;
+        },
+        destroy() {
+          disposed = true;
+          if (frame !== null) cancelAnimationFrame(frame);
+        },
+      };
     },
     thinkingClass(i, m, paneState = null, paneMsgs = null) {
       return this.isMsgExpanded(i, m, false, paneState, paneMsgs)
@@ -18406,22 +18655,56 @@ function portal() {
       if (typeof requestAnimationFrame !== "function") { setTimeout(fn, 0); return; }
       requestAnimationFrame(() => requestAnimationFrame(fn));
     },
+    _reportRenderPerf(fields) {
+      if (!["transcript", "tail"].includes(fields.phase)
+          && fields.total_ms < 50 && fields.chars < 16 * 1024) return;
+      const payload = {
+        phase: fields.phase,
+        status: fields.status,
+        cancel_reason: fields.cancel_reason || "none",
+        sid8: /^[0-9a-f]{8}$/.test(fields.sid8) ? fields.sid8 : "none",
+        asset_version: String(document.querySelector(
+          'meta[name="muselab-asset-version"]')?.content || "").slice(0, 32),
+      };
+      const numeric = ["total_ms", "settle_ms", "chars", "long_task_count",
+        "longest_task_ms", "block_count", "mounted_count", "generation"];
+      if (fields.phase === "tail") {
+        payload.trigger = ["jump", "scroll", "programmatic"].includes(fields.trigger)
+          ? fields.trigger : "programmatic";
+        numeric.push("visible_start", "visible_end", "range_offset", "canonical_total",
+          "known_canonical_count", "bottom_distance", "following", "streaming",
+          "pending_sync", "history_fetch", "progress_age_ms", "transport_age_ms");
+      }
+      for (const name of numeric) {
+        payload[name] = Math.max(0, Math.min(Math.round(Number(fields[name]) || 0), 100_000_000));
+      }
+      try {
+        fetch("/api/log/chat-render", { method: "POST", keepalive: true,
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(payload) }).catch(() => {});
+      } catch (_) { /* diagnostics never affect rendering */ }
+    },
     _reportHistoryLoadPerf(fields) {
       // One privacy-bounded summary per canonical history load. Never include a
-      // session id, message text, URL, model name, or error string.
+      // full session id, message text, URL, model name, or error string.
       const numeric = [
         "total_ms", "fetch_ms", "receive_ms", "parse_ms", "first_reveal_ms", "shape_ms", "markdown_ms",
         "install_ms", "response_bytes", "block_count", "assistant_blocks",
         "long_task_count", "longest_task_ms",
+        "requested_tail", "local_offset", "local_total", "response_offset", "response_total", "retry_n",
       ];
       const payload = {
+        sid8: /^[0-9a-f]{8}$/.test(fields.sid8) ? fields.sid8 : "none",
+        generation_changed: !!fields.generation_changed,
+        recovery: ["none", "expand", "exhausted", "restored", "latest"].includes(fields.recovery)
+          ? fields.recovery : "none",
         status: ["ok", "cancelled", "error"].includes(fields.status)
           ? fields.status : "error",
         mode: ["cold", "quiet", "prefetch"].includes(fields.mode)
           ? fields.mode : "cold",
         foreground: !!fields.foreground,
         visibility: ["visible", "hidden"].includes(fields.visibility) ? fields.visibility : "unknown",
-        cancel_reason: ["none", "superseded", "live_owner", "revision_changed", "anchor_missing", "aborted"]
+        cancel_reason: ["none", "superseded", "live_owner", "revision_changed", "anchor_missing", "aborted", "unstable_snapshot", "older_snapshot", "shorter_snapshot", "missing_terminal_boundary"]
           .includes(fields.cancel_reason) ? fields.cancel_reason : "none",
       };
       for (const name of numeric) {
@@ -18708,6 +18991,37 @@ function portal() {
       return false;
     },
 
+    _historySnapshotRejection(st, snapshot, opts = {}) {
+      // All replacement paths share this gate, including revision/replay loads
+      // that never pass through the explicit done-frame reconciler.
+      if (snapshot.completion_state?.stable === false) return "unstable_snapshot";
+      const seen = Number(st._seenUpdated) || 0;
+      const updated = Number(snapshot.updated_at) || 0;
+      if (seen && updated && updated < seen) return "older_snapshot";
+      const generation = String(snapshot.history_generation || "");
+      const sameGeneration = generation && generation === st.messageRange.generation;
+      if (sameGeneration && !opts.full && st.messageRange.order !== "full"
+          && Number.isFinite(snapshot.total)
+          && snapshot.total < (Number(st._installedHistoryTotal) || 0)) {
+        return "shorter_snapshot";
+      }
+      const expected = st._pendingCompletedTurnSync;
+      const boundary = opts.completedBoundary?.uuid
+        || (expected && expected.completedTurnId === st._lastTerminalTurnId
+          ? expected.expectedAssistantUuid : "")
+        || st._lastTerminalAssistantUuid;
+      // A compact/delete/full-history navigation can legitimately change the
+      // window. Within the SAME normal generation and completed turn, however,
+      // an acknowledged final UUID cannot disappear from the latest snapshot.
+      if (boundary && sameGeneration && !opts.full && !snapshot.has_later
+          && st.messageRange.order !== "full"
+          && snapshot.completion_state?.completed_turn_id === st._lastTerminalTurnId
+          && !(snapshot.messages || []).some(message => message.uuid === boundary)) {
+        return "missing_terminal_boundary";
+      }
+      return "";
+    },
+
     async loadSession(sid, opts = {}) {
       if (!sid) return false;
       // full:true → fetch the raw-JSONL view (?full=1) so PRE-compaction
@@ -18744,8 +19058,10 @@ function portal() {
       // deferred instead of recursively treating it as completed.
       if (st.streaming || st.es || this._hasAdmissionBubble(st)) return false;
       const historyReplaceToken = this._beginHistoryReplace(st);
-      const quietRangeSnapshot = quiet
+      let quietRangeSnapshot = quiet
         ? this._captureMessageRangeSnapshot(st) : null;
+      const requestedUserScrollAt = Number(st._userScrollAt) || 0;
+      const requestedAtBottom = st.atBottom !== false;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -18755,9 +19071,9 @@ function portal() {
       // mid-load corrupts the now-active tab (messages not assigned / skeleton
       // stuck / model/effort overwritten by the old session). See loadSession race.
       const isCurrent = sid === this.currentId;
-      const quietScrollEl = quiet && isCurrent ? this._chatBodyElement() : null;
-      const quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
-      const quietAnchor = quietScrollEl && !st.atBottom
+      let quietScrollEl = quiet && isCurrent ? this._chatBodyElement() : null;
+      let quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
+      let quietAnchor = quietScrollEl && !st.atBottom
         ? this._captureViewportMessageAnchor(quietScrollEl, sid) : null;
       // Quiet refresh keeps the existing bubbles on screen (morph swap below) —
       // raising the skeleton would defeat the point, so only cold/switch loads
@@ -18775,6 +19091,10 @@ function portal() {
       const perfNow = (typeof performance !== "undefined" && performance.now)
         ? () => performance.now() : () => Date.now();
       const historyPerf = {
+        sid8: /^[0-9a-f]{8}-/.test(sid) ? sid.slice(0, 8) : "none",
+        local_offset: st.messageRange.offset, local_total: st.messageRange.total,
+        retry_n: st._reconcileRetryN || 0,
+        recovery: opts.followTail ? "latest" : "none",
         status: "cancelled",
         mode: quiet ? "quiet" : (isCurrent ? "cold" : "prefetch"),
         foreground: isCurrent,
@@ -18807,13 +19127,14 @@ function portal() {
         // phones, 100 on desktop). History remains canonical on the server and
         // the reader can explicitly prepend another same-sized page through the
         // "Load earlier" control. Quiet reconciliation keeps blocks the user
-        // already chose to load, but never expands the resident window by itself.
+        // already chose to load. Missing anchors permit bounded expansion.
         const historyPage = this._historyWindowSize();
         const minimumTail = Math.max(0, Number(opts.minimumTail) || 0);
         const requestedTail = Math.max(
           minimumTail,
           quiet ? Math.max(historyPage, st.messages.length) : historyPage,
         );
+        historyPerf.requested_tail = requestedTail;
         const preserveFullOrder = quiet && st.messageRange.order === "full";
         const qs = full
           ? "?full=1"
@@ -18876,6 +19197,10 @@ function portal() {
         historyPerf.response_bytes = Math.max(
           0, Number(r.headers.get("content-length")) || 0);
         const s = this._retainExpectedSessionSettings(parsedSession);
+        historyPerf.response_offset = s.offset;
+        historyPerf.response_total = s.total;
+        historyPerf.generation_changed = String(s.history_generation || "")
+          !== String(st.messageRange.generation || "");
         if (this.tabState[sid] !== st
             || !this._historyReplaceStillOwns(st, historyReplaceToken)) {
           historyPerf.cancel_reason = "superseded";
@@ -18898,6 +19223,12 @@ function portal() {
           return false;
         }
         const loadedUpdated = Number(s.updated_at) || 0;
+        const rejection = this._historySnapshotRejection(st, s, opts);
+        if (rejection) {
+          historyPerf.cancel_reason = rejection;
+          st._pendingExternalUpdate = true;
+          return false;
+        }
         const shapeStarted = perfNow();
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
@@ -19003,10 +19334,25 @@ function portal() {
         // points the DOM at entirely different (usually much earlier) messages.
         // Snapshot stable keys before replacing the range and synchronously
         // rebase after it, so Alpine never paints one frame with invalid indices.
+        const quietNavigationChanged = quiet && (
+          (Number(st._userScrollAt) || 0) !== requestedUserScrollAt
+          || (st.atBottom !== false) !== requestedAtBottom
+        );
+        if (quietNavigationChanged) {
+          // Network and Markdown work can outlive a jump-to-latest or an upward
+          // gesture. Rebase against the user's current position before publishing
+          // the new repository, not the position saved when the request started.
+          quietRangeSnapshot = this._captureMessageRangeSnapshot(st);
+          quietScrollEl = sid === this.currentId ? this._chatBodyElement() : null;
+          quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
+          quietAnchor = quietScrollEl && st.atBottom === false
+            ? this._captureViewportMessageAnchor(quietScrollEl, sid) : null;
+        }
         const virtualWindowBeforeInstall = quiet
           ? this._captureMessageVirtualWindow(st) : null;
         const followTailAtInstall = quiet && (
-          opts.followTail === true || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
+          (opts.followTail === true && !quietNavigationChanged)
+          || !!(quietRangeSnapshot && quietRangeSnapshot.followTail)
         );
         // Only a complete, stable snapshot of the retired turn can prove a
         // missing reader anchor was removed, rather than merely outside a tail
@@ -19025,7 +19371,9 @@ function portal() {
         const quietRangeResolved = quiet
           ? (followTailAtInstall
             ? {
-              start: Math.max(0, all.length - this._liveMessageDomCap()),
+              start: Math.max(0, all.length - Math.max(this._historyMountWindowSize(),
+                Math.min(this._liveMessageDomCap(),
+                  st.messageRange.visibleEnd - st.messageRange.visibleStart))),
               end: all.length,
             }
             : this._resolveMessageRangeSnapshot(
@@ -19038,6 +19386,19 @@ function portal() {
         // applying old numeric indices to unrelated messages.
         if (quiet && !quietRangeResolved) {
           historyPerf.cancel_reason = "anchor_missing";
+          // Expand toward the old reader's coordinate, then stop when the full
+          // available/capped window still cannot establish identity. Never retry
+          // the same rejected tail thirty times or guess a new reading position.
+          const recoveryLimit = Math.max(2000, st.messages.length);
+          const minimumTail = Math.min(recoveryLimit, Number(s.total) || requestedTail,
+            Math.max(requestedTail * 2, (Number(s.total) || 0) - st.messageRange.offset));
+          const exhausted = full || Number(s.offset) === 0 || minimumTail <= requestedTail;
+          st._historyAnchorRecovery = {
+            targetUpdated: Number(st._reconcileTargetUpdated) || 0,
+            minimumTail, exhausted,
+          };
+          historyPerf.recovery = exhausted ? "exhausted" : "expand";
+          st._pendingExternalUpdate = true;
           st.atBottom = false;
           return false;
         }
@@ -19132,9 +19493,18 @@ function portal() {
         // accepted the canonical message window. A stream claiming the pane mid-
         // read returns above without falsely marking an unseen revision as loaded.
         if (loadedUpdated) st._seenUpdated = loadedUpdated;
+        if (st._historyAnchorRecovery && !opts.followTail) historyPerf.recovery = "restored";
+        st._historyAnchorRecovery = null;
+        if ((Number(st._seenUpdated) || 0) >= (Number(st._reconcileTargetUpdated) || 0)) {
+          st._pendingExternalUpdate = false;
+        }
         st._installedCanonicalCount = Math.max(
           0, Number(s.message_count) || Number(s.total) || incomingCount,
         );
+        // Session metadata can count pre-compaction/raw records. Keep this
+        // normal-window baseline separate, excluding provisional active turns.
+        st._installedHistoryTotal = s.completion_state?.stable === true
+          && s.completion_state?.active === false ? (Number(s.total) || 0) : 0;
         // (The session outline is sourced from the backend via
         // refreshOutlineFromBackend (GET …/outline), not built here.)
         const permissionExpected = st._permissionExpected;
@@ -19202,15 +19572,26 @@ function portal() {
           if (quiet) {
             // Already swapped in place above (no skeleton, no reveal). Just
             // re-highlight the freshly-added tail and re-pin to the bottom IF the
-            // user was following it — _reconcileOpenSession only quiet-reloads
-            // when atBottom, so this won't yank anyone reading history.
+            // user is still following it. Quiet refresh also runs while reading
+            // history; preserve that reader's anchor without pausing new data.
             const _wasAtBottom = st.atBottom !== false;
+            const presentationUserScrollAt = Number(st._userScrollAt) || 0;
+            const ownsPresentation = () => this.currentId === sid
+              && this.tabState[sid] === st && !st.streaming && !st.es
+              && this._historyReplaceStillOwns(st, historyReplaceToken)
+              && (Number(st._userScrollAt) || 0) === presentationUserScrollAt
+              && (st.atBottom !== false) === _wasAtBottom;
             this.$nextTick(async () => {
-              try { await this.highlightCode(".chat-body"); st._highlighted = true; }
+              if (!ownsPresentation()) return;
+              try { await this.highlightCode(".chat-body"); }
               catch (_e) { /* highlight best-effort */ }
-              if (sid === this.currentId && _wasAtBottom) {
-                st.atBottom = true; this.scrollToBottom(true);
-              } else if (sid === this.currentId && quietScrollEl) {
+              // Decoration can finish after a new send, navigation or scroll.
+              // Its old anchor must never revoke the new owner's tail-follow.
+              if (!ownsPresentation()) return;
+              st._highlighted = true;
+              if (_wasAtBottom) {
+                this.scrollToBottom(false);
+              } else if (quietScrollEl) {
                 const restored = this._restoreMessageAnchor(
                   quietScrollEl, quietAnchor);
                 if (!restored) quietScrollEl.scrollTop = quietScrollTop;
@@ -19406,6 +19787,18 @@ function portal() {
       // commit deliberately small so transcript installation yields to shell
       // buttons and the composer between batches instead of freezing the app.
       const CH = this._isMobileLayout() ? 1 : 2;
+      const repository = st.messages;
+      const owner = { seq: st._historyReplaceOwner, epoch: st._historyEpoch };
+      const ownsReveal = () => {
+        if (this.tabState[sid] !== st) return false;
+        if (st.streaming || st.es) {
+          // A live handoff may inherit an empty first batch. Repair only that
+          // invalid range; never replace a valid live tail with old coordinates.
+          this._ensureNonEmptyMessageRange(st);
+          return false;
+        }
+        return st.messages === repository && this._historyReplaceStillOwns(st, owner);
+      };
       if (!tailFirst) {
         // Quiet canonical reconciliation preserves an existing viewport anchor.
         // Keep its established chronological expansion; exposing only the tail
@@ -19413,10 +19806,11 @@ function portal() {
         const start = st.messageRange.visibleStart;
         let i = 0;
         while (i < visible.length) {
-          if (this.tabState[sid] !== st || st.streaming || st.es) return;
+          if (!ownsReveal()) return;
           i = Math.min(visible.length, i + CH);
           st.messageRange.visibleEnd = start + i;
           await new Promise(resolve => this.$nextTick(resolve));
+          if (!ownsReveal()) return;
           if (!this._paneElement(sid)) {
             st.messageRange.visibleEnd = start + visible.length;
             break;
@@ -19425,22 +19819,21 @@ function portal() {
             await this._yieldHistoryInstall();
           }
         }
-        if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
+        if (ownsReveal()) this._scheduleHistoryViewport(st, "older");
         return;
       }
-      const finalStart = st.messageRange.visibleStart;
-      const finalEnd = finalStart + visible.length;
+      const finalEnd = st.messageRange.visibleStart + visible.length;
+      const finalStart = Math.max(st.messageRange.visibleStart,
+        finalEnd - this._historyMountWindowSize());
       let cursor = finalEnd;
       while (cursor > finalStart) {
         const nextStart = Math.max(finalStart, cursor - CH);
-        // Establish a real tail batch before any ownership/cancellation exit.
-        // The previous order first collapsed the range to [finalEnd, finalEnd]
-        // and only expanded it after this guard. If SSE claimed the tab in that
-        // interval, finally marked the pane ready with a permanently empty slice.
+        // Check ownership before every write after yielding. A late batch from
+        // a cold load must not hide messages appended by an adopted live stream.
+        if (!ownsReveal()) return;
         st.messageRange.visibleStart = nextStart;
         st.messageRange.visibleEnd = finalEnd;
         cursor = nextStart;
-        if (this.tabState[sid] !== st || st.streaming || st.es) return;
         const active = sid === this.currentId;
         const scrollEl = active ? this._chatBodyElement() : null;
         const anchor = scrollEl && st.atBottom === false
@@ -19450,6 +19843,7 @@ function portal() {
         // the physical scroller; the remaining resident rows continue prepending
         // between frames without blocking the composer or surrounding controls.
         await new Promise(resolve => this.$nextTick(resolve));
+        if (!ownsReveal()) return;
         if (active && sid === this.currentId && this.tabState[sid] === st) {
           if (!st.messagesReady) st.messagesReady = true;
           if (onFirstReveal) { onFirstReveal(); onFirstReveal = null; }
@@ -19467,7 +19861,7 @@ function portal() {
           await this._yieldHistoryInstall();
         }
       }
-      if (this.tabState[sid] === st) this._scheduleHistoryViewport(st, "older");
+      if (ownsReveal()) this._scheduleHistoryViewport(st, "older");
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
     // markdown loadSession skipped so first paint wasn't blocked on the whole
@@ -20105,6 +20499,9 @@ function portal() {
     // Phones use a smaller explicit page because parsing and installing 100 rich
     // tool/Markdown blocks can monopolize their main thread. Desktop keeps 100.
     _historyWindowSize() { return this._isMobileLayout() ? 20 : 100; },
+    // Fetch ahead independently of DOM work. Older resident rows remain
+    // reachable through history paging without another network request.
+    _historyMountWindowSize() { return 20; },
     _liveMessageDomCap() { return this._isMobileLayout() ? 40 : 100; },
     _liveMessageHistoryStep() { return Math.max(1, Math.floor(this._liveMessageDomCap() / 2)); },
     _isLiveMessagePane(st) { return !!(st && (st.streaming || st.es)); },
@@ -20571,7 +20968,7 @@ function portal() {
         }
         const liveWindow = this._isLiveMessagePane(st);
         const batchSize = liveWindow
-          ? this._liveMessageHistoryStep() : this._historyWindowSize();
+          ? this._liveMessageHistoryStep() : this._historyMountWindowSize();
         const previousEnd = range.visibleEnd;
         const nextStart = Math.max(0, range.visibleStart - batchSize);
         const batch = st.messages.slice(nextStart, range.visibleStart);
@@ -20581,7 +20978,9 @@ function portal() {
           for (let k = j; k < chunkEnd; k++) {
             const m = batch[k];
             if (m.role === "assistant" && m.text && !m.html) {
-              m.html = this._renderHistoryMessage(m);
+              const html = await this._renderHistoryMessageAsync(m, () =>
+                this.tabState[sid] === st && st.messages.includes(m));
+              if (html !== null) m.html = html;
             }
             m._noAnim = true;
           }
@@ -20614,30 +21013,78 @@ function portal() {
         st._loadingEarlier = false;
       }
     },
-    async returnToLatest(sid) {
+    _reportChatTail(st, trigger, status, historyFetch, started) {
+      try {
+        const el = st._sid === this.currentId ? this._chatBodyElement() : null;
+        const pane = this._paneElement(st._sid);
+        const meta = (this.sessions || []).find(row => row.id === st._sid);
+        const age = value => value ? Math.max(0, Date.now() - value) : 0;
+        this._reportRenderPerf({
+          phase: "tail", trigger, status, sid8: String(st._sid || "").slice(0, 8),
+          total_ms: performance.now() - started,
+          block_count: st.messages.length,
+          mounted_count: pane?.querySelectorAll(".msg").length || 0,
+          visible_start: st.messageRange.visibleStart, visible_end: st.messageRange.visibleEnd,
+          range_offset: st.messageRange.offset, canonical_total: st.messageRange.total,
+          known_canonical_count: Number(meta?.message_count) || 0,
+          bottom_distance: el ? el.scrollHeight - el.scrollTop - el.clientHeight : 0,
+          following: Number(st.atBottom !== false), streaming: Number(!!(st.streaming || st.es)),
+          pending_sync: Number(!!st._pendingExternalUpdate), history_fetch: Number(historyFetch),
+          progress_age_ms: age(st._lastSseProgressAt), transport_age_ms: age(st._lastSseTransportAt),
+        });
+      } catch (_) { /* diagnostics must never change navigation */ }
+    },
+    async returnToLatest(sid, trigger = "programmatic") {
       sid = sid || this.currentId;
       const st = sid && this.tabState[sid];
       if (!st) return false;
-      const range = st.messageRange;
-      st.atBottom = false;
-      if (range.offset + st.messages.length < range.total) {
-        const loaded = await this.loadSession(sid, {
-          quiet: sid === this.currentId,
-          followTail: true,
+      const report = trigger !== "programmatic" || this._messageRangeHasLater(st)
+        || st._pendingExternalUpdate;
+      const started = performance.now();
+      let status = "cancelled", historyFetch = false;
+      if (report) this._reportChatTail(st, trigger, "start", historyFetch, started);
+      try {
+        const range = st.messageRange;
+        const navigationUserScrollAt = Number(st._userScrollAt) || 0;
+        st.atBottom = false;
+        const meta = (this.sessions || []).find(row => row.id === sid);
+        const needsFreshTail = st._pendingExternalUpdate || st._historyAnchorRecovery
+          || (Number(st._reconcileTargetUpdated) || 0) > (Number(st._seenUpdated) || 0)
+          || (Number(meta?.updated_at) || 0) > (Number(st._seenUpdated) || 0)
+          || (Number(meta?.message_count) || 0) > (Number(st._installedCanonicalCount) || 0);
+        if (!st.streaming && !st.es
+            && (needsFreshTail || range.offset + st.messages.length < range.total)) {
+          historyFetch = true;
+          const loaded = await this.loadSession(sid, {
+            quiet: sid === this.currentId,
+            followTail: true,
+          });
+          if (!loaded || this.tabState[sid] !== st
+              || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return false;
+        } else {
+          const windowSize = this._isLiveMessagePane(st)
+            ? this._liveMessageDomCap() : this._historyMountWindowSize();
+          range.visibleEnd = st.messages.length;
+          range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
+          this._scheduleHistoryViewport(st, "newer");
+        }
+        this._enforceMessageRangeInvariant(st);
+        if (this._messageRangeHasLater(st)) return false;
+        st.atBottom = true;
+        if (sid === this.currentId) this.$nextTick(() => {
+          if (this.currentId !== sid || this.tabState[sid] !== st || st.atBottom === false
+              || (Number(st._userScrollAt) || 0) !== navigationUserScrollAt) return;
+          this.scrollToBottom(true);
         });
-        if (!loaded || this.tabState[sid] !== st) return false;
-      } else {
-        const windowSize = this._isLiveMessagePane(st)
-          ? this._liveMessageDomCap() : this._historyWindowSize();
-        range.visibleEnd = st.messages.length;
-        range.visibleStart = Math.max(0, range.visibleEnd - windowSize);
-        this._scheduleHistoryViewport(st, "newer");
+        status = "ok";
+        return true;
+      } finally {
+        if (report) this.$nextTick(() => {
+          if (this.tabState[sid] === st) {
+            this._reportChatTail(st, trigger, status, historyFetch, started);
+          }
+        });
       }
-      this._enforceMessageRangeInvariant(st);
-      if (this._messageRangeHasLater(st)) return false;
-      st.atBottom = true;
-      if (sid === this.currentId) this.$nextTick(() => this.scrollToBottom(true));
-      return true;
     },
     hasLaterMessages(sid) {
       return this._messageRangeHasLater(this.tabState[sid || this.currentId]);
@@ -22480,12 +22927,21 @@ function portal() {
 
     // Refresh the available model list from backend — called when provider
     // visibility changes so the model picker dropdown stays in sync.
-    async _fetchModels() {
+    _queueModelCatalogRefresh(pending) {
+      if (!pending || this._modelCatalogRefreshTimer) return;
+      const token = this.token;
+      this._modelCatalogRefreshTimer = setTimeout(() => {
+        this._modelCatalogRefreshTimer = null;
+        if (this.authed && this.token === token) void this._fetchModels(false);
+      }, 2250);
+    },
+    async _fetchModels(catalogRetry = true) {
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
           const d = await r.json();
           this.availableModels = d.models || [];
+          if (catalogRetry) this._queueModelCatalogRefresh(d.catalog_pending);
           this._modelsLoaded = true;
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           if (d.default_permission) {
@@ -22562,6 +23018,8 @@ function portal() {
     // a long-lived tab slowly leaks entries. Call wherever a session is
     // permanently removed (delete) or its tab state is torn down.
     _clearSessionWarnFlags(sid) {
+      const perf = museTranscriptPerf.get(sid);
+      if (perf) this._finishTranscriptPerf(perf.token, "cancelled", "superseded");
       if (this._budgetWarned) delete this._budgetWarned[sid];
       if (this._ctxWarned) delete this._ctxWarned[sid];
       if (this._autoCompacted) delete this._autoCompacted[sid];
@@ -22825,7 +23283,9 @@ function portal() {
         // 刷新可用 provider 列表
         const r2 = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r2.ok) {
-          this.availableModels = (await r2.json()).models || [];
+          const providers = await r2.json();
+          this.availableModels = providers.models || [];
+          this._queueModelCatalogRefresh(providers.catalog_pending);
           // 关键：先校正 this.model 再 rebind。否则 default_model 仍是
           // 出厂值 claude-sonnet-4-6（GET /api/settings 在 MUSELAB_MODEL 未设
           // 时回退到它），而用户只配了 DeepSeek、没有 Anthropic 鉴权 → claude
@@ -24003,6 +24463,19 @@ function portal() {
           )) this._fileTreeDirty = !ok;
       return ok;
     },
+    _fileTreeList() {
+      // Menu actions run in a nested Alpine scope whose $refs can differ from
+      // the file pane's. Always resolve the workspace's actual scroll surface.
+      return document.querySelector("#app .filelist");
+    },
+    _initFileTreeViewport(list) {
+      if (typeof ResizeObserver !== "function") return;
+      // Pane visibility and transitions can settle after Alpine's next tick.
+      new ResizeObserver(() => {
+        this._invalidateFileTreeRowHeight();
+        this._scheduleFileTreeViewportSync();
+      }).observe(list);
+    },
     _fileTreeRowHeight() {
       // MEASURED from a live row, not hard-coded. The old constants (40 touch /
       // 22 desktop) were the CSS `min-height`, but padding and line-height push
@@ -24011,7 +24484,7 @@ function portal() {
       // put the spacers 800px out of sync with reality, so scrolling landed on
       // the wrong slice. Fall back to the CSS floor only before first paint.
       if (this._fileTreeRowHeightCache > 0) return this._fileTreeRowHeightCache;
-      const list = this.$refs && this.$refs.fileList;
+      const list = this._fileTreeList();
       const row = list && list.querySelector(
         "li:not(.filelist-virtual-spacer):not(.filelist-status)");
       const measured = row ? row.getBoundingClientRect().height : 0;
@@ -24027,7 +24500,7 @@ function portal() {
     _invalidateFileTreeRowHeight() {
       this._fileTreeRowHeightCache = 0;
     },
-    _syncFileTreeViewport(list = this.$refs && this.$refs.fileList) {
+    _syncFileTreeViewport(list = this._fileTreeList()) {
       if (!list) return;
       const total = this.visible.length;
       const rowHeight = this._fileTreeRowHeight();
@@ -24051,11 +24524,43 @@ function portal() {
     },
     _scheduleFileTreeViewportSync(resetScroll = false) {
       this.$nextTick(() => {
-        const list = this.$refs && this.$refs.fileList;
+        const list = this._fileTreeList();
         if (!list) return;
         if (resetScroll) list.scrollTop = 0;
         this._syncFileTreeViewport(list);
+        this._flushFileTreeReveal();
       });
+    },
+    async _flushFileTreeReveal() {
+      const pending = this._pendingFileTreeReveal;
+      if (!pending) return false;
+      const isCurrent = () => pending.seq === this._fileTreeRevealSeq
+        && this._workspaceIsCurrent(pending.workspace)
+        && this._workspaceGenerationIsCurrent(pending.workspace, pending.generation);
+      if (!isCurrent()) {
+        this._pendingFileTreeReveal = null;
+        return false;
+      }
+      await this.$nextTick();
+      if (!isCurrent() || this._pendingFileTreeReveal !== pending) return false;
+      const list = this._fileTreeList();
+      // A hidden pane cannot retain a meaningful scrollTop. Keep the logical
+      // target until ResizeObserver reports that the pane has become visible.
+      if (!list || list.clientHeight <= 0) return false;
+      this._pendingFileTreeReveal = null;
+      if (!this._positionFileTreePath(pending.path, pending.block)) return false;
+      await this.$nextTick();
+      if (!isCurrent()) return false;
+      const escaped = CSS.escape(pending.path);
+      const row = list.querySelector(`li[role="treeitem"][data-path="${escaped}"]`);
+      if (!row) return false;
+      if (pending.highlight) {
+        row.classList.remove("reveal-pulse");
+        void row.offsetWidth;
+        row.classList.add("reveal-pulse");
+        setTimeout(() => row.classList.remove("reveal-pulse"), 1600);
+      }
+      return true;
     },
     fileTreeWindowRows() {
       const total = this.visible.length;
@@ -24079,7 +24584,7 @@ function portal() {
       return Math.max(0, this.visible.length - end) * this._fileTreeRowHeight();
     },
     _positionFileTreePath(path, block = "nearest") {
-      const list = this.$refs && this.$refs.fileList;
+      const list = this._fileTreeList();
       const idx = this.visible.findIndex(node => node.path === path);
       if (!list || idx < 0) return false;
       const rowHeight = this._fileTreeRowHeight();
@@ -24804,7 +25309,8 @@ function portal() {
         && this._workspaceGenerationIsCurrent(
           ownerWorkspace, workspaceGeneration,
         )
-        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
+        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)
+        && (!opts.isCurrent || opts.isCurrent());
       let children;
       try {
         children = await this.fetchChildren(n.path, {
@@ -27563,7 +28069,10 @@ function portal() {
           : (!this.previewOpen || !!this.desktopFullPane)
       );
       if (path === this.selected && this.previewSurface === "file"
-          && !revealNeeded) return true;
+          && !revealNeeded) {
+        await this.revealInTree(path, { mode: "background", reveal: opts.reveal === true });
+        return true;
+      }
       // A terminal overlays the last selected file without clearing
       // `selected`. Clicking that same (usually rightmost) file tab must still
       // route through openFile so the preview surface leaves terminal mode.
@@ -27578,78 +28087,60 @@ function portal() {
         { preview: !!(cur && cur.preview), reveal: opts.reveal === true },
       );
       if (!opened) return false;
-      // Pass mode:"background" so we expand/scroll the tree quietly —
-      // the user clicked a preview tab, they want to STAY in preview
-      // (especially on mobile, where revealInTree's default mode would
-      // bounce them to the files pane). The pulse animation also
-      // doesn't fire here because there's no "I'm looking for this
-      // file in the tree" user intent — they were already on it.
-      await this.revealInTree(path, { mode: "background" });
+      // Keep the mobile preview in place while locating its row. The logical
+      // target is applied when the Files pane next has a visible viewport.
+      await this.revealInTree(path, { mode: "background", reveal: opts.reveal === true });
       return true;
     },
     async revealInTree(path, opts = {}) {
-      // Make the file's row visible in the tree pane and flash it so the
-      // user can see the locate operation actually happened.
-      //
-      // Two modes:
-      //   - "interactive" (default): user explicitly asked to locate
-      //     this file (context menu "在文件树定位"). Switch mobileTab to
-      //     "files" so they see the result, clear searchMode (the tree
-      //     is hidden under x-show otherwise), and pulse the row.
-      //   - "background": caller wants the side-effect of expanding
-      //     ancestors + scrolling, but the user is currently doing
-      //     something else (e.g. switching preview tabs). Do NOT
-      //     hijack mobileTab, do NOT clear search, do NOT pulse —
-      //     just quietly position the row so it's already correct
-      //     when the user later switches to the files pane.
-      //
-      // Failure modes the interactive mode guards against:
-      //   1. Mobile — user is on mobileTab="preview", so even after the
-      //      tree expands they see no change. Switch to "files" first.
-      //   2. searchMode — filelist-wrap has x-show="!searchMode", so the
-      //      <li> exists in DOM but is hidden inside a display:none parent.
-      //      Clear searchMode so the tree is actually visible.
-      //   3. Already in viewport — block:"nearest" + smooth scroll does
-      //      nothing visibly. Use block:"center" + a temporary CSS pulse
-      //      class so the user always sees feedback.
-      //   4. Non-active tab — when the user right-clicks a non-current
-      //      preview tab, `selected !== path`, so the row has no `sel`
-      //      class. The pulse class handles that too.
-      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
-      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace);
-      if (!path || !isOwner()) return;
+      const workspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const generation = this._workspaceGeneration(workspace);
+      if (!path || !this._workspaceIsCurrent(workspace)) return false;
+      const seq = ++this._fileTreeRevealSeq;
+      this._pendingFileTreeReveal = null;
+      const isCurrent = () => seq === this._fileTreeRevealSeq
+        && this._workspaceIsCurrent(workspace)
+        && this._workspaceGenerationIsCurrent(workspace, generation);
       const interactive = opts.mode !== "background";
-      if (interactive) {
+      const showTree = interactive || opts.reveal === true;
+      if (showTree) {
         if (this.searchMode) this.clearSearch();
-        if (this._isMobileLayout()) this.setMobileTab("files");
+        if (this._isMobileLayout()) {
+          if (interactive) this.setMobileTab("files");
+        } else {
+          this.leftOpen = true;
+          this.desktopFullPane = "";
+        }
       }
-      const parts = path.split("/");
-      parts.pop();   // drop the filename, keep only directory chain
-      const dirPath = parts.join("/");
-      if (dirPath) await this.expandPath(dirPath);
-      if (!isOwner()) return;
-      // With a virtualized tree the target row may intentionally not exist in
-      // DOM yet. Position the logical row first; updating the viewport window
-      // mounts it on the following tick.
-      this.$nextTick(() => this.$nextTick(() => {
-        if (!isOwner()) return;
-        this._positionFileTreePath(path, interactive ? "center" : "nearest");
-        this.$nextTick(() => {
-          if (!isOwner()) return;
-          const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
-          const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
-          if (!el) return;
-          if (!interactive && !opts.highlight) return;
-          // Pulse highlight — independent of `sel` class so it fires even
-          // when this isn't the active tab. Restart by removing+adding so
-          // rapid re-reveals still trigger the animation.
-          el.classList.remove("reveal-pulse");
-          // Force reflow so the next add restarts the animation.
-          void el.offsetWidth;
-          el.classList.add("reveal-pulse");
-          setTimeout(() => el.classList.remove("reveal-pulse"), 1600);
-        });
-      }));
+      // A file opened through a link/tab may live under the hidden-file
+      // filter. Reveal its real ancestors before looking up virtual rows.
+      if (!this.showHidden && path.split("/").some(part => part.startsWith("."))) {
+        await this.toggleHidden();
+        if (!isCurrent()) return false;
+      }
+      const dirPath = path.split("/").slice(0, -1).join("/");
+      if (dirPath) {
+        await this.expandPath(dirPath, { ownerWorkspace: workspace, isCurrent });
+        if (!isCurrent()) return false;
+      }
+      if (!await this._ensureFileTreeNode(path, workspace, generation, isCurrent)) return false;
+      if (!isCurrent()) return false;
+      if (showTree) {
+        this.clearTreeSelection();
+        this.treeFocusPath = path;
+        this._selAnchor = path;
+      }
+      this._pendingFileTreeReveal = {
+        path, seq, workspace, generation,
+        block: showTree ? "center" : "nearest",
+        highlight: showTree || !!opts.highlight,
+      };
+      // Wait for both the pane layout and expanded virtual spacers to mount.
+      // Callers can await completion; stale requests cannot scroll a newer tab.
+      await this.$nextTick();
+      if (!isCurrent()) return false;
+      await this._flushFileTreeReveal();
+      return true;
     },
     closeTab(path) {
       const idx = this.tabs.findIndex(t => t.path === path);
@@ -28129,14 +28620,6 @@ function portal() {
         return Promise.resolve();
       };
       if (!nodes.length) { return Promise.resolve(runArtifacts()); }
-      if (!window.hljs) {
-        // We have blocks to highlight → NOW lazy-load hljs, then re-call.
-        // The re-call re-collects (cheap) and idempotently highlights any
-        // blocks that appeared since the last paint (data-hl="1" sentinel
-        // prevents double work).
-        return this._loadHljs().then(() => this.highlightCode(root, scopeEls))
-          .catch(e => console.warn("[muselab] hljs lazy-load failed:", e));
-      }
       // We DON'T highlight all blocks in one synchronous forEach: on a long
       // history (re)entered cold this can be 150+ blocks, and hljs auto-detect
       // on big ones takes many ms each — the sum locked the main thread for
@@ -28154,11 +28637,11 @@ function portal() {
       const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
       let i = 0;
       return new Promise((resolve) => {
-        const pump = () => {
+        const pump = async () => {
           const started = performance.now();
           const end = Math.min(i + maxChunk, nodes.length);
           for (; i < end; i++) {
-            this._highlightOne(nodes[i]);
+            await this._highlightOne(nodes[i]);
             if (performance.now() - started >= frameBudgetMs) {
               i++;
               break;
@@ -28224,7 +28707,7 @@ function portal() {
     // Highlight a single <code> block (extracted from highlightCode so the
     // chunked pump can call it per element). Idempotent via the data-hl
     // sentinel — see highlightCode for why dedup matters during streaming.
-    _highlightOne(el) {
+    async _highlightOne(el) {
       // Dedup: every stream chunk re-runs flushRender → highlightCode, and
       // without this guard we'd re-highlight every code block on every chunk.
       // The `data-hl="1"` sentinel is cleared by the preview-reload paths
@@ -28263,19 +28746,24 @@ function portal() {
       }
       const m = el.className.match(/language-([\w+#-]+)/);
       const lang = m && m[1];
+      if (el.dataset.hlPending === "1") return;
+      el.dataset.hlPending = "1";
+      const started = performance.now();
       try {
-        const r = (lang && window.hljs.getLanguage(lang))
-          ? window.hljs.highlight(text, { language: lang, ignoreIllegals: true })
-          // No explicit language → auto-detect, but RESTRICTED to a subset of
-          // common languages. Plain highlightAuto(text) tries every one of the
-          // ~39 registered grammars (and compiles them all on first use); the
-          // subset cuts that to ~15 likely candidates, which is both faster and
-          // less prone to mis-detecting prose-y blocks as some exotic language.
-          : window.hljs.highlightAuto(text, this._hlAutoSubset());
-        el.innerHTML = r.value;
+        const html = await museRichWorker({ kind: "highlight", text,
+          language: lang, languages: Array.from(this._hlAutoSubset()) },
+          () => el.isConnected && el.textContent === text);
+        if (!el.isConnected || el.textContent !== text) return;
+        if (html !== null && window.DOMPurify) {
+          el.innerHTML = window.DOMPurify.sanitize(html, {
+            ALLOWED_TAGS: ["span"], ALLOWED_ATTR: ["class"],
+          });
+        }
         el.classList.add("hljs");
         el.dataset.hl = "1";
-      } catch (e) { console.warn("[muselab] highlight failed:", e); }
+        this._reportRenderPerf({ phase: "highlight", status: html === null ? "plain" : "ok",
+          total_ms: performance.now() - started, chars: text.length });
+      } finally { delete el.dataset.hlPending; }
       // Attach copy button to every <pre> wrapping a code block — only once.
       this._attachCopyBtn(el);
     },
@@ -29994,14 +30482,45 @@ function portal() {
       if (n.is_dir) { this.clearSearch(); await this.expandPath(n.path); }
       else { await this.openFile(n, { reveal: true }); }
     },
-    async expandPath(path) {
+    async _ensureFileTreeNode(path, workspace, generation, isCurrent) {
+      const existing = this.visible.find(node => node.path === path);
+      if (existing) return existing;
+      // An indexed snapshot may lag a new file, and bounded directory
+      // listings can omit it. Resolve just the requested path from disk.
+      const headers = this.hdr();
+      if (workspace) headers["X-Muselab-Workspace"] = encodeURIComponent(workspace);
+      let node;
+      try {
+        const response = await fetch("/api/files/stat?path=" + encodeURIComponent(path), { headers });
+        if (!response.ok) return null;
+        node = await response.json();
+      } catch (_) { return null; }
+      if (!isCurrent() || !this._workspaceGenerationIsCurrent(workspace, generation)
+          || !node || node.path !== path) return null;
+      this._applyFileTreeDelta([{ ...node, type: "added" }]);
+      return this.visible.find(row => row.path === path) || null;
+    },
+    async expandPath(path, opts = {}) {
+      const workspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const generation = this._workspaceGeneration(workspace);
+      const isCurrent = () => this._workspaceIsCurrent(workspace)
+        && this._workspaceGenerationIsCurrent(workspace, generation)
+        && (!opts.isCurrent || opts.isCurrent());
       const parts = path.split("/");
       let acc = "";
       for (let i = 0; i < parts.length; i++) {
+        if (!isCurrent()) return false;
         acc = acc ? acc + "/" + parts[i] : parts[i];
-        const node = this.visible.find(x => x.path === acc);
-        if (node && node.is_dir && !this.expanded.has(acc)) await this.expand(node);
+        const node = await this._ensureFileTreeNode(acc, workspace, generation, isCurrent);
+        if (!isCurrent() || !node || !node.is_dir) return false;
+        if (!this.expanded.has(acc)) {
+          await this.expand(node, {
+            ownerWorkspace: workspace, workspaceGeneration: generation, isCurrent,
+          });
+          if (!isCurrent() || !this.expanded.has(acc)) return false;
+        }
       }
+      return true;
     },
 
     // ===== upload / drag-drop / mkdir =====
@@ -31562,7 +32081,8 @@ function portal() {
     },
     _refreshSlashPalette(prefix = this.input) {
       const text = String(prefix || "");
-      if (!text.startsWith("/")) {
+      if (!this.SLASH_ENABLED || !text.startsWith("/")
+          || /^\/[^\s]*[\/\\]/.test(text)) {
         this.slashShow = false;
         return false;
       }
@@ -32581,12 +33101,21 @@ function portal() {
       const el = this._chatBodyElement();
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      const pointer = this._chatPointerScroll;
+      let movedTowardLatest = false;
+      if (st && pointer?.sid === this.currentId
+          && Math.abs(el.scrollTop - pointer.top) > 1) {
+        const direction = el.scrollTop > pointer.top ? 1 : -1;
+        pointer.top = el.scrollTop;
+        this._applyChatScrollIntent(direction);
+      }
       if (st) {
         const now = (typeof performance !== "undefined" && performance.now)
           ? performance.now() : Date.now();
         const previousTop = Number(st._lastVirtualScrollTop) || 0;
         const previousAt = Number(st._lastVirtualScrollAt) || now;
         const delta = el.scrollTop - previousTop;
+        movedTowardLatest = delta > 1;
         const elapsed = Math.max(8, now - previousAt);
         st._virtualScrollDirection = delta < -1 ? -1 : (delta > 1 ? 1 : st._virtualScrollDirection);
         st._virtualScrollVelocity = Math.min(20000, Math.abs(delta) * 1000 / elapsed);
@@ -32610,90 +33139,105 @@ function portal() {
       // mis-classify and never re-engage auto-follow).
       const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
       if (nearBottom) {
-        // The physical bottom of a frozen range is not the logical transcript
-        // tail. Keep the jump affordance until hidden later messages are restored.
+        // Returning through a real downward gesture resumes a paused live tail.
+        // Layout scrolls and explicitly paged historical windows keep their range.
+        if (movedTowardLatest && this._resumePausedChatTail(st, el)) return;
         if (st) {
           st.atBottom = !this.hasLaterMessages(this.currentId);
+          if (st.atBottom) st._pausedTailKey = "";
           st.scrollTop = el.scrollTop;
         }
         return;
       }
-      // Not at the bottom. ONLY a genuine user gesture (wheel / touch / scrollbar
-      // drag) may disengage follow. The previous code flipped atBottom=false on
-      // ANY scroll event whose geometry read > 2px — but several NON-user events
-      // fire scroll with a transiently-wrong distance and silently broke
-      // mid-stream follow ("某些 block 导致停止追随"):
-      //   1. A measured virtual-window shift replaces estimated spacer height;
-      //      the distance read can briefly exceed 2px during that correction.
-      //   2. A late-realizing block (image / iframe / mermaid / highlighted code)
-      //      growing height triggers the browser's scroll-anchoring, which moves
-      //      scrollTop without any user input.
-      // Both must NOT stop following. Gate disengagement on a recent real
-      // pointer/wheel gesture; layout-induced scrolls leave atBottom untouched
-      // so the next streaming tick re-pins to the bottom.
-      const userDriven = (Date.now() - ((st && st._userScrollAt)
-        || this._userScrollAt || 0)) < 400;
-      if (userDriven && st) st.atBottom = false;
+      // Upward wheel/touch/scrollbar intent already disengages follow in
+      // _userScrollIntent. A later layout scroll must not reuse that old gesture:
+      // sending or jumping to latest may have explicitly resumed follow since.
       if (st) st.scrollTop = el.scrollTop;
     },
     // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
-    // pointerdown on the chat body (see index.html) so onChatScroll can tell a
-    // user scroll-up apart from a layout-induced scroll event.
+    // pointerdown on the chat body (see index.html). Only real reader input
+    // can disengage follow; layout-induced scroll events preserve that choice.
     _chatTouchStart(ev) {
       const touch = ev && ev.touches && ev.touches[0];
       this._chatTouchY = touch ? touch.clientY : null;
     },
+    _resumePausedChatTail(st, el) {
+      if (!st || !el || st._sid !== this.currentId || st.atBottom !== false
+          || !st._pausedTailKey || !this._messageRangeHasLater(st)
+          || st._pausedTailKey !== st.messages[st.messageRange.visibleEnd - 1]?._k
+          || !st._scrollTowardLatestAt
+          || st._scrollTowardLatestAt !== st._userScrollAt
+          || el.scrollHeight - el.scrollTop - el.clientHeight >= 2) return false;
+      // The reader reached the same tail where follow was paused, not the end
+      // of a different history page. A momentum scroll can outlive its input
+      // event; newer input direction, rather than a timer, owns that decision.
+      st._pausedTailKey = "";
+      void this.returnToLatest(st._sid, "scroll");
+      return true;
+    },
+    _applyChatScrollIntent(direction) {
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      if (!st || !direction) return;
+      this._userScrollAt = Date.now();
+      st._userScrollAt = this._userScrollAt;
+      if (direction > 0) {
+        st._scrollTowardLatestAt = st._userScrollAt;
+        // At the physical bottom another wheel/touch gesture need not produce
+        // a scroll event. It must still be able to reveal pending local messages.
+        this._resumePausedChatTail(st, this._chatBodyElement());
+        return;
+      }
+      st._scrollTowardLatestAt = 0;
+      if (st.atBottom !== false && !this._messageRangeHasLater(st)) {
+        st._pausedTailKey = st.messages[st.messageRange.visibleEnd - 1]?._k || "";
+      }
+      if (this.previewQuote.show && this.previewQuote.source === "chat"
+          && this.previewQuote.mode !== "ask") this.dismissPreviewQuote(false);
+      st.atBottom = false;
+      this._settleToken = (this._settleToken || 0) + 1;
+      this._autoScrolling = false;
+    },
     _userScrollIntent(ev) {
       const el = this._chatBodyElement();
-      let movesTowardHistory = true;
-      if (ev && ev.type === "wheel") {
-        movesTowardHistory = Number(ev.deltaY) < 0;
-      } else if (ev && ev.type === "touchmove") {
-        const touch = ev.touches && ev.touches[0];
-        const previousY = Number(this._chatTouchY);
-        const currentY = touch ? touch.clientY : previousY;
-        movesTowardHistory = Number.isFinite(previousY) && currentY > previousY;
-        this._chatTouchY = currentY;
-      } else if (ev && ev.type === "pointerdown" && el) {
-        // A pointer press inside message content is selection/clicking, not a
-        // scroll request. Only the scrollbar gutter claims pointerdown as a
-        // possible reader-controlled scroll; wheel/touch paths know direction.
-        const rect = el.getBoundingClientRect();
-        movesTowardHistory = Number(ev.clientX) >= rect.right - 20;
+      let direction = -1;
+      if (ev?.type === "wheel") {
+        direction = Math.sign(Number(ev.deltaY) || 0);
+      } else if (ev?.type === "touchmove") {
+        const currentY = ev.touches?.[0]?.clientY;
+        const previousY = this._chatTouchY;
+        this._chatTouchY = Number.isFinite(currentY) ? currentY : null;
+        if (!Number.isFinite(previousY) || !Number.isFinite(currentY)) return;
+        direction = Math.sign(previousY - currentY);
+      } else if (ev?.type === "keydown") {
+        if (ev.target?.closest("input,textarea,[contenteditable=true]")) return;
+        if (["ArrowUp", "PageUp", "Home"].includes(ev.key)) direction = -1;
+        else if (["ArrowDown", "PageDown", "End"].includes(ev.key)) direction = 1;
+        else return;
+      } else if (ev?.type === "pointerdown") {
+        if (!el || Number(ev.clientX) < el.getBoundingClientRect().right - 20) return;
+        direction = 0;
       }
-      if (!movesTowardHistory) return;
-      // Tool output/code panels have their own scroll containers. Their
-      // bubbling gestures do not mean the reader left the conversation tail.
-      // At an inner boundary allow normal scroll chaining to claim the outer
-      // viewport, unless the panel explicitly contains that chain.
+      if (!direction && ev?.type !== "pointerdown") return;
+      // A scrollable inner thinking/code/tool panel consumes its own gestures.
+      // Only chaining past the relevant boundary belongs to the conversation.
       for (let node = ev?.target instanceof Element ? ev.target : null;
         node && node !== el; node = node.parentElement) {
         const style = getComputedStyle(node);
         if (!/(auto|scroll|overlay)/.test(style.overflowY)
             || node.scrollHeight <= node.clientHeight + 1) continue;
-        if (ev.type === "pointerdown" || node.scrollTop > 0
+        const innerCanScroll = direction < 0 ? node.scrollTop > 0
+          : node.scrollTop + node.clientHeight < node.scrollHeight - 1;
+        if (ev.type === "pointerdown" || innerCanScroll
             || /^(contain|none)$/.test(style.overscrollBehaviorY)) return;
       }
-      if (this.previewQuote.show && this.previewQuote.source === "chat"
-          && this.previewQuote.mode !== "ask") {
-        // Hide the contextual actions while the transcript moves, but preserve
-        // the browser selection. Clearing it here made wheel-assisted text
-        // selection impossible: once the actions popover appeared, the next
-        // wheel tick called removeAllRanges() even while the mouse button was
-        // still held, so users could not extend a selection across viewports.
-        this.dismissPreviewQuote(false);
+      if (ev?.type === "pointerdown") {
+        // Pressing the scrollbar (or nearby content) is not itself scrolling.
+        // Observe actual movement before pausing, so a stationary click cannot
+        // freeze all subsequent messages while the reader remains at the bottom.
+        this._chatPointerScroll = { sid: this.currentId, top: el.scrollTop };
+        return;
       }
-      this._userScrollAt = Date.now();
-      const st = this.currentId && this.tabState && this.tabState[this.currentId];
-      if (st) {
-        st._userScrollAt = this._userScrollAt;
-        st.atBottom = false;
-      }
-      // A real upward gesture immediately owns the viewport. Cancel any tail
-      // settle that was still realizing content-visibility rows; waiting for its
-      // next synthetic scroll event would let it yank the reader back down.
-      this._settleToken = (this._settleToken || 0) + 1;
-      this._autoScrolling = false;
+      this._applyChatScrollIntent(direction);
     },
     _ensureChatTailObserver() {
       const body = this._chatBodyElement();
@@ -32794,6 +33338,7 @@ function portal() {
           return;
         }
         st.atBottom = true;
+        st._pausedTailKey = "";
         this._syncMessageViewport(sid, true);
         this.$nextTick(() => {
           if (this.currentId !== sid || this.tabState[sid] !== st) return;
@@ -33002,7 +33547,7 @@ function portal() {
       if (this.SLASH_ENABLED && isComposerSubmission) {
         const slashDraft = String((sendState.draft && sendState.draft.input) || "");
         const slashText = slashDraft.trim();
-        if (slashText.startsWith("/")) {
+        if (slashText.startsWith("/") && !/^\/[^\s]*[\/\\]/.test(slashText)) {
           const match = slashText.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
           if (match) {
             return await this._dispatchSlash(match[1], match[2] || "", {
@@ -34192,6 +34737,11 @@ function portal() {
         cancelPendingPaint();
         curBubble.text = acc;
         curBubble._streamText = acc;
+        if (acc.length >= 16 * 1024) {
+          this._queueDeferredStreamRich(streamSid, streamState, curBubble);
+          _scrollIfActive();
+          return;
+        }
         curBubble.html = this._renderHistoryMessage(curBubble);
         curBubble._streamPlain = false;
         curBubble._deferredRichReady = false;
@@ -34561,7 +35111,7 @@ function portal() {
         };
         this.rlBadge = this.rateLimitWorst();
       });
-      // Backend preflight auto-compact. Drives the SAME per-tab `compacting`
+      // Preflight and CLI-native auto-compact share the per-tab `compacting`
       // flag the manual compact button sets, so the 📦 bubble, the ctx-meter
       // shimmer and the "busy" checks all light up identically — the user
       // shouldn't have to know whether a compact was their idea or the
@@ -34573,12 +35123,18 @@ function portal() {
         if (!streamState) return;
         if (d.phase === "start") {
           streamState.compacting = true;
-          streamState._compactStartedAt = Date.now();
+          const now = Date.now();
+          const startedAt = Number(d.started_at_ms);
+          streamState._compactStartedAt = Number.isFinite(startedAt)
+            && startedAt > 0 && startedAt <= now ? startedAt : now;
           if (streamSid === this.currentId) {
-            this.toast(this.lang === "zh"
-              ? `上下文 ${Math.round((d.used || 0) / 1000)}K，自动压缩中…`
-              : `Context ${Math.round((d.used || 0) / 1000)}K — auto-compacting…`,
-              "info", 4000);
+            const used = Number(d.used);
+            const label = Number.isFinite(used) && used > 0
+              ? (this.lang === "zh"
+                ? `上下文 ${Math.round(used / 1000)}K，自动压缩中…`
+                : `Context ${Math.round(used / 1000)}K — auto-compacting…`)
+              : (this.lang === "zh" ? "正在压缩会话上下文…" : "Compacting conversation context…");
+            this.toast(label, "info", 4000);
           }
         } else if (d.phase === "end") {
           streamState.compacting = false;
@@ -34823,6 +35379,7 @@ function portal() {
         const terminalTurnId = streamTurnId || String(streamState.activeTurnId || "");
         if (authoritativeTerminal && terminalTurnId) {
           streamState._lastTerminalTurnId = terminalTurnId;
+          streamState._lastTerminalAssistantUuid = String(completionMeta?.assistantUuid || "");
         }
         if (streamState._stoppingTurnId === terminalTurnId) {
           streamState._stoppingTurnId = "";
@@ -35065,8 +35622,14 @@ function portal() {
         this._ctxWarned = this._ctxWarned || {};
         this._autoCompacted = this._autoCompacted || {};
         const ctxPct = d.session_usage && d.session_usage.context_used_pct;
+        // The backend resolves capacity provenance and disables its threshold
+        // when only an unknown model's display fallback is available. Share
+        // that decision instead of turning an estimated percentage into a
+        // second, independent command scheduler.
+        const canAutoCompact = Number(d.session_usage && d.session_usage.auto_compact_threshold) > 0
+          && !d.is_error && !d.cancelled;
         const streamStCompacting = !!(this.tabState[streamSid] && this.tabState[streamSid].compacting);
-        if (ctxPct >= 95 && !this._autoCompacted[streamSid] && !streamStCompacting) {
+        if (canAutoCompact && ctxPct >= 95 && !this._autoCompacted[streamSid] && !streamStCompacting) {
           this._autoCompacted[streamSid] = true;
           // Schedule on next tick so the stream's done handler fully
           // unwinds first (runCompact's per-session streaming check
@@ -35080,7 +35643,7 @@ function portal() {
                        "info", 3000);
             this.runCompact(streamSid, { skipConfirm: true });
           });
-        } else if (ctxPct >= 85 && ctxPct < 95 && !this._ctxWarned[streamSid]) {
+        } else if (canAutoCompact && ctxPct >= 85 && ctxPct < 95 && !this._ctxWarned[streamSid]) {
           this._ctxWarned[streamSid] = true;
           this.toast(
             this.t("ctx.window_warn", { pct: Math.round(ctxPct) }),

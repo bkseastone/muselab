@@ -10,7 +10,6 @@ No real network, no real CLI subprocess, no Anthropic API.
 """
 import asyncio
 import base64
-import collections
 import inspect
 import json
 import threading
@@ -88,9 +87,6 @@ def stream_env(app_module, monkeypatch):
         lambda *_args, **_kwargs: (
             "fixture-canonical-assistant", "fixture-canonical-user", True),
     )
-    # Skip jsonl signature cleanup (would scan disk).
-    from backend import jsonl_cleanup
-    monkeypatch.setattr(jsonl_cleanup, "clean_session", lambda sid: None)
     # Pretend a device is active so the turn-done push fan-out is skipped.
     from backend import presence
     monkeypatch.setattr(presence, "recently_active", lambda: True)
@@ -3514,7 +3510,7 @@ def test_continuation_footer_is_durable_before_terminal_publish(stream_env):
     """Offload the exact-UUID sidecar write without reopening the reload race."""
     import inspect
 
-    source = inspect.getsource(stream_env._watch_inflight_tasks)
+    source = inspect.getsource(stream_env._watch_inflight_tasks_owned)
     close_at = source.index("async def _close_continuation")
     annotate_at = source.index("sess.set_message_annotation,", close_at)
     done_at = source.index(
@@ -4126,34 +4122,35 @@ def test_pooled_stream_attaches_before_query_and_parks_leftovers(stream_env):
     assert pooled.index("turn_q = stream.attach_turn()") < pooled.index(
         "await _send_query()"
     )
-    assert "stream.park_unconsumed(turn_q)" in pooled
+    assert "await stream.release_turn(turn_q, background_messages)" in pooled
 
 
-def test_turn_does_not_consume_buffered_continuation(stream_env):
-    """The invariant the old _TurnBusy gate was really protecting.
+def test_turn_does_not_consume_detached_continuation(stream_env, monkeypatch):
+    """An idle delivery belongs to the original session, never the next query."""
+    chat = stream_env
+    delivered = []
 
-    A background task's auto-continuation can land while no consumer is
-    attached; the pump parks it. A turn that attaches afterwards must not
-    inherit it — otherwise the follow-up renders the previous task's reply as
-    the answer to the new prompt. It belongs to the watcher.
-    """
-    chat_mod = stream_env
+    async def consume(key, message):
+        delivered.append((key[0], message))
+
+    monkeypatch.setattr(chat, "_consume_sdk_idle_message", consume)
+
+    class IdleClient:
+        async def receive_messages(self):
+            await asyncio.Event().wait()
+            yield
 
     async def exercise():
-        stream = chat_mod._SessionStream.__new__(chat_mod._SessionStream)
-        # Build the routing state directly; a real pump needs a live CLI.
-        stream.key = ("buffered-continuation", "model", "auto", "")
-        stream._turn = None
-        stream._background = None
-        stream._orphans = collections.deque(maxlen=8)
-        stream._closed = False
-        stream._orphans.append("continuation-of-previous-task")
-
-        turn_q = stream.attach_turn()
-        assert turn_q.empty(), "a new turn must not inherit parked messages"
-
-        bg_q = stream.attach_background()
-        assert bg_q.get_nowait() == "continuation-of-previous-task"
+        stream = chat._SessionStream(("fixture-session", "model", "auto", ""), IdleClient())
+        try:
+            previous = stream.attach_turn()
+            previous.put_nowait("previous continuation")
+            await stream.release_turn(previous)
+            current = stream.attach_turn()
+            assert current.empty()
+            assert delivered == [("fixture-session", "previous continuation")]
+        finally:
+            await stream.aclose()
 
     asyncio.run(exercise())
 
@@ -5987,7 +5984,7 @@ def test_failed_session_stream_evicts_dead_cached_client(stream_env):
     asyncio.run(go())
 
 
-def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
+def test_release_turn_delivers_leftovers_before_discarding_queue(stream_env, monkeypatch):
     """Stopping at our own Result must not swallow what the pump queued after it.
 
     A slash command breaks on its ResultMessage, but the pump routes
@@ -6005,20 +6002,23 @@ def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
             await asyncio.Event().wait()
             yield  # pragma: no cover — never reached
 
+    delivered = []
+    async def consume(_key, message):
+        delivered.append(message)
+    monkeypatch.setattr(chat_mod, "_consume_sdk_idle_message", consume)
+
     async def go():
         stream = chat_mod._SessionStream(("sid", "m", "auto", ""), IdleClient())
         try:
             q = stream.attach_turn()
             q.put_nowait(later)
             q.put_nowait(chat_mod._STREAM_EOF)
-            stream.detach_turn(q)
-            stream.park_unconsumed(q)
+            await stream.release_turn(q)
         finally:
             await stream.aclose()
-        return list(stream._orphans)
 
-    # EOF is a wake-up sentinel, not a message — it must not be re-parked.
-    assert asyncio.run(go()) == [later]
+    asyncio.run(go())
+    assert delivered == [later]  # EOF must not reach the idle consumer.
 
 
 def test_preflight_compact_trusts_the_token_count_over_the_verdict(
@@ -7016,7 +7016,7 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
 
     try:
         chat_mod._task_watchers[sid] = LiveWatcher()
-        assert chat_mod.session_active_status(sid) == {
+        assert asyncio.run(chat_mod.session_active_status(sid)) == {
             "active": False,
             "stopping": False,
             "background_tasks_pending": 0,
@@ -7030,7 +7030,7 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
         }
 
         chat_mod._pin_background_task(sid, "task_live")
-        active = chat_mod.session_active_status(sid)
+        active = asyncio.run(chat_mod.session_active_status(sid))
         assert active["active"] is True
         assert active["background"] is True
         assert active["background_tasks_pending"] == 1
@@ -7255,7 +7255,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
     monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
     monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
     monkeypatch.setattr(
-        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+        chat_mod, "_refresh_sdk_session_summary", no_refresh)
 
     async def run():
         assert await chat_mod._observe_sdk_stream_message(
@@ -7270,7 +7270,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
             ),
         ) is True
         await asyncio.sleep(0)
-        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        delivery = chat_mod._sdk_deliveries[key]
         broadcast = delivery.broadcast
         assert chat_mod._active_turns[sid] is broadcast
         assert broadcast.activity_source == "scheduled"
@@ -7316,7 +7316,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
     broadcast = asyncio.run(run())
     try:
         assert sid not in chat_mod._active_turns
-        assert key not in chat_mod._sdk_scheduled_deliveries
+        assert key not in chat_mod._sdk_deliveries
         events = list(broadcast.replay_events())
         assert [event["event"] for event in events] == [
             "startup", "text", "done",
@@ -7324,7 +7324,7 @@ def test_sdk_scheduled_trigger_is_broadcast_live_without_refresh(
         done = json.loads(events[-1]["data"])
         assert done["scheduled"] is True
         assert done["activity_source"] == "scheduled"
-        assert chat_mod.session_active_status(sid)["scheduled"] is True
+        assert asyncio.run(chat_mod.session_active_status(sid))["scheduled"] is True
     finally:
         recent = chat_mod._recent_turns.pop(sid, None)
         handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
@@ -7360,7 +7360,7 @@ def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
     monkeypatch.setattr(chat_mod, "_start_activity_early", no_activity)
     monkeypatch.setattr(chat_mod, "_finish_activity", no_activity)
     monkeypatch.setattr(
-        chat_mod, "_refresh_scheduled_session_summary", no_refresh)
+        chat_mod, "_refresh_sdk_session_summary", no_refresh)
     monkeypatch.setattr(
         chat_mod.sess, "set_message_annotation", lambda *_a, **_k: None)
 
@@ -7374,7 +7374,7 @@ def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
             ),
         )
         await asyncio.sleep(0)
-        delivery = chat_mod._sdk_scheduled_deliveries[key]
+        delivery = chat_mod._sdk_deliveries[key]
         assert accepted is True
         assert delivery.job_id == "job-originless"
         assert delivery.broadcast.user_text == prompt
@@ -7412,7 +7412,7 @@ def test_originless_sdk_scheduled_trigger_uses_known_prompt_fingerprint(
         ]
     finally:
         chat_mod._sdk_cron_jobs.pop(sid, None)
-        chat_mod._sdk_scheduled_deliveries.pop(key, None)
+        chat_mod._sdk_deliveries.pop(key, None)
         chat_mod._active_turns.pop(sid, None)
         recent = chat_mod._recent_turns.pop(sid, None)
         handle = chat_mod._recent_turn_expiry_handles.pop(sid, None)
@@ -7443,7 +7443,7 @@ def test_originless_cron_prompt_does_not_capture_foreground_user_turn(
             UserMessage(content=prompt, uuid="human-user", origin=None),
         ))
         assert accepted is False
-        assert key not in chat_mod._sdk_scheduled_deliveries
+        assert key not in chat_mod._sdk_deliveries
     finally:
         chat_mod._active_turns.pop(sid, None)
         chat_mod._sdk_cron_jobs.pop(sid, None)
@@ -8768,3 +8768,144 @@ async def test_stop_during_recall_never_submits_query(stream_env, client, monkey
     assert cancelled.is_set()
     assert fake.queried == []
     assert sid not in chat_mod.mem0._prepared_recalls
+
+
+@pytest.mark.parametrize("ending", ["status", "boundary", "result"])
+def test_native_compaction_announces_progress_without_preflight(
+        stream_env, client, monkeypatch, ending):
+    """CLI-owned compaction must reach the existing UI before the turn ends."""
+    sid = _make_session(client)
+    messages = [
+        SystemMessage(subtype="status", data={
+            "status": "compacting", "private": "synthetic-private-marker",
+        }),
+        SystemMessage(subtype="status", data={"status": "compacting"}),
+        SystemMessage(subtype="status", data={"permissionMode": "default"}),
+    ]
+    if ending == "status":
+        messages.append(SystemMessage(subtype="status", data={"status": None}))
+    elif ending == "boundary":
+        messages.append(SystemMessage(subtype="compact_boundary", data={
+            "compact_metadata": {"trigger": "auto", "pre_tokens": 180000},
+            "private": "synthetic-private-marker",
+        }))
+    messages.extend([
+        AssistantMessage(content=[TextBlock(text="native compact finished")],
+                         model="claude-sonnet-4-6"),
+        ResultMessage(subtype="success", duration_ms=30, duration_api_ms=20,
+                      is_error=False, num_turns=1, session_id=sid,
+                      total_cost_usd=0.0, usage={}),
+    ])
+    fake = _FakeStreamClient(messages)
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(stream_env, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=native-compact-fixture&model=claude-sonnet-4-6")
+    assert response.status_code == 200
+    events = _parse_sse(response.text)
+    progress = [json.loads(data) for event, data in events
+                if event == "compact_progress"]
+    assert [item["phase"] for item in progress] == ["start", "end"]
+    assert progress[0]["source"] == "native"
+    assert progress[0]["started_at_ms"] > 0
+    assert progress[1]["ok"] is True
+    assert "synthetic-private-marker" not in response.text
+    assert fake.queried == ["native-compact-fixture"]
+    kinds = [event for event, _ in events]
+    assert kinds.index("compact_progress") < kinds.index("text")
+    assert max(i for i, kind in enumerate(kinds) if kind == "compact_progress") < kinds.index("done")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["success", "connect_error", "cancelled"])
+@pytest.mark.parametrize("attachment", [False, True])
+async def test_recall_overlaps_connect_and_retires_with_startup(
+    stream_env, client, monkeypatch, ending, attachment,
+):
+    chat = stream_env
+    sid = _make_session(client)
+    aid = "overlap-attachment"
+    if attachment:
+        chat._image_store[aid] = {
+            "kind": "text", "mime": "text/plain", "name": "overlap.txt",
+            "raw": b"synthetic attachment", "text": "synthetic attachment",
+            "ts": chat.time.time(),
+        }
+    entered, stopped = asyncio.Event(), asyncio.Event()
+    prompts, hooks, events = [], [], []
+    monkeypatch.setattr(chat.obs, "perf_event", lambda event, **fields: events.append((event, fields)))
+
+    async def recall(prompt, _sid):
+        prompts.append(prompt)
+        entered.set()
+        try:
+            if ending != "success":
+                await asyncio.Event().wait()
+            return "SYNTHETIC_RECALL_CONTEXT"
+        finally:
+            stopped.set()
+
+    class HookClient(_FakeStreamClient):
+        async def query(self, prompt):
+            await super().query(prompt)
+            hooks.append(await chat.mem0.build_recall_hook(sid, prepared_only=True)(
+                {"prompt": prompt}, None, None))
+
+    fake = HookClient([ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=9, is_error=False,
+        num_turns=1, session_id=sid, total_cost_usd=0.0, usage={},
+    )])
+
+    async def connect(*_args, **_kwargs):
+        # The old sequential implementation cannot reach recall while connect
+        # waits here. No wall-clock performance threshold is needed.
+        await asyncio.wait_for(entered.wait(), 2)
+        broadcast = chat._active_turns[sid]
+        if attachment and ending == "success":
+            # Moving the lease earlier must pin the file for the entire cold
+            # connection, even if normal upload TTL expires during that await.
+            chat._image_store[aid]["ts"] = chat.time.time() - chat._IMAGE_TTL_S - 1
+            chat._gc_images()
+            assert aid in chat._image_store
+        if ending == "connect_error":
+            raise RuntimeError("synthetic connect failure")
+        if ending == "cancelled":
+            broadcast.cancelled = True
+            raise asyncio.CancelledError
+        assert await broadcast.recall_task
+        return fake
+
+    monkeypatch.setattr(chat, "get_client", connect)
+    monkeypatch.setattr(chat.mem0, "enabled", lambda: True)
+    monkeypatch.setattr(chat.mem0, "search_context", recall)
+    start = chat._start_turn(sid, "synthetic overlap prompt", model="claude-sonnet-4-6",
+                             image_ids=aid if attachment else "")
+    if ending == "connect_error":
+        with pytest.raises(chat._TurnStartError):
+            await start
+        broadcast = chat._recent_turns[sid]
+    else:
+        broadcast = await start
+        if broadcast.task:
+            await asyncio.wait_for(broadcast.task, 5)
+    assert stopped.is_set()
+    assert broadcast.recall_task.done()
+    assert sid not in chat.mem0._prepared_recalls
+    assert aid not in chat._staged_attachment_claims
+    if ending == "success":
+        assert fake.queried == prompts
+        assert len(hooks) == 1
+        assert hooks[0]["hookSpecificOutput"]["additionalContext"] == "SYNTHETIC_RECALL_CONTEXT"
+        if attachment:
+            assert "overlap.txt" in prompts[0] and "Files attached" in prompts[0]
+        startup = next(fields for event, fields in events if event == "chat.startup")
+        assert startup["recall_wait_ms"] <= startup["recall_ms"] + 1
+    else:
+        assert fake.queried == []
+        if attachment:
+            assert aid in chat._image_store
+    assert "SYNTHETIC_RECALL_CONTEXT" not in repr(events)

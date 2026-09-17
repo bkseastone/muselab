@@ -255,6 +255,8 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/synthetic-private-agent.sock")
     monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "synthetic-private-value")
     monkeypatch.setenv("DUCC_AUTH_SOURCE", "managed-login")
+    monkeypatch.setenv("MUSELAB_DUCC_WORKSPACE", "/stale/workspace")
+    monkeypatch.setenv("PWD", "/")
     monkeypatch.setenv("HTTPS_PROXY", "https://user:password@proxy.invalid")
     monkeypatch.setattr(
         chat_mod, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
@@ -276,6 +278,8 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     assert captured["model"] == "Opus 4.8"
     ducc_env = captured["env"]
     assert ducc_env["MUSELAB_DUCC_CLI"] == "/opt/ducc/bin/ducc"
+    assert ducc_env["MUSELAB_DUCC_WORKSPACE"] == captured["cwd"]
+    assert ducc_env["MUSELAB_DUCC_WORKSPACE"] != "/stale/workspace"
     assert ducc_env["HOME"]
     assert ducc_env["DUCC_AUTH_SOURCE"] == "managed-login"
     assert "HTTPS_PROXY" not in ducc_env
@@ -317,6 +321,7 @@ def test_non_claude_ducc_model_uses_catalog_name_without_claude_controls(
     assert captured["cli_path"] == str(wrapper)
     assert captured["model"] == "gpt-5.6-sol"
     assert captured["env"]["MUSELAB_DUCC_CLI"] == "/opt/ducc/bin/ducc"
+    assert captured["env"]["MUSELAB_DUCC_WORKSPACE"] == captured["cwd"]
     assert "effort" not in captured
     assert captured["thinking"] == {"type": "disabled"}
 
@@ -825,3 +830,54 @@ def test_mem0_recall_uses_user_prompt_hook(app_module, monkeypatch, tmp_path):
     assert len(matchers[0].hooks) == 1
     assert callable(matchers[0].hooks[0])
     assert matchers[0].timeout == chat_mod.mem0.RECALL_HOOK_TIMEOUT
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("unavailable", None), ("catalog", 243200), ("override", 300000),
+    ("known_model", 364800),
+])
+def test_codex_runtime_window_requires_known_capacity(
+    app_module, monkeypatch, tmp_path, source, expected,
+):
+    from backend import chat, endpoints
+
+    model = "codex:gpt-5.6-sol"
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "fixture-key")
+    monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", "http://127.0.0.1:9876")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    monkeypatch.setattr(chat, "MODEL_CONTEXT_LIMITS",
+                        {model: 384000} if source == "known_model" else {})
+    monkeypatch.setattr(chat, "_context_limit_env_override",
+                        lambda _m: 300000 if source == "override" else 0)
+    capability = ({"context_limit": 243200, "context_limit_source": "gateway_catalog",
+                   "context_raw_limit": 256000, "context_limit_is_estimate": False}
+                  if source == "catalog" else None)
+    monkeypatch.setattr(chat, "_detect_gateway_context_capability",
+                        lambda _m: asyncio.sleep(0, result=capability))
+    captured = _capture_build_options(chat, monkeypatch)
+    asyncio.run(chat._build_and_connect_client(
+        "fixture-capacity-runtime", model, "bypassPermissions", ""))
+    assert captured["connected"]
+    for key in ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
+        if expected is None:
+            assert key not in captured["env"]
+        else:
+            assert captured["env"][key] == str(expected)
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "mismatch"])
+def test_ducc_workspace_diagnostic_is_private_and_deduplicated(
+    app_module, capsys, reason,
+):
+    from backend import chat as chat_mod
+
+    sink = chat_mod._privacy_safe_cli_stderr_logger("DUCC", "12345678-private-id")
+    capsys.readouterr()
+    line = f"MuseLab DUCC runtime: workspace cwd {reason}"
+    sink(line)
+    sink(line)
+    logged = capsys.readouterr().err
+    assert logged.count("category=workspace") == 1
+    assert "sid=12345678" in logged
+    assert "private-id" not in logged
+    assert line not in logged

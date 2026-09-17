@@ -1770,7 +1770,7 @@ async def test_reconcile_perf_event_splits_wait_scan_and_replay(
 
 
 @pytest.mark.asyncio
-async def test_detached_scan_retries_after_watcher_mutation(
+async def test_detached_scan_yields_retry_to_scheduler_after_unknown_mutation(
     app_module,
     temp_root,
     monkeypatch,
@@ -1843,8 +1843,12 @@ async def test_detached_scan_retries_after_watcher_mutation(
     await asyncio.wait_for(heartbeat.wait(), timeout=0.2)
     release_first_scan.set()
 
-    # The stale first result is discarded. The fresh result is applied once and
-    # its exact payload is built while the mutation lock is still owned.
+    # An unknown mutation cannot be rebased. End this pass without applying;
+    # the scheduler owns the next attempt and its elapsed-time backoff.
+    with pytest.raises(file_events.WorkspaceScanIncomplete):
+        await reconcile
+    assert scan_calls == 1 and store.applications == 0
+    reconcile = asyncio.create_task(manager._reconcile_and_broadcast(state))
     assert await asyncio.to_thread(store.apply_entered.wait, 1)
     mutation_acquired = asyncio.Event()
 
@@ -2274,8 +2278,8 @@ async def test_reconcile_failures_back_off_coalesce_and_reset(
         return await real_scan(state)
 
     monkeypatch.setattr(manager, "_scan_workspace", fail_twice)
-    monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_START_S", 0.02)
-    monkeypatch.setattr(file_events, "_RECONCILE_BACKOFF_CAP_S", 0.04)
+    monkeypatch.setattr(file_events, "_RECONCILE_RETRY_BASE_S", 0.02)
+    monkeypatch.setattr(file_events, "_RECONCILE_RETRY_MAX_S", 0.04)
     monkeypatch.setattr(
         file_events,
         "perf_event",
@@ -2314,7 +2318,10 @@ async def test_reconcile_failures_back_off_coalesce_and_reset(
                         if event == "files.reconcile"]
     assert [fields["attempt"] for fields in reconcile_events] == [1, 2, 3]
     assert [fields["failures"] for fields in reconcile_events] == [1, 2, 0]
-    assert [fields["backoff_ms"] for fields in reconcile_events] == [20, 40, 0]
+    # A slow runner can spend longer than the base delay in the failed scan.
+    # Retry also accounts for that elapsed work, bounded by the configured cap.
+    assert 20 <= reconcile_events[0]["backoff_ms"] <= 40
+    assert [fields["backoff_ms"] for fields in reconcile_events[1:]] == [40, 0]
     assert {fields["phase"] for fields in reconcile_events} == {"initial"}
     captured = repr(reconcile_events)
     assert str(temp_root) not in captured
@@ -2564,7 +2571,7 @@ async def test_relevant_native_noop_invalidates_detached_scan_token(
     await manager.shutdown()
 
 
-def test_detached_snapshot_rejects_a_changed_cursor(
+def test_detached_snapshot_rebases_over_complete_watcher_events(
     app_module,
     temp_root,
 ):
@@ -2595,11 +2602,9 @@ def test_detached_snapshot_rejects_a_changed_cursor(
         expected_cursor=before,
     )
     assert stale == {
-        "_stale": True,
-        "cursor": before + 1,
-        "changes": [],
-        "resync": True,
+        "cursor": before + 1, "changes": [], "resync": False,
     }
+    assert report["rebased_paths"] == 1
 
     assert added.name in {
         row["path"] for row in store.bootstrap(workspace_id)["entries"]
@@ -3432,7 +3437,7 @@ async def test_continuous_watcher_mutations_back_off_instead_of_rescanning_forev
     try:
         with pytest.raises(module.WorkspaceScanIncomplete):
             await manager._reconcile_and_broadcast(state)
-        assert scans == 3
+        assert scans == 1
         assert not state.scan_progress
         assert state.initialized and state.reconcile_retry_at > module.monotonic()
         assert state.reconcile_failures == 1
@@ -3482,3 +3487,16 @@ def test_workspace_connection_context_closes_handle(app_module, temp_root):
         assert connection.execute('SELECT 1').fetchone()[0] == 1
     with pytest.raises(sqlite3.ProgrammingError, match='closed'):
         connection.execute('SELECT 1')
+
+
+def test_expensive_failed_scan_has_cost_proportional_bounded_retry(temp_root, monkeypatch):
+    from backend import file_events as events
+    monkeypatch.setattr(events, "monotonic", lambda: 100.0)
+    state = events._WatchState(root=temp_root, workspace_id="retry-fixture")
+    delay = events.FileWatchManager._record_reconcile_retry(state, elapsed_s=20.0)
+    assert delay == 20.0
+    assert state.reconcile_retry_at == 120.0
+    delay = events.FileWatchManager._record_reconcile_retry(state, elapsed_s=100.0)
+    assert delay == events._RECONCILE_RETRY_MAX_S
+    events.FileWatchManager._reset_reconcile_retry(state)
+    assert state.reconcile_retry_at == 0

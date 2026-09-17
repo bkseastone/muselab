@@ -74,7 +74,7 @@ def test_idle_hook_messages_are_consumed_before_the_orphan_queue(stream_env, mon
         try:
             await asyncio.wait_for(received.wait(), 2)
             assert stream._failure is None
-            assert len(stream._orphans) == 0
+            assert stream._turn is None and stream._background is None
             assert chat._session_has_scheduled_tasks(key[0])
         finally:
             await stream.aclose()
@@ -107,7 +107,7 @@ def test_unannounced_native_cron_stream_is_drained_without_stealing_a_user_turn(
         pass
     monkeypatch.setattr(chat, "_start_activity_early", ignore)
     monkeypatch.setattr(chat, "_finish_activity", ignore)
-    monkeypatch.setattr(chat, "_refresh_scheduled_session_summary", ignore)
+    monkeypatch.setattr(chat, "_refresh_sdk_session_summary", ignore)
 
     async def run():
         await create_job(chat, key)
@@ -115,8 +115,10 @@ def test_unannounced_native_cron_stream_is_drained_without_stealing_a_user_turn(
             "type": "content_block_delta",
             "delta": {"type": "text_delta", "text": "Fixture is healthy"},
         })
-        assert await chat._observe_sdk_stream_message(key, message) is True
-        delivery = chat._sdk_scheduled_deliveries[key]
+        assert await chat._observe_sdk_stream_message(key, message) is False
+        await chat._consume_sdk_idle_message(key, message)
+        delivery = chat._sdk_deliveries[key]
+        assert not delivery.scheduled and not delivery.job_id
         await chat._observe_sdk_stream_message(key, AssistantMessage(
             content=[TextBlock("Fixture is healthy")], model="model",
         ))
@@ -125,7 +127,7 @@ def test_unannounced_native_cron_stream_is_drained_without_stealing_a_user_turn(
             is_error=False, num_turns=1, session_id=key[0],
         ))
         assert delivery.broadcast.done
-        assert not chat._sdk_scheduled_deliveries
+        assert not chat._sdk_deliveries
         foreground = chat.TurnBroadcast(key[0], model="model")
         chat._active_turns[key[0]] = foreground
         try:
@@ -143,7 +145,7 @@ def test_synthetic_no_response_is_not_successful_cron_execution(stream_env, monk
         pass
     monkeypatch.setattr(chat, "_start_activity_early", ignore)
     monkeypatch.setattr(chat, "_finish_activity", ignore)
-    monkeypatch.setattr(chat, "_refresh_scheduled_session_summary", ignore)
+    monkeypatch.setattr(chat, "_refresh_sdk_session_summary", ignore)
 
     async def run():
         await create_job(chat, key)
@@ -151,7 +153,7 @@ def test_synthetic_no_response_is_not_successful_cron_execution(stream_env, monk
             content="Check the fixture status", uuid="trigger-1",
             origin={"kind": "task-notification", "subkind": "scheduled-trigger"},
         ))
-        delivery = chat._sdk_scheduled_deliveries[key]
+        delivery = chat._sdk_deliveries[key]
         await chat._observe_sdk_stream_message(key, AssistantMessage(
             content=[TextBlock("No response requested.")], model="<synthetic>",
         ))
@@ -285,7 +287,7 @@ def test_buffer_diagnostics_identify_owner_and_envelope_without_content(stream_e
         queue.put_nowait(SystemMessage(subtype="status", data={"private": "do-not-log"}))
     event = events[-1][1]
     assert event["session"] == "fixture-"
-    assert event["envelope_counts"] == {"SystemMessage:status": 1}
+    assert event["envelope_0"] == "SystemMessage:status:1"
     assert event["incoming_kind"] == "SystemMessage:status"
     assert "do-not-log" not in json.dumps(event)
     queue.get_nowait()
@@ -368,7 +370,7 @@ def test_cron_run_requires_successful_matching_tool_result(stream_env, monkeypat
     key = (sid, meta["model"], "auto", "")
     async def ignore(*_a, **_kw):
         pass
-    for name in ("_start_activity_early", "_finish_activity", "_refresh_scheduled_session_summary"):
+    for name in ("_start_activity_early", "_finish_activity", "_refresh_sdk_session_summary"):
         monkeypatch.setattr(chat, name, ignore)
     async def run():
         await create_job(chat, key)
@@ -411,4 +413,108 @@ def test_receipt_write_failure_is_visible_and_recovers_on_a_later_write(stream_e
         assert await chat._persist_native_cron_state(sid)
         assert job["record_saved"] is True
         assert native_cron.load_all()[sid]["fixture01"]["record_saved"] is True
+    asyncio.run(run())
+
+
+def test_cron_list_cannot_import_another_sessions_creation(stream_env):
+    chat = stream_env
+    owner = ("cron-owner-a", "model", "auto", "")
+    other = ("cron-owner-b", "model", "auto", "")
+
+    async def run():
+        await create_job(chat, owner)
+        # Also repair a legacy list-only duplicate from an earlier runtime.
+        chat._sdk_cron_jobs[other[0]] = {"fixture01": {"runtime_state": "active"}}
+        await chat._observe_sdk_stream_message(other, AssistantMessage(
+            content=[ToolUseBlock(id="list-b", name="CronList", input={})], model="model"))
+        await chat._observe_sdk_stream_message(other, UserMessage(content=[ToolResultBlock(
+            tool_use_id="list-b", content="fixture01 — Every minute\nrestored-b — Every hour")]))
+        assert set(chat._sdk_cron_jobs[other[0]]) == {"restored-b"}
+        assert chat._sdk_cron_jobs[owner[0]]["fixture01"]["owner_session_id"] == owner[0]
+        assert not chat._matching_sdk_cron_job(other, "Check the fixture status")
+
+    asyncio.run(run())
+
+
+def test_native_origin_does_not_require_a_host_creation_receipt(stream_env):
+    chat = stream_env
+    key = ("native-resumed-session", "model", "auto", "")
+    assert chat._is_sdk_scheduled_trigger(key, UserMessage(content="Native resumed prompt", origin={
+        "kind": "task-notification", "subkind": "scheduled-trigger"}))
+    assert not chat._is_sdk_scheduled_trigger(key, UserMessage(content="Peer message", origin={
+        "kind": "task-notification", "subkind": "peer-send-message"}))
+
+
+def test_originless_cron_fallback_ignores_terminal_or_foreign_receipts(stream_env):
+    chat = stream_env
+    owner = ("cron-fingerprint-a", "model", "auto", "")
+    other = ("cron-fingerprint-b", "model", "auto", "")
+
+    async def run():
+        await create_job(chat, owner)
+        prompt = "Check the fixture status"
+        duplicate = dict(chat._sdk_cron_jobs[owner[0]]["fixture01"])
+        chat._sdk_cron_jobs[other[0]] = {"fixture01": duplicate}
+        assert not chat._is_sdk_scheduled_trigger(other, UserMessage(content=prompt))
+        # Two independently created tasks may have identical prompts.
+        await create_job(chat, other, result="Scheduled recurring job other02. Session-only.")
+        assert chat._matching_sdk_cron_job(other, prompt) == "other02"
+        chat._sdk_cron_jobs[other[0]]["other02"]["runtime_state"] = "finished"
+        assert not chat._is_sdk_scheduled_trigger(other, UserMessage(content=prompt))
+        assert chat._matching_sdk_cron_job(owner, prompt) == "fixture01"
+
+    asyncio.run(run())
+
+
+def test_startup_loads_creation_owners_before_recovering_legacy_list_copies(stream_env, monkeypatch):
+    chat = stream_env
+    from backend import native_cron
+    scheduled = []
+    # The wrong-session copy is deliberately loaded first.
+    monkeypatch.setattr(native_cron, "load_all", lambda: {
+        "copy-b": {"job-shared": {"runtime_state": "active"}},
+        "owner-a": {"job-shared": {"runtime_state": "active", "created_at_ms": 1}},
+    })
+    monkeypatch.setattr(chat.sess, "get_session_meta", lambda _sid: {"model": "model"})
+    monkeypatch.setattr(chat, "_schedule_native_cron_recovery", lambda sid:
+                        scheduled.append(sid) if chat._sdk_cron_jobs.get(sid) else None)
+    assert asyncio.run(chat.recover_native_cron_at_startup()) == 1
+    assert scheduled == ["owner-a"]
+    assert not chat._sdk_cron_jobs["copy-b"]
+
+
+def test_replayed_creation_cannot_move_an_existing_native_job(stream_env):
+    chat = stream_env
+    owner = ("create-owner-a", "model", "auto", "")
+    other = ("create-replay-b", "model", "auto", "")
+
+    async def run():
+        await create_job(chat, owner)
+        await create_job(chat, other)
+        assert "fixture01" in chat._sdk_cron_jobs[owner[0]]
+        assert "fixture01" not in chat._sdk_cron_jobs.get(other[0], {})
+
+    asyncio.run(run())
+
+
+def test_native_delivery_diagnoses_foreign_receipt_without_rerouting(stream_env):
+    chat = stream_env
+    owner = ("11111111-owner-a", "model", "auto", "")
+    other = ("22222222-runtime-b", "model", "auto", "")
+    prompt = "Check the fixture status"
+    async def run():
+        await create_job(chat, owner)
+        chat._sdk_cron_jobs[owner[0]]["fixture01"]["runtime_state"] = "interrupted"
+        identity = chat._native_cron_delivery_identity(other[0], prompt)
+        assert identity == {"ownership": "foreign_candidate", "candidate_owner": "11111111", "candidate_count": 1}
+        assert prompt not in repr(identity)
+        # An SDK-native trigger in B remains B's execution. A fingerprint match
+        # must never silently copy B's context/results into A's conversation.
+        assert chat._is_sdk_scheduled_trigger(other, UserMessage(content=prompt, origin={
+            "kind": "task-notification", "subkind": "scheduled-trigger"}))
+        assert not chat._matching_sdk_cron_job(other, prompt)
+        await create_job(chat, other, result="Scheduled recurring job other02. Session-only.")
+        assert chat._native_cron_delivery_identity(other[0], prompt)["ownership"] == "local"
+        assert chat._native_cron_delivery_identity("third-runtime", prompt)["ownership"] == "ambiguous"
+        assert chat._native_cron_delivery_identity(other[0], "unrelated")["ownership"] == "unknown"
     asyncio.run(run())

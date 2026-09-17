@@ -769,7 +769,8 @@ def test_committed_canonical_suffix_retires_stream_even_with_recent_transport(
         "streaming": False,
         "hasStream": False,
         "closed": True,
-        "pendingExternalUpdate": False,
+        # Retiring transport has not installed the pending canonical history.
+        "pendingExternalUpdate": True,
         "reasons": ["history_revision"],
     }
     _assert_no_browser_errors(page, errors)
@@ -8204,7 +8205,7 @@ def test_live_turn_keeps_resident_messages_but_bounds_mounted_rows(
     assert result["physicalBottomAtBottom"] is False
     assert result["emojiLength"] == 1500
     assert result["emojiTruncated"] is False
-    assert result["latest"] == {"start": 200, "end": 300, "mounted": 100}
+    assert result["latest"] == {"start": 280, "end": 300, "mounted": 20}
     _assert_no_browser_errors(page, errors)
 
 
@@ -11274,6 +11275,7 @@ def test_browser_error_diagnostics_send_fingerprints_without_raw_details(
     page.route('**/api/log/client-error', capture)
     page.evaluate(r'''() => {
         const error = new TypeError("synthetic-private-error-fixture");
+        error.expression = "fixture.privateValue.length";
         error.stack = "TypeError: synthetic-private-error-fixture\n at fixture ("
             + location.origin + "/static/app.js?v=12345678:42:3)";
         window.dispatchEvent(new ErrorEvent("error", {
@@ -11286,8 +11288,39 @@ def test_browser_error_diagnostics_send_fingerprints_without_raw_details(
             break
         page.wait_for_timeout(50)
     diagnostic = next(row for row in records if row.get('reason_fp'))
+    import hashlib
+    assert diagnostic['expression_fp'] == hashlib.sha256(
+        b"fixture.privateValue.length").hexdigest()[:24]
     assert len(diagnostic['reason_fp']) == len(diagnostic['trace_fp']) == 24
     assert diagnostic['app_line'] == 42 and diagnostic['app_column'] == 3
     assert diagnostic['asset_revision']
     assert 'synthetic-private-error-fixture' not in json.dumps(records)
-    assert not ({'message', 'stack', 'filename', 'url'} & diagnostic.keys())
+    assert not ({'message', 'stack', 'filename', 'url', 'expression'} & diagnostic.keys())
+
+
+def test_alpine_rethrow_retains_private_expression_fingerprint(
+    page: Page, backend_url, auth_token,
+):
+    import hashlib
+    _login(page, backend_url, auth_token)
+    records = []
+    def capture(route):
+        records.append(json.loads(route.request.post_data or "{}"))
+        route.fulfill(status=200, json={"ok": True})
+    page.route("**/api/log/client-error", capture)
+    page.evaluate("""() => {
+        const node = document.createElement("div");
+        node.id = "expression-error-fixture";
+        node.setAttribute("x-data", "{ fixtureMissing: undefined }");
+        node.setAttribute("x-text", "fixtureMissing.length");
+        document.body.appendChild(node);
+    }""")
+    expected = hashlib.sha256(b"fixtureMissing.length").hexdigest()[:24]
+    for _ in range(60):
+        if any(row.get("expression_fp") == expected for row in records):
+            break
+        page.wait_for_timeout(50)
+    assert any(row.get("expression_fp") == expected for row in records)
+    assert "fixtureMissing" not in json.dumps(records)
+    assert all(not ({"expression", "message", "stack"} & row.keys()) for row in records)
+    page.evaluate('document.querySelector("#expression-error-fixture").remove()')
