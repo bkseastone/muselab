@@ -6416,7 +6416,8 @@ def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
     presentation = (BACKEND / "chat_presentation.py").read_text(encoding="utf-8")
 
-    assert html.count('class="task-detail-trigger"') == 2
+    # Two message-card renderers plus the scheduler modal's background tab.
+    assert html.count('class="task-detail-trigger"') == 3
     assert html.count("openTaskDetail(m.task_status, m, $event)") == 2
     assert 'class="modal task-detail-modal" role="dialog" aria-modal="true"' in html
     assert 'aria-labelledby="task-detail-title"' in html
@@ -6436,6 +6437,45 @@ def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
     assert 'usage=data.get("usage") or {}' in presentation
     assert ".modal.task-detail-modal" in css
     assert ".task-detail-trigger:focus-visible" in css
+
+
+def test_scheduler_modal_opens_one_standalone_surface_per_topbar_entry():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    for tab in ("native", "scheduled", "background"):
+        assert f"x-show=\"scheduler.tab === '{tab}'\"" in html
+    # One surface per entry: no tab strip inside the modal.
+    assert "sched-tabs" not in html
+    assert "setSchedulerTab" not in app
+    assert "openBackgroundTasks(tid, $event)" in html
+    for tab in ("native", "scheduled", "background"):
+        assert f"openScheduler({{ tab: '{tab}' }})" in html
+    assert "currentSessionBackgroundCount()" in html
+    for icon in ("i-calendar-clock", "i-bell", "i-list-checks"):
+        assert f'<symbol id="{icon}"' in html
+    assert "activityHasBackgroundWork(item)" in html
+    assert "async openScheduler(options = {})" in app
+    assert "backgroundTaskRows(sid = " in app
+    # Cards cloned into a rollover successor are owned by the predecessor; the
+    # modal must still list them, and running rows need a title.
+    assert "status.owner_session_id !== sid) continue" not in app
+    assert "backgroundTaskTitle(row)" in app
+    # Blue (streaming) wins over yellow (detached background/schedule).
+    assert "isTabDetachedOnly(tid)" in html
+    assert "isTabDetachedOnly(s.id, s)" in html
+    # Yellow is lowest priority: an unread (green) tab never also shows it.
+    assert "&& !this.isTabUnread(tid, session)" in app
+    assert "if (this.isTabStreaming(tid, session)) return false;\n      const st = this.tabState[tid];\n      return !!(st && st.unread);" in app
+    assert "backgroundTaskTitle(row)" in html
+    assert ".activity-row.has-bg-work" in css
+
+    # The task-detail dialog opens over the scheduler modal (both default to 900).
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    assert re.search(r"\.modal-backdrop\.task-detail-backdrop\s*\{\s*z-index:\s*1[2-9]\d\d;", css)
+    # The native Cron panel lists only tasks the session still owns.
+    assert '!["finished", "expired", "missing"].includes(task.runtime_state || "active"));' in app
 
 
 def test_latest_edit_tool_idx_cache_key_tracks_window_slide():
