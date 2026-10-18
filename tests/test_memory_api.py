@@ -253,6 +253,7 @@ def test_memory_reads_bypass_busy_writer_and_recall(client, auth, app_module):
 
 def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
         client, auth, app_module, monkeypatch):
+    import gc
     import threading
     import time
     from backend.memory_engine import engine
@@ -273,6 +274,13 @@ def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
         entered.set()
         release.wait(2)
 
+    # The assertions below are wall-clock: a 50 ms read budget against a 2 s
+    # blocker. A full collection over a large suite-wide heap stops every
+    # thread while holding the GIL (observed: 3.9 s on a loaded macOS
+    # runner), outlasting the blocker so the read completes with 200. Pay the
+    # collection up front and keep the collector out of the timed window.
+    gc.collect()
+    gc.disable()
     blocker = engine._ui_store_actor._submit(hold)
     try:
         assert entered.wait(1)
@@ -282,6 +290,7 @@ def test_memory_read_timeout_is_retryable_and_queue_is_cancelled(
         assert response.headers["retry-after"] == "1"
         assert time.perf_counter() - started < 0.5
     finally:
+        gc.enable()
         release.set()
         blocker.result(timeout=2)
     engine._ui_store_actor._submit(lambda store: None).result(timeout=2)
