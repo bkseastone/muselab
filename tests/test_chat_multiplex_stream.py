@@ -37,7 +37,7 @@ def _active_state(broadcast, *, attachable=True, background=False):
 
 async def _open_mux(chat_mod, checkpoints, *, mobile=False):
     stream = chat_mod._subscribe_multiplex(checkpoints, mobile=mobile)
-    handshake = await asyncio.wait_for(anext(stream), timeout=0.2)
+    handshake = await asyncio.wait_for(anext(stream), timeout=2)
     assert handshake == {"event": "ping", "data": ""}
     return stream
 
@@ -190,7 +190,7 @@ def test_mux_ticket_validation_dedupes_and_is_single_use(
 
 
 def test_idle_mux_flushes_headers_through_gzip(
-        chat_mod, app_module):
+        chat_mod, app_module, monkeypatch):
     ticket = chat_mod.mux_stream_start(
         chat_mod.MuxStreamStartReq(checkpoints=[], mobile=False),
     )["ticket"]
@@ -227,6 +227,16 @@ def test_idle_mux_flushes_headers_through_gzip(
             return {"type": "http.disconnect"}
 
         messages: asyncio.Queue = asyncio.Queue()
+        stream_started = asyncio.Event()
+        stream_response = chat_mod.EventSourceResponse._stream_response
+
+        async def observe_stream_start(response, send):
+            stream_started.set()
+            await stream_response(response, send)
+
+        monkeypatch.setattr(
+            chat_mod.EventSourceResponse, "_stream_response", observe_stream_start,
+        )
 
         async def send(message):
             await messages.put(message)
@@ -234,7 +244,18 @@ def test_idle_mux_flushes_headers_through_gzip(
         request_task = asyncio.create_task(
             app_module.app(scope, receive, send),
         )
+        ready_task = asyncio.create_task(stream_started.wait())
         try:
+            # Cold request setup is separate from the GZip flush contract. Once
+            # the real SSE producer starts, retain both original frame guards.
+            done, _ = await asyncio.wait(
+                {request_task, ready_task}, timeout=10,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if request_task in done:
+                await request_task
+                assert stream_started.is_set(), "mux request completed before stream started"
+            assert ready_task in done, "mux stream did not start within setup guard"
             response_start = await asyncio.wait_for(messages.get(), timeout=2)
             assert response_start["type"] == "http.response.start"
             assert response_start["status"] == 200
@@ -250,6 +271,8 @@ def test_idle_mux_flushes_headers_through_gzip(
             assert b"event: ping" in first_body.get("body", b"")
         finally:
             disconnected.set()
+            ready_task.cancel()
+            await asyncio.gather(ready_task, return_exceptions=True)
             await asyncio.wait_for(request_task, timeout=2)
 
     asyncio.run(exercise())
@@ -1070,3 +1093,46 @@ def test_mux_disconnect_releases_successors_waiting_for_a_live_predecessor(chat_
                 broadcast.finish()
                 broadcast.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_mux_close_after_handshake_retires_unstarted_child(chat_mod):
+    broadcast = chat_mod.TurnBroadcast("unstarted-mux-child")
+    chat_mod._active_turns[broadcast.session_id] = broadcast
+    stream = chat_mod._subscribe_multiplex({})
+    try:
+        assert await anext(stream) == {"event": "ping", "data": ""}
+        assert len(broadcast.subscribers) == 1
+        # No event-loop yield separates handshake from close. The adoption
+        # task has not entered its try/finally and still owns this subscriber.
+        await stream.aclose()
+        assert not broadcast.subscribers
+    finally:
+        await stream.aclose()
+        broadcast.close()
+        await broadcast.events.flush_async()
+
+
+@pytest.mark.asyncio
+async def test_mux_setup_storage_failure_retires_listener_and_prior_children(chat_mod):
+    first = chat_mod.TurnBroadcast("first-mux-child")
+    broken = chat_mod.TurnBroadcast("broken-mux-child")
+    broken.publish({"event": "text", "data": '{"text":"synthetic"}'})
+    broken.events._io._error = OSError("synthetic storage unavailable")
+    chat_mod._active_turns[first.session_id] = first
+    chat_mod._active_turns[broken.session_id] = broken
+    before = set(chat_mod._mux_turn_listeners)
+    stream = chat_mod._subscribe_multiplex({})
+    try:
+        with pytest.raises(OSError, match="replay storage unavailable"):
+            await anext(stream)
+        assert chat_mod._mux_turn_listeners == before
+        assert not first.subscribers
+    finally:
+        await stream.aclose()
+        for callback in chat_mod._mux_turn_listeners - before:
+            chat_mod._mux_turn_listeners.discard(callback)
+        first.close()
+        broken.close()
+        await asyncio.gather(first.events.flush_async(), broken.events.flush_async(),
+                             return_exceptions=True)

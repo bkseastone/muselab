@@ -67,10 +67,12 @@ def backend_url(tmp_path_factory):
         "MUSELAB_TOKEN": TEST_TOKEN,
         "MUSELAB_ROOT": str(root),
         "MUSELAB_SESSIONS_DIR": str(root / "sessions"),
+        "MUSELAB_MEMORY_DIR": str(root / "memory"),
         "XDG_STATE_HOME": str(root / "state"),
         "TMPDIR": str(root / "tmp"),
         "MUSELAB_PORT": str(port),
         "MUSELAB_ENV_PATH": str(root / "e2e.env"),
+        "MUSELAB_CONFIG_DIR": str(root),
         "MUSELAB_MODEL": "deepseek-v4-pro",
         "MUSELAB_DEFAULT_MODEL": "deepseek-v4-pro",
     }

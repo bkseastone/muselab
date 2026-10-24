@@ -2,9 +2,10 @@
 
 The original muselab treated ``MUSELAB_ROOT`` as the only workspace.  The
 browser can now register a small set of additional roots, and sessions/files
-carry the selected root explicitly.  Registration is the only operation that
-may look outside an existing workspace; normal file APIs remain confined to a
-registered root.
+carry the selected root explicitly. Directory and mutation APIs stay confined
+to a registered root. Authenticated file preview/download can also read an
+explicit absolute path outside that root; credential and internal-state
+exclusions still apply.
 """
 
 from __future__ import annotations
@@ -167,17 +168,29 @@ class WorkspaceRegistry:
             updated_ids[path_value],
         )
 
-    def remove(self, value: str | Path) -> None:
+    def entry_for_removal(self, value: str | Path) -> WorkspaceEntry:
+        """Identify the stored registration even if its directory was replaced."""
         path = Path(value).expanduser()
         if not path.is_absolute():
             path = self.primary / path
-        path = path.resolve()
-        if path == self.primary:
-            raise ValueError("primary workspace cannot be removed")
+        key = str(path)
         with self._lock:
-            if str(path) not in self._workspaces:
-                raise ValueError("workspace is not registered")
-            path_value = str(path)
+            if key not in self._workspaces:
+                # Keep aliases usable when they are not registered paths.
+                return self.entry_for(path)
+            return WorkspaceEntry(
+                path=key,
+                name=self._workspaces[key],
+                primary=path == self.primary,
+                id=self._ids[key],
+            )
+
+    def remove(self, value: str | Path) -> None:
+        with self._lock:
+            entry = self.entry_for_removal(value)
+            if entry.primary:
+                raise ValueError("primary workspace cannot be removed")
+            path_value = entry.path
             updated = dict(self._workspaces)
             del updated[path_value]
             updated_ids = dict(self._ids)

@@ -58,10 +58,10 @@
 | **Agent 执行与扩展** | 展示工具调用、子代理时间线、代码差异、Hook 状态和模型用量，支持 Skills、MCP 与 Hook 配置 |
 | **连续的会话工作流** | 支持多会话标签、后台执行、持久消息队列、会话分支与末轮重问 |
 | **全局任务管理** | 集中查看跨会话的任务状态与执行结果，支持后台任务、定时任务和推送通知 |
-| **长期记忆** | 通过做梦机制整理任务经历，支持混合召回、现场证据回溯和人工修订；默认关闭，需单独配置 |
+| **长期记忆** | 通过做梦机制整理任务经历；Agent 可用 MCP 工具自主检索、回溯原始证据并维护记忆，Claude Code / Ducc 等外部 CLI 可共享同一份记忆；支持人工修订，默认关闭，需单独配置 |
 | **多模型与 Provider** | 支持 Claude OAuth、API Key，以及经独立本地网关接入的 Codex；可配置 Anthropic-compatible 端点 |
 | **文件预览与编辑** | 支持 Markdown、HTML、图片、PDF、XLSX、CSV、TSV 与文本预览，以及 Markdown 编辑和分屏预览 |
-| **桌面与移动端** | 桌面浏览器与移动端 PWA 访问同一份工作文件与会话，支持中英双语与多主题 |
+| **桌面、移动端与 Apple Watch** | 桌面浏览器与移动端 PWA 共享工作文件和会话，支持中英双语与多主题；Apple Watch 通过快捷指令支持语音发送消息、查看最近会话与回复，并继续对话 |
 
 配置说明：[工作区](docs/personalize-claude-md_zh.md) · [模型接入](docs/providers_zh.md) · [Codex Gateway](docs/codex-gateway_zh.md) · [长期记忆](docs/memory_zh.md)。
 
@@ -100,7 +100,7 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 **[📚 完整文档索引](docs/README_zh.md)**
 
 - **上手：** [快速入门](docs/quickstart_zh.md) · [Linux 安装](docs/install-linux_zh.md) · [macOS 安装](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
-- **使用：** [工作台操作](docs/workbench-ui_zh.md) · [配置工作区 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [终端](docs/terminal_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md) · [长期记忆](docs/memory_zh.md)
+- **使用：** [工作台操作](docs/workbench-ui_zh.md) · [配置工作区 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [终端](docs/terminal_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [Apple Watch](docs/apple-watch-console_zh.md) · [定时任务](docs/scheduler_zh.md) · [长期记忆](docs/memory_zh.md)
 - **模型：** [Providers](docs/providers_zh.md) · [Codex Gateway](docs/codex-gateway_zh.md) · [接入新 provider](docs/add-provider_zh.md) · [模型路由](docs/routing_zh.md)
 - **内部机制：** [架构](docs/architecture_zh.md) · [会话](docs/backend-sessions_zh.md) · [Files API](docs/backend-files_zh.md) · [安全模型](docs/backend-security_zh.md) · [前端](docs/frontend_zh.md) · [基础设施](docs/infrastructure_zh.md)
 - **参考：** [配置](docs/configuration_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [排错](docs/troubleshooting_zh.md) · [词汇表](docs/glossary_zh.md)
@@ -109,6 +109,6 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 
 ## 状态
 
-当前版本为 v2.0.0。升级已有安装前，请阅读[升级说明](docs/upgrade_zh.md)并备份数据。
+当前版本为 v2.1.0。升级已有安装前，请阅读[升级说明](docs/upgrade_zh.md)并备份数据。
 
 [MIT](LICENSE)

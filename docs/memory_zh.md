@@ -7,15 +7,21 @@ MuseLab 的长期记忆是默认关闭的可选能力。它面向长期业务背
 
 ## 架构
 
-```text
-CLI JSONL 证据
-  → SQLite Registry（真相源、来源、版本、冲突、审核、队列）
-  → Episode（跨多轮任务经历）
-  → Dreamer（候选事实／决策／反思）
-  → Verifier（证据、冲突和未来价值检查）
-  → lexical + dense + metadata 混合召回
-  → 有界、不可信的聊天上下文
+```mermaid
+flowchart LR
+    J["CLI JSONL 证据"] --> E["Episode<br/>跨多轮任务经历"]
+    E --> D["Dreamer<br/>候选事实 / 决策 / 反思"]
+    D --> V["Verifier<br/>证据、冲突、价值检查"]
+    V -->|"inferred"| R[("SQLite Registry<br/>真相源：来源、版本、冲突、审核、队列")]
+    U["脑形按钮 / 记忆中心"] -->|"confirmed"| R
+    A["Agent 记忆工具<br/>write / update / delete"] -->|"inferred + 审计"| R
+    R -.->|"可重建索引"| X[("Qdrant / pgvector")]
+    R --> H["混合召回<br/>lexical + dense + metadata"]
+    X --> H
+    H --> C["有界、不可信的聊天上下文"]
 ```
+
+写入有三个入口：后台做梦整理、用户在界面确认、Agent 通过工具主动维护，最终都落到同一个 Registry。
 
 一个用户只有一个逻辑记忆池。工作区、业务、主题和实体是软元数据，不是彼此隔绝的
 “记忆空间”。向量数据库只保存可重建的检索索引；切换 Embedding 模型或数据库后可
@@ -59,14 +65,116 @@ CLI JSONL 证据
 分类器；用户点击后，内容以 `confirmed` 权威级别写入。更正会建立 `supersedes`
 关系，忘记会同时使 Registry 条目失效并清理向量索引。
 
+```mermaid
+stateDiagram-v2
+    [*] --> active: 通过校验 / 用户确认 / Agent 写入
+    [*] --> pending_review: 价值较低或影子模式
+    [*] --> quarantined: 与已有记忆冲突
+    pending_review --> active: 人工审核（升为 confirmed）
+    active --> superseded: 更正（用户或 Agent），生成新版本
+    active --> deleted: 忘记（用户或 Agent）
+    pending_review --> deleted: 忘记
+```
+
 后台 Worker 只能生成 Skill 草稿。草稿保存在 SQLite 中，不在 SDK 可发现目录。
 只有带现有 Token 鉴权的用户明确点击“审核并启用”，才会安装到
 `~/.claude/skills/muselab-generated-<name>/SKILL.md`。禁用会移出可发现目录并保留
 审计记录。
 
+## Agent 自主记忆
+
+主动模式下，每个聊天会话会挂载进程内 MCP 服务 `muselab-memory`，Agent 可自行调用：
+
+| 工具 | 作用 |
+| --- | --- |
+| `memory_search` | 关键词＋语义混合检索，可按类型过滤；未命中时可改写查询再检索 |
+| `memory_get_evidence` | 从记忆、证据（`ev_…`）或 Episode（`ep_…`）回溯原始用户／助手消息、工具记录与相邻上下文，长内容分页返回 |
+| `memory_write` | 写入一条可长期复用的事实、偏好、决策或经验；完全相同的记忆不重复写入，并返回相近记忆供合并 |
+| `memory_update` | 更正或改写任意记忆（含用户确认过的记忆），生成 `supersedes` 新版本，旧版本保留在历史中 |
+| `memory_delete` | 删除错误、过时或重复的记忆，同时清理向量索引 |
+
+Agent 可以不经确认地修改任何记忆。所有写入、更正和删除都会记录审计（`agent_write`／`agent_update`／`agent_delete`），新版本标记为 `inferred` 并附带会话来源与修改原因，可在记忆中心查看和回退。工具返回的内容一律标记为不可信背景数据。
+
+一轮对话中 Agent 使用记忆的典型过程：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant H as 提交前召回 Hook
+    participant A as Agent
+    participant M as muselab-memory 工具
+    participant R as Registry
+    U->>H: 发送消息
+    H->>R: 混合召回
+    R-->>H: 候选记忆
+    H-->>A: memory_hint：编号 + 摘要（hint 模式）
+    opt 需要背景
+        A->>M: memory_search（可多次、可改写查询）
+        M->>R: 检索并记录召回日志
+        R-->>M: 记忆 + 来源编号
+    end
+    opt 需要原文
+        A->>M: memory_get_evidence
+        M-->>A: 原消息 / 工具记录 / 相邻上下文（分页）
+    end
+    opt 发现值得记或需要更正
+        A->>M: memory_write / update / delete
+        M->>R: 写入新版本 + 审计
+    end
+    A-->>U: 回答
+```
+
+每轮召回方式由“每轮召回方式”（`retrieval.recall_mode`）控制：
+
+- `hint`（默认）：只注入候选记忆的编号与约 160 字摘要，并提示 Agent 按需检索与回溯；
+- `inject`：注入完整召回内容（旧行为）；
+- `tool-only`：不预召回，只提醒记忆工具可用。
+
+`hint` 与 `tool-only` 仅在当前会话的客户端确实挂载了记忆工具时生效，否则自动回退为 `inject`，保证不会丢失召回内容。
+
+```mermaid
+flowchart TD
+    S["每轮开始"] --> Q{"本会话已挂载记忆工具？"}
+    Q -->|"否"| I["inject：注入完整召回内容"]
+    Q -->|"是"| M{"recall_mode"}
+    M -->|"inject"| I
+    M -->|"hint"| HN["hint：候选编号 + 摘要<br/>Agent 按需检索"]
+    M -->|"tool-only"| T["tool-only：不预召回<br/>只提示工具可用"]
+```
+
+其他 Agent CLI（Claude Code、Ducc 等）可通过 stdio 桥接共享同一份记忆，调用会经带 Token 鉴权的 `/api/memory/agent/tools/<tool>` 转发到运行中的 MuseLab：
+
+```mermaid
+flowchart LR
+    W["MuseLab 网页会话"] -->|"进程内 SDK MCP"| T["记忆工具实现"]
+    C["Claude Code / Ducc / Codex"] -->|"stdio"| B["scripts/muselab_memory_mcp.py"]
+    B -->|"HTTP + X-Auth-Token"| P["/api/memory/agent/tools/{tool}"]
+    P --> T
+    T --> R[("Registry + 向量索引")]
+```
+
+```bash
+claude mcp add muselab-memory -e MUSELAB_URL=http://127.0.0.1:8765 \
+  -e MUSELAB_TOKEN=<token> -e MUSELAB_MEMORY_CLIENT=claude-code -- \
+  python3 /path/to/muselab/scripts/muselab_memory_mcp.py
+```
+
 ## 现场证据回溯
 
-记忆来源可以关联 Episode、会话消息和工具调用记录。通过来源入口可返回相关会话；显式消息来源包含有效消息标识时，还可定位到对应消息。Episode 或工具证据来源通常定位到会话，记录缺失或没有来源的条目可能无法回溯。
+记忆来源可以关联 Episode、会话消息和工具调用记录。通过来源入口可返回相关会话；对话轮次证据会记录对应的消息标识，因此可直接定位到原消息，可定位的来源排在最前。工具证据与 Agent 写入的会话来源定位到会话，记录缺失或没有来源的条目可能无法回溯。
+
+```mermaid
+flowchart LR
+    M["记忆"] --> S["来源记录"]
+    S --> E["Episode<br/>任务经历"]
+    S --> V["Evidence<br/>消息 / 工具调用"]
+    S --> SS["会话<br/>Agent 写入来源"]
+    S --> O["旧版本记忆<br/>supersedes"]
+    E --> V
+    V -->|"对话轮次证据"| MSG["定位到原消息"]
+    V -->|"工具证据"| SES["定位到会话"]
+    SS --> SES
+```
 
 “复制现场证据”复制的是会话证据定位信息，包括会话、工作区和原始记录路径，而不是完整对话正文，也不会重建当时的执行环境。定位信息可能包含私有路径与标识，公开分享前应检查并脱敏。
 
@@ -105,6 +213,39 @@ Embedding 的中立 JSON，可用于迁移；向量索引用“重建索引”�
 后台会新建一个 `tools=[]`、无 MCP／Skill 的一次性 SDK 查询；不会复用活跃聊天
 client，也不会获得 Agent 工具能力。
 
+### 定向恢复历史总结
+
+Dreamer 的 JSON 解析与业务字段校验共用最多两次生成调用；标题或总结为空、字段类型错误时，任务明确失败，不再写入空总结后标记成功。候选验证完成后，总结、事实、来源和索引任务在同一事务提交；有效的零事实总结仍可成功。
+
+`scripts/repair_memory_once.py` 提供面向明确历史目标的恢复入口，默认只读 dry-run，不自动重试全部失败任务。清单格式：
+
+```json
+{"owner_id":"your-owner","items":[{"episode_id":"ep_...","job_ids":["job_..."],"mode":"summary-only"}]}
+```
+
+- `summary-only` 只补总结，保留已有事实及非空的 Episode 元数据。
+- `full` 仅适用于证据完整、没有既有生成产物的目标；部分产物、活动任务或归属冲突须先复核。
+- `--action generate --output prepared.json` 使用当前记忆配置，在只读 Registry 上生成并冻结已验证结果。配置目录必须显式指定；`--db` 不会同时切换配置。
+- `--action apply --prepared prepared.json` 不调用模型；逐项检查源指纹并原子写入，持久回执使同一冻结结果可安全重复应用。保留旧失败记录；出现冲突即停止，禁止整库覆盖。
+
+上述命令都必须指定 `--db` 和 `--manifest`。先在一致性副本验证，再应用到已完成本版本 schema 迁移的 Registry；apply 自身不执行全库迁移。生成产物包含私有记忆，不应提交 Git 或公开上传。索引任务入队不等于索引已生效，还需等待 Worker 完成并验证真实召回。
+
+已有 Registry 完成基础 repair 迁移后，可单独补充覆盖索引，不调用普通构造器：
+
+```python
+from pathlib import Path
+from backend.memory_store import MemoryStore
+MemoryStore.migrate_existing_repair_indexes(Path("/absolute/path/to/registry.sqlite3"),
+                                           timeout_seconds=30)
+```
+
+先在私有一致性副本演练同一调用。此入口只打开已有数据库，在同一事务添加
+`artifacts(source_episode_ids_json,id)`、`memories(owner_id,kind,content)` 和迁移 marker；
+不重建 FTS、不回填召回统计，缺少基础 schema 时拒绝执行。SQL 中断或提交前超时会整体回滚，
+解决锁竞争后可重试。apply/replay 要求两个索引及 marker 存在，但不会自行迁移；逐项 apply
+默认仍为 0.5 秒。SQLite progress handler 无法抢占阻塞磁盘 I/O 或 commit/fsync，因此
+30 秒迁移预算与离线耗时都不代表生产冷缓存墙钟上限。
+
 ## 异机验收
 
 不需要在开发机启动服务。部署机更新依赖后，可依次执行：
@@ -125,8 +266,9 @@ Registry 全部通过；用两段独立会话验证 Episode／反思来源；最
 
 ### 召回时限与诊断
 
-召回使用独立的 SQLite actor，以只读连接访问 WAL 数据库；后台巩固、
-任务记账和召回遥测继续使用写 actor。召回读不会初始化或迁移数据库。
+召回以只读连接访问 WAL 数据库；关键词查询与近期证据／正文读取使用各自独立的
+SQLite actor 和取消状态，避免慢关键词查询阻塞已返回的向量候选读取。
+后台巩固、任务记账和召回遥测继续使用写 actor。召回读不会初始化或迁移数据库。
 
 时限从召回入口开始，覆盖近期证据、稠密与关键词检索、正文读取及可选重排。
 `0` 不设召回时限；正数约束所有阶段的总耗时，不再预留内部子预算或另设 facade 时限。

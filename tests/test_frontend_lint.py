@@ -381,7 +381,18 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert 'x-ref="previewQuoteInput"' in html
     assert ':href="previewQuoteSourceIcon()"' in html
     assert 'class="selection-quote-chip"' in html
-    assert '@click="removePendingQuote(i)"' in html
+    assert '@click="removePendingQuote(pendingQuotes.indexOf(quote))"' in html
+    assert 'x-for="(quote, i) in composerQuoteChips()"' in html
+    assert '@keydown="onImeKeydown($event); onQuoteMarkerKeydown($event)"' in html
+    # Highlight is a passive mirror behind the textarea, never an editor.
+    assert 'class="chat-input-mirror" x-ref="chatInputMirror" aria-hidden="true"' in html
+    assert '@scroll="syncComposerQuoteMirror()"' in html
+    assert '@keyup="updateComposerQuoteFocus($event)"' in html
+    assert 'class="composer-quote-hint"' in html
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    mirror_css = css[css.index(".chat-input-mirror {"):css.index(".composer-quote-hint {")]
+    assert "pointer-events: none" in mirror_css
+    assert "padding" not in mirror_css.split(".chat-input-quote-mark {")[1]
     assert "将展开为独立侧问" in html
     assert "独立多轮 · 可网页搜索" in html
     assert '@click="openPreviewSelectionAskSession()"' in html
@@ -433,8 +444,22 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     quote_end = app.index("\n\n    removePendingQuote", quote_start)
     quote = app[quote_start:quote_end]
     assert "draft.pendingQuotes.push" in quote
-    assert "draft.input" not in quote
+    # Quoting inserts an inline marker at the composer caret; the prompt
+    # composer later replaces it with the quote content in place.
+    assert "quote.label = this._nextQuoteLabel(draft.pendingQuotes)" in quote
+    assert "ta.selectionStart" in quote
+    assert "this._setChatInput(next)" in quote
     assert "_insertComposerTextAtCaret" not in app
+    remove_start = app.index("\n    removePendingQuote(index) {")
+    remove = app[remove_start:app.index("\n    },", remove_start)]
+    assert "split(quote.label)" in remove
+    compose_start = app.index("\n    _composerPromptText(input, quotes) {")
+    compose = app[compose_start:app.index("\n    },", compose_start)]
+    assert "this._inlineQuotePlacements(body, valid)" in compose
+    assert ".filter(q => !q.label)" in compose
+    assert "if (!hasDetachedText) this._pruneUnplacedQuotes(sendDraft);" in app
+    assert 'x-html="userMessageHtml(m)"' in html
+    assert 'x-for="(quote, qidx) in userQuoteCards(m)"' in html
 
     send_start = app.index("async send(opts = {})")
     send_end = app.index("\n    async stop(", send_start)
@@ -1108,7 +1133,7 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     meta = method("async loadSelectedMeta(path)", "\n    // Format a unix-seconds")
     children = method("async fetchChildren(path, opts = {})", "\n    async toggleHidden()")
     upload = method("async _syncUploadedFiles(", "\n    onPreviewTabDragStart")
-    save = method("async saveEdit()", "\n    // ===== @ mention")
+    save = method("async saveEdit({ exitAfterSave = false } = {})", "\n    // ===== @ mention")
     palette = method("async _fetchPaletteFiles()", "\n    // Build the item list")
 
     assert "const loadSeq = ++this._trashLoadSeq" in trash
@@ -1124,8 +1149,15 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     assert "_uniqueFileNodes(nodes)" in app
     assert "ownerWorkspace = this.fileWorkspacePath()" in upload
     assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
-    assert save.index("if (!sameOwner) return") < save.index(
-        "this._previewCacheDel(savePath)")
+    # An acknowledged write invalidates its origin cache even after navigation;
+    # updates to visible editor fields still require the original editor owner.
+    assert "workspace = this.fileWorkspacePath()" in save
+    acknowledged = save.index("if (!response.ok) throw")
+    cache_invalidated = save.index("this._previewCacheDel(savePath, workspace)")
+    owner_guard = save.index("if (!sameOwner()) return")
+    assert acknowledged < cache_invalidated < owner_guard
+    assert owner_guard < save.index("this.rawText = saveText")
+    assert owner_guard < save.index("this.editText = this._editorText()")
     assert "const requestSeq = ++this._paletteFileSeq" in palette
     assert "requestSeq === this._paletteFileSeq" in palette
 
@@ -1161,7 +1193,7 @@ def test_session_rename_patches_activity_without_reloading_chat():
     optimistic_start = helper.index("async _renameSessionOptimistically(")
     optimistic = helper[optimistic_start:]
     assert optimistic.index("this._applyRenamedSession(sid, name)") < optimistic.index("await fetch(")
-    assert "if (current && current.name === name)" in optimistic
+    assert "if (owned && current && current.name === name)" in optimistic
     assert "this._applyRenamedSession(canonicalSid, previousName)" in optimistic
     assert app.count("this._applyRenamedSession(") == 3
     assert 'this._renameSessionOptimistically(cur.id, name, cur.name, true, "modal")' in modal
@@ -1586,7 +1618,7 @@ def test_session_setting_writes_keep_their_tab_owner_and_order():
     assert '"_thinkingPatchTail"' in thinking
 
 
-def test_model_switch_new_session_keeps_workspace_and_does_not_hijack_active_tab():
+def test_model_switch_switches_in_place_and_does_not_hijack_active_tab():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async onModelChange()")
     end = app.index("\n    // ===== Effort knob", start)
@@ -1599,8 +1631,15 @@ def test_model_switch_new_session_keeps_workspace_and_does_not_hijack_active_tab
     assert "await this._ensureSessionRegistered(sid)" in model
     assert "ownerState._modelPatchSeq !== seq" in model
     assert "ownerState._modelExpected = expected" in model
-    assert "name: \"\", model: newM, cwd: ownerWorkspace" in model
-    assert "this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid" in model
+    # The owning workspace and tab must still own the selection when the PATCH lands.
+    assert "&& this._conversationWorkspaceIsCurrent(ownerWorkspace)" in model
+    # Switching is in place: PATCH the session, never create a replacement.
+    assert '"/api/chat/sessions/" + encodeURIComponent(sid)' in model
+    assert 'method: "PATCH"' in model
+    assert 'method: "POST"' not in model
+    # A 409 (session has live scheduled tasks) surfaces the server-provided reason.
+    assert "r.status === 409" in model
+    assert 'this.toast(detail || this.t("slash.failed"), "error")' in model
 
 
 def test_effort_and_fast_controls_follow_per_model_capabilities():
@@ -1690,10 +1729,17 @@ def test_new_and_model_switched_sessions_start_with_clean_runtime_settings():
     model_end = app.index("\n    // ===== Effort knob", model_start)
     model = app[model_start:model_end]
     assert "this.onEffortChange()" not in model
-    assert 'effort: "auto", service_tier: ""' in model
-    cancel = model[model.index("if (!ok)"):model.index("try {", model.index("if (!ok)"))]
-    assert "effort" not in cancel
-    assert "serviceTier" not in cancel
+    # The in-place switch carries a compatible effort/tier over and otherwise
+    # falls back to the new model's defaults.
+    assert "const nextEffort = this._effortAllowed(currentEffort, newM)" in model
+    assert '? currentEffort : "auto"' in model
+    assert 'const nextTier = this._supportsFast(newM) ? currentTier : ""' in model
+    # A refused or failed switch restores the dropdown and leaves the session's
+    # effort/tier untouched.
+    abandon = model[model.index("const abandon = () => {"):
+                   model.index("try {", model.index("const abandon = () => {"))]
+    assert "effort" not in abandon
+    assert "serviceTier" not in abandon
 
 
 def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate():
@@ -1761,6 +1807,17 @@ def test_history_jump_keeps_the_session_that_owned_the_click():
     assert "document.querySelector(" not in jump
     assert "await this._loadAroundMessage(sid, uuid)" in jump
     assert "this.tabState[sid] !== st || sid !== this.currentId" in jump
+    # A live repository cannot be replaced: defer visibly instead of no-op.
+    assert "if (st.streaming || st.es) {" in jump
+    assert "this._deferHistoryJump(sid, st, m, jumpSeq)" in jump
+    assert "st._historyJumpSeq !== jumpSeq" in jump
+    assert '"error");' in jump
+    # A distant resident target mounts one bounded window, not the whole span.
+    assert "if (nextEnd - nextStart > windowSize) {" in jump
+    defer_start = app.index("    _deferHistoryJump(sid, st, m, jumpSeq) {")
+    defer = app[defer_start:app.index("\n    // Short preview text", defer_start)]
+    assert "if (!superseded && (st.streaming || st.es)) return;" in defer
+    assert "this._scrollToUserMsg(m, sid)" in defer
     assert "if (this.currentId !== sid) return" in palette_jump
     assert "body && body.querySelector" in palette_jump
     assert "await this._loadAroundMessage(sid, uuid)" in palette_jump
@@ -2837,7 +2894,7 @@ def test_runtime_continuation_history_identity_footer_and_fork_guards():
     assert 'canonicalTail.display_kind !== "runtime_continuation"' in preserve
 
     fork_start = app.index("    turnForkMessageId(paneMsgs, i) {")
-    fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
+    fork_end = app.index("\n    _isExternalFilePath(path)", fork_start)
     fork = app[fork_start:fork_end]
     assert 'tail.display_kind === "runtime_continuation"' in fork
     assert "tail.forkable === false" in fork
@@ -3078,7 +3135,7 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     blank_start = app.index("_blankTabState()")
     blank = app[blank_start:app.index("_ensureTabState(id)", blank_start)]
-    attach_start = app.index("async _attachFile(file)")
+    attach_start = app.index("async _attachFile(file,")
     attach = app[attach_start:app.index("async onAttachPicked", attach_start)]
     editor_start = app.index("async openImageEditor(i)")
     editor = app[editor_start:app.index("openImageGen()", editor_start)]
@@ -3095,8 +3152,13 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert "_activateComposerState(id)" in app
     assert "this._activateComposerState(id)" in app
     assert "if (st.draft._activated === false) return" in app
-    assert attach.index("const ownerSid = this.currentId") < attach.index(
-        "await this._maybeCompressImage")
+    batch = attach[attach.index("async _attachFiles(files)"):]
+    assert batch.index("const ownerSid = this.currentId") < batch.index(
+        "this._attachFile(file, { ownerSid, waitFor: pending })") < batch.index("await pending")
+    assert "ownerSid = this.currentId" in attach
+    assert attach.index("ownerDraft.pendingImages.push(raw)") < attach.index("await waitFor")
+    assert attach.index("ownerDraft.pendingDocs.push(raw)") < attach.index("await waitFor")
+    assert attach.index("await waitFor") < attach.index("await this._maybeCompressImage")
     assert "ownerDraft.pendingImages.push(raw)" in attach
     assert "ownerDraft.pendingDocs.push(raw)" in attach
     assert "this.tabState[ownerSid] === ownerState" in attach
@@ -3112,7 +3174,7 @@ def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     helper_start = app.index("_uploadAttachment(fd")
-    helper_end = app.index("async _attachFile(file)", helper_start)
+    helper_end = app.index("async _attachFile(file,", helper_start)
     helper = app[helper_start:helper_end]
     assert "new XMLHttpRequest()" in helper
     assert 'xhr.upload.addEventListener("progress"' in helper
@@ -3120,7 +3182,7 @@ def test_attachment_upload_uses_real_byte_progress_and_renders_percentage():
     assert 'xhr.setRequestHeader(name, value)' in helper
     assert 'signal.addEventListener("abort"' in helper
 
-    attach_start = app.index("async _attachFile(file)")
+    attach_start = app.index("async _attachFile(file,")
     attach_end = app.index("async onAttachPicked", attach_start)
     attach = app[attach_start:attach_end]
     assert "progress: 0, progressKnown: false" in attach
@@ -3516,7 +3578,6 @@ def test_render_key_owned_arrays_mutate_only_at_audited_boundaries():
         "_truncatePaneMessagesFrom",
         "loadSession",
         "newSession",
-        "onModelChange",
     }
 
 
@@ -3632,7 +3693,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     continuity = app[continuity_start:continuity_end]
     assert 'if (role === "assistant") continuityIds.push(m.forkUuid)' in continuity
     fork_start = app.index("turnForkMessageId(paneMsgs, i)")
-    fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
+    fork_end = app.index("\n    _isExternalFilePath(path)", fork_start)
     fork = app[fork_start:fork_end]
     assert "if (message.forkUuid) return message.forkUuid" in fork
 
@@ -3984,6 +4045,19 @@ def test_history_paging_uses_smaller_mobile_pages_only_on_user_request():
     scroll = app[scroll_start:scroll_end]
     assert "loadEarlierMessages(" not in scroll
     assert "_scheduleTransparentHistory(" not in scroll
+    # Jumped windows continue forward on a downward user gesture only.
+    assert "st._scrollTowardLatestAt === st._userScrollAt" in scroll
+    assert "void this._revealLaterHistory(this.currentId)" in scroll
+    intent_start = app.index("    _applyChatScrollIntent(direction) {")
+    intent = app[intent_start:app.index("    _userScrollIntent(ev) {", intent_start)]
+    assert "void this._revealLaterHistory(this.currentId)" in intent
+    reveal_start = app.index("    async _revealLaterHistory(sid) {")
+    reveal = app[reveal_start:app.index("    _chatNearLaterEdge(el) {", reveal_start)]
+    assert "st._loadingLater || st.streaming || st.es" in reveal
+    assert "await this._fetchLaterWindow(sid)" in reveal
+    assert "this._historyMountWindowSize()" in reveal
+    assert "st.messages.indexOf(batch[0]) !== range.visibleEnd" in reveal
+    assert "activeSession._historyLaterError" in html
 
     assert '@click="loadEarlierMessages()"' in html
     assert ':disabled="activeSession._loadingEarlier"' in html
@@ -4367,7 +4441,7 @@ def test_history_markdown_cache_reuses_stable_block_keys_without_hiding_content(
     history_key = history_key[:history_key.index("_historyStoreKey", 1)]
     render = app[app.index("_renderHistoryMessage(m) {"):]
     render = render[:render.index("_historyHtmlDelete", 1)]
-    huge_plain = app[app.index("if (text.length >= 64 * 1024)"):]
+    huge_plain = app[app.index("if (opts.raw === undefined && text.length >= 64 * 1024)"):]
     huge_plain = huge_plain[:huge_plain.index("// Streaming-friendly preprocess")]
 
     assert "m.block_id" in history_key
@@ -4448,7 +4522,8 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "if (this._terminalSelectionCleanup) this._terminalSelectionCleanup()" in app
     assert "_terminalLegacyCopy(text)" in app
     assert 'document.execCommand("copy")' in app
-    assert "Stop xterm from encoding Ctrl+V as \\x16" in app
+    # Real keyboard paste is covered by test_terminal_paste.py; source
+    # comments do not establish whether Ctrl+V reaches xterm correctly.
     assert "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V" in app
     assert 'host.addEventListener("touchmove", onMove, captureActive)' in app
     assert "capture: true, passive: false" in app
@@ -4486,7 +4561,7 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert 'data-terminal-key="backslash"' in html
     assert "@click=\"terminalMobileKey('\\\\')\"" in html
     assert "chat-terminal-btn" not in css
-    assert ".pane.preview > .pane-head > .btn-primary { display: none; }" in css
+    assert ".pane.preview > .pane-head > .btn-primary:not(.preview-keep-mobile) { display: none; }" in css
     assert ".pane.preview .pane-head .btn-primary { display: none; }" not in css
     layer_start = css.index(".pane.pane-floating-layer")
     layer_end = css.index("}", layer_start)
@@ -4906,7 +4981,7 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     assert "await rootReady" not in boot
 
     load_start = app.index("loadRoot({\n      runtimeSnapshot = false")
-    load_end = app.index("\n    reloadTree(options = {})", load_start)
+    load_end = app.index("\n    async reloadTree(options = {})", load_start)
     load = app[load_start:load_end]
     assert "this._enqueueWorkspaceSync(" in load
     assert "_loadRootNow({" in app
@@ -5018,6 +5093,23 @@ def test_ctx_breakdown_excludes_free_space_and_deferred_from_the_stack():
     assert "deferredTotal: sum(deferred)" in body
     assert "usedTotal: sum(used)" in body
 
+
+def test_ctx_breakdown_draws_autocompact_buffer_as_reserved():
+    """The Autocompact buffer is reserved headroom, outside totalTokens.
+
+    Real bug, 2026-10-21: drawn as a `used` peer, the 33K buffer filled the
+    stack to ~65% under a "95.4K / 200K (48%)" header.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("    _ctxBuildView(data) {")
+    body = app[start:app.index("\n    },", start)]
+    assert "/auto\\s*-?\\s*compact/i.test(name)) { reserved.push(c); continue; }" in body
+    assert "used, deferred, reserved, freeTokens," in body
+    assert html.count('x-for="cat in ctxBreakdown.view.reserved"') == 2
+    assert 'class="ctx-breakdown-stack-seg reserved"' in html
+    assert ".ctx-breakdown-stack-seg.reserved" in css
 
 def test_ctx_breakdown_drilldown_uses_normalised_labels():
     """memoryFiles keys its name as `path`, skills wraps skillFrontmatter.
@@ -5207,7 +5299,8 @@ def test_running_turn_footer_is_owned_by_active_user_boundary():
     assert "|| (pane && pane.streamingModel)" not in model
 
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
-    footer = html[html.index('<div class="turn-footer"'):]
+    footer_start = html.index('<div class="turn-footer"')
+    footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "paneMsgs[i + 1]._steeringAdjustment !== true" in footer
 
@@ -5244,7 +5337,8 @@ def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    footer = html[html.index('<div class="turn-footer"'):]
+    footer_start = html.index('<div class="turn-footer"')
+    footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "turnFooterTime(m, pane)" in footer
     assert "turnFooterElapsed(m, pane)" in footer
@@ -5415,7 +5509,8 @@ def test_pre_response_state_uses_the_same_turn_separator_not_a_left_bubble():
     assert "fmtStreamElapsed(activeSession.streamElapsed)" in pending
     assert "modelLabel(activeSession.streamingModel)" in pending
 
-    footer = html[html.index('<div class="turn-footer"'):]
+    footer_start = html.index('<div class="turn-footer"')
+    footer = html[html.rfind("<template", 0, footer_start):]
     footer = footer[:footer.index('<button class="turn-fork-btn"')]
     assert "m.role !== 'user'" in footer
     assert "turnFooterStatus(m, pane) === 'running'" in footer
@@ -5472,7 +5567,7 @@ def test_auto_compact_drives_the_same_ui_as_a_manual_one():
 
     # The emitter is injected, not closed over: merge_q is one scope deeper.
     assert "async def _emit_side(evt: dict) -> None:" in chat
-    assert "await _preflight_compact_if_needed(_emit_side)" in chat
+    assert "await _preflight_compact_if_needed(emit_side, context_probe)" in chat
     # A UI cue must never kill the turn it describes.
     helper = chat[chat.index("async def _emit_compact("):]
     helper = helper[:helper.index("async def _preflight_compact_if_needed(")]
@@ -5800,7 +5895,7 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     delivery_end = app.index("\n    sendButtonHint(sid)", delivery_start)
     delivery = app[delivery_start:delivery_end]
     assert 'this.busySendMode) !== "adjust"' in delivery
-    assert "!turnId || attachmentIntent || st.compacting" in delivery
+    assert "!turnId || st.compacting" in delivery
     assert "st.backgroundActive || st._draining || st.parentTurnId" in delivery
     assert "!this._pendingQueueAllowsAdjustment(st, turnId)" in delivery
     assert "!this._pendingQueueAllowsAdjustment(st)" in delivery
@@ -5811,7 +5906,7 @@ def test_busy_send_mode_uses_authoritative_delivery_and_steering_state():
     assert '"/api/chat/sessions/" + sid + "/active"' in resolve
     assert "status.active" in resolve
     assert "status.background" in resolve
-    assert "this._busySendDelivery(sid, turnId, hasAttachments)" in resolve
+    assert "this._busySendDelivery(sid, turnId)" in resolve
     assert "this.tabState[sid] !== st" in resolve
     assert "const streamOwnerToken = String(expectedStreamOwnerToken || \"\")" in resolve
     assert "ownerStillCurrent()" in resolve
@@ -6387,7 +6482,8 @@ def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
     presentation = (BACKEND / "chat_presentation.py").read_text(encoding="utf-8")
 
-    assert html.count('class="task-detail-trigger"') == 2
+    # Two message-card renderers plus the scheduler modal's background tab.
+    assert html.count('class="task-detail-trigger"') == 3
     assert html.count("openTaskDetail(m.task_status, m, $event)") == 2
     assert 'class="modal task-detail-modal" role="dialog" aria-modal="true"' in html
     assert 'aria-labelledby="task-detail-title"' in html
@@ -6398,9 +6494,113 @@ def test_background_task_cards_open_a_safe_focus_managed_detail_dialog():
     assert '"task-detail", ".task-detail-modal", ".task-detail-close"' in app
     assert 'else if (top === "task-detail") this.closeTaskDetail()' in app
     assert '"/api/chat/task-output?session_id="' in app
+    # Output must load for cards without output_file (task_id lookup).
+    assert "_taskOutputUrls(status)" in app
+    assert '"&task_id=" + encodeURIComponent(taskId)' in app.replace("\n          + ", " + ").replace("\n", " ") or "&task_id=" in app
     assert "requestId !== this._taskDetailRequestId" in app
     assert "this._syncOpenTaskDetail(card.task_status, card)" in app
     assert "usage: d.usage || null" in app
     assert 'usage=data.get("usage") or {}' in presentation
     assert ".modal.task-detail-modal" in css
     assert ".task-detail-trigger:focus-visible" in css
+
+
+def test_scheduler_modal_opens_one_standalone_surface_per_topbar_entry():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    for tab in ("native", "scheduled", "background"):
+        assert f"x-show=\"scheduler.tab === '{tab}'\"" in html
+    # One surface per entry: no tab strip inside the modal.
+    assert "sched-tabs" not in html
+    assert "setSchedulerTab" not in app
+    assert "openBackgroundTasks(tid, $event)" in html
+    for tab in ("native", "scheduled", "background"):
+        assert f"openScheduler({{ tab: '{tab}' }})" in html
+    assert "currentSessionBackgroundCount()" in html
+    for icon in ("i-calendar-clock", "i-bell", "i-list-checks"):
+        assert f'<symbol id="{icon}"' in html
+    assert "activityHasBackgroundWork(item)" in html
+    assert "async openScheduler(options = {})" in app
+    assert "backgroundTaskRows(sid = " in app
+    # Cards cloned into a rollover successor are owned by the predecessor; the
+    # modal must still list them, and running rows need a title.
+    assert "status.owner_session_id !== sid) continue" not in app
+    assert "backgroundTaskTitle(row)" in app
+    # Blue (streaming) wins over yellow (detached background/schedule).
+    assert "isTabDetachedOnly(tid)" in html
+    assert "isTabDetachedOnly(s.id, s)" in html
+    # Yellow is lowest priority: an unread (green) tab never also shows it.
+    assert "&& !this.isTabUnread(tid, session)" in app
+    assert "if (this.isTabStreaming(tid, session)) return false;\n      const st = this.tabState[tid];\n      return !!(st && st.unread);" in app
+    assert "backgroundTaskTitle(row)" in html
+    assert ".activity-row.has-bg-work" in css
+
+    # The task-detail dialog opens over the scheduler modal (both default to 900).
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    assert re.search(r"\.modal-backdrop\.task-detail-backdrop\s*\{\s*z-index:\s*1[2-9]\d\d;", css)
+    # The native Cron panel lists only tasks the session still owns.
+    assert '!["finished", "expired", "missing"].includes(task.runtime_state || "active"));' in app
+
+
+def test_latest_edit_tool_idx_cache_key_tracks_window_slide():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_latestEditToolIdx(paneMsgs")
+    body = app[start:app.index("isLatestEditTool(i, m", start)]
+
+    assert "msgs.length" in body
+    assert "msgs[0]?._k" in body
+    assert "msgs[msgs.length - 1]?._k" in body
+
+
+def test_workspace_surface_keeps_its_own_pane_layout():
+    """Each workspace restores its own file-tree / preview open state and widths.
+
+    2026-10-21 request: resizing the chat/preview split in one workspace used
+    to carry over to every other workspace because the widths were global.
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    capture_start = app.index("_captureWorkspaceSurface(path")
+    change_start = app.index("async _changeWorkspaceSurface(path)")
+    capture = app[capture_start:change_start]
+    for field in ("leftOpen: !!this.leftOpen", "previewOpen: !!this.previewOpen",
+                  "leftWidth: this.leftWidth", "previewWidth: this.previewWidth"):
+        assert field in capture
+    apply_start = app.index("    _applyWorkspaceLayout(surface = {}) {")
+    apply = app[apply_start:app.index("\n    },", apply_start)]
+    # Missing fields (a workspace never captured) must inherit, not reset.
+    assert 'typeof surface.leftOpen === "boolean"' in apply
+    assert 'typeof surface.previewOpen === "boolean"' in apply
+    assert "Number.isFinite(v) && v > 0" in apply
+    change_end = app.index("\n    async switchWorkspace(path)", change_start)
+    assert "this._applyWorkspaceLayout(surface);" in app[change_start:change_end]
+
+
+def test_quotes_are_not_capped_per_message():
+    """Users may place as many inline quotes as they like.
+
+    The composer used to refuse the fifth quote with a toast, and history
+    rendering only re-parsed ids below 1000.
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert "pendingQuotes.length >= 4" not in app
+    assert "最多引用 4 段内容" not in app
+    assert 'Up to 4 quotes per message' not in app
+    assert '<quote id="(\\d+)" source=' in app
+
+
+def test_ctx_ring_tone_ignores_an_estimated_window():
+    """A fallback denominator must not turn the ring red.
+
+    DUCC's transcript model name missed the catalog, the meter fell back to
+    128K, and a 1M session showed a full red ring at 182% (2026-10-23).
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    assert 'class="chat-toolbar-ring" :class="ctxRingTone()"' in html
+    assert "sessionUsage.context_used_pct >= 90" not in html
+    start = app.index("    ctxRingTone() {")
+    body = app[start:app.index("\n    },", start)]
+    assert "u.context_limit_is_estimate || u.context_is_estimate" in body
+    assert 'return "danger"' in body and 'return "warn"' in body

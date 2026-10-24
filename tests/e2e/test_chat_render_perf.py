@@ -2534,14 +2534,18 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
           input: st.draft.input,
           quotes: st.draft.pendingQuotes.map(item => ({
             text: item.text, role: item.role, messageId: item.messageId,
+            label: item.label,
           })),
           images: st.draft.pendingImages.map(item => item.id),
           docs: st.draft.pendingDocs.map(item => item.id),
         };
         """,
     )
-    assert quoted["input"] == "EXISTING_DRAFT"
+    # The quote lands as an inline marker at the caret (end of the draft);
+    # the existing draft text is kept around it.
     assert len(quoted["quotes"]) == 1
+    assert quoted["quotes"][0]["label"]
+    assert quoted["input"] == "EXISTING_DRAFT" + quoted["quotes"][0]["label"]
     assert quoted["quotes"][0]["role"] == "assistant"
     assert quoted["quotes"][0]["messageId"] == "selection-assistant"
     assert "ASSISTANT_SELECTION_MARKER" in quoted["quotes"][0]["text"]
@@ -4716,6 +4720,97 @@ def test_outline_around_conflict_retries_and_returns_to_real_tail(
     _assert_no_browser_errors(page, errors)
 
 
+def test_outline_jump_scrolls_down_into_later_history_and_defers_while_live(
+    page: Page, backend_url, auth_token,
+):
+    """An outline jump window keeps loading forward; a live jump is deferred."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    sid = "perf-around-later"
+    target_uuid = "jump-target"
+    total = 200
+    calls: list[dict] = []
+    full = _make_mixed_messages(total, "JUMP_MSG")
+    full[105] = {"role": "user", "text": "JUMP_TARGET_VISIBLE",
+                 "uuid": target_uuid, "ts": 1_700_040_105}
+    full[-1] = {"role": "assistant", "text": "JUMP_LAST_VISIBLE",
+                "html": "<p>JUMP_LAST_VISIBLE</p>", "uuid": "jump-last",
+                "ts": 1_700_040_199}
+
+    def handle(route):
+        qs = {key: values[0] for key, values in
+              parse_qs(urlparse(route.request.url).query).items()}
+        calls.append(qs)
+        if "around_uuid" in qs:
+            offset, page_rows = 100, full[100:140]
+        else:
+            offset = int(qs.get("offset", "0"))
+            page_rows = full[offset:offset + int(qs.get("limit", "100"))]
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid, "messages": page_rows, "offset": offset,
+                "total": total, "history_generation": "gen",
+                "history_order": "full",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", handle)
+    _login(page, backend_url, auth_token)
+    _bootstrap_session_for_real_load(page, sid, "Jump later history")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.messageRange.generation = "gen";
+        st._loaded = true;
+        st.messagesReady = true;
+        st.streaming = true;
+        app._scrollToUserMsg({ uuid: "jump-target" }, arg);
+        return true;
+        """,
+        sid,
+    )
+    page.wait_for_timeout(700)
+    # A live repository cannot be replaced; the click is acknowledged and held.
+    assert not [call for call in calls if "around_uuid" in call]
+    assert _app_eval(page, "return app.toasts.length;") >= 1
+    _app_eval(page, "app.tabState[arg].streaming = false; return true;", sid)
+    page.wait_for_function(
+        """uuid => document.querySelector(`.msg[data-uuid="${CSS.escape(uuid)}"]`)""",
+        arg=target_uuid,
+        timeout=10000,
+    )
+    assert len([call for call in calls if "around_uuid" in call]) == 1
+    assert _app_eval(page, "return app.hasLaterMessages(arg);", sid) is True
+
+    body = page.locator(".chat-body")
+    for _ in range(40):
+        if page.locator(".msg", has_text="JUMP_LAST_VISIBLE").count():
+            break
+        body.hover()
+        page.mouse.wheel(0, 2400)
+        page.wait_for_timeout(150)
+    expect(page.locator(".msg", has_text="JUMP_LAST_VISIBLE")).to_be_visible()
+    later_calls = [call for call in calls if "offset" in call]
+    assert later_calls and later_calls[0]["offset"] == "140"
+    assert all(call.get("full") == "1" for call in later_calls)
+    state = _app_eval(
+        page,
+        """
+        const st = app.tabState[arg];
+        return {resident: st.messages.length, offset: st.messageRange.offset,
+          end: st.messageRange.visibleEnd, later: app.hasLaterMessages(arg),
+          error: st._historyLaterError};
+        """,
+        sid,
+    )
+    assert state == {"resident": 100, "offset": 100, "end": 100,
+                     "later": False, "error": False}
+    _assert_no_browser_errors(page, errors)
+
+
 def test_resident_history_uses_exact_layout_and_native_scroll_anchor(
     page: Page, backend_url, auth_token,
 ):
@@ -5626,7 +5721,7 @@ def test_existing_same_turn_adjust_keeps_next_real_send_as_adjust(
         // A native adjustment from another immutable turn is still an ordering
         // barrier; only the exact current-turn row may admit another adjustment.
         st.pendingQueue[0].targetTurnId = "different-active-turn";
-        const differentTurnDelivery = app._busySendDelivery(sid, turnId, false);
+        const differentTurnDelivery = app._busySendDelivery(sid, turnId);
         st.pendingQueue[0].targetTurnId = turnId;
 
         app.input = arg.secondPrompt;
@@ -11232,6 +11327,7 @@ def test_palette_search_cancels_old_work_without_clobbering_new_results(
 ):
     _login(page, backend_url, auth_token)
     result = _app_eval(page, r'''
+        app.openPalette();
         const originalFetch = window.fetch;
         const requests = [];
         window.fetch = (url, options) => {
@@ -11324,3 +11420,129 @@ def test_alpine_rethrow_retains_private_expression_fingerprint(
     assert "fixtureMissing" not in json.dumps(records)
     assert all(not ({"expression", "message", "stack"} & row.keys()) for row in records)
     page.evaluate('document.querySelector("#expression-error-fixture").remove()')
+
+
+@pytest.mark.parametrize("transport", ["legacy", "mux"])
+@pytest.mark.parametrize("submission", ["none", "choices", "other"])
+def test_shared_question_answer_closes_card_despite_losing_post(
+    page: Page, backend_url, auth_token, transport, submission,
+):
+    errors = _capture_browser_errors(page)
+    if transport == "mux":
+        _install_fake_mux_event_source(page)
+    else:
+        _install_fake_event_source(page)
+    page.route(
+        "**/api/chat/stream/mux/start",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"ticket": "question-mux"}),
+        ),
+    )
+    page.route(
+        "**/api/chat/turns/start",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "accepted": True,
+                "session_id": route.request.post_data_json["session_id"],
+                "turn_id": "question-turn",
+            }),
+        ),
+    )
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"ticket": "question-stream"}),
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        app._confirmSessionBusy = async () => false;
+        app._awaitRuntimeSettingPatches = async () => true;
+        app.availableModels = [{
+          model: 'question-model', label: 'Question test', group: 'e2e',
+          supports_thinking: true,
+        }];
+        app.model = 'question-model';
+        app.sessions = app.sessions.map(session => session.id === app.currentId
+          ? {...session, model: 'question-model'} : session);
+        const state = app._ensureTabState(app.currentId);
+        state.draft.input = 'Question synchronization test';
+        app._activateComposerState(app.currentId);
+        await app.send();
+        const sid = app.currentId;
+        let seq = 0;
+        window.__emitAsk = (type, payload) => {
+          if (arg === 'mux') {
+            window.__emitMux(type, {
+              ...payload, session_id: sid, turn_id: 'question-turn',
+              event_seq: ++seq,
+            });
+          } else {
+            window.__emitSse(type, payload);
+          }
+        };
+        window.__emitAsk('ask_user_question', {
+          id: 'shared-question',
+          questions: [{
+            question: 'Pick one', header: 'Choice', multiSelect: false,
+            options: [{label: 'A'}, {label: 'B'}],
+          }],
+        });
+        """,
+        transport,
+    )
+    card = page.locator(".msg-pane:visible .ask-question")
+    expect(card).to_be_visible(timeout=5000)
+    _app_eval(
+        page,
+        """
+        const msg = app._ensureTabState(app.currentId).messages.find(
+          item => item.role === 'ask_user_question' && item.id === 'shared-question');
+        const originalFetch = window.fetch.bind(window);
+        if (arg !== 'none') {
+          window.fetch = (url, options) => {
+            if (String(url).includes('/api/chat/answer/')) {
+              return new Promise(resolve => {
+                window.__finishLosingAnswer = () => resolve(new Response('{}', {
+                  status: 404, headers: {'Content-Type': 'application/json'},
+                }));
+              });
+            }
+            return originalFetch(url, options);
+          };
+          if (arg === 'choices') {
+            msg.pendingAnswers['Pick one'] = 'A';
+            window.__askSubmission = app.submitAskAnswers(msg);
+          } else {
+            msg.askOtherOpen = true;
+            msg.askOtherText = 'Local answer';
+            window.__askSubmission = app.submitAskOther(msg);
+          }
+        }
+        // Another browser accepted B while this tab's request was in flight.
+        window.__emitAsk('ask_user_question_resolved', {
+          id: 'shared-question', answers: {'Pick one': 'B'},
+        });
+        if (arg !== 'none') {
+          window.__finishLosingAnswer();
+          await window.__askSubmission;
+        }
+        """,
+        submission,
+    )
+    expect(card.locator(".ask-submitted-tag")).to_be_visible(timeout=1500)
+    assert _app_eval(
+        page,
+        """
+        const msg = app._ensureTabState(app.currentId).messages.find(
+          item => item.role === 'ask_user_question' && item.id === 'shared-question');
+        return {submitted: msg.submitted, answer: msg.pendingAnswers['Pick one'],
+          otherOpen: msg.askOtherOpen};
+        """,
+    ) == {"submitted": True, "answer": "B", "otherOpen": False}
+    _assert_no_browser_errors(page, errors)

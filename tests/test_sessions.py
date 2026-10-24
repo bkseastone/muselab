@@ -1542,6 +1542,19 @@ def test_bump_session_auto_renames_from_first_user_text(app_module):
     assert s["auto_named"] is False
 
 
+def test_bump_session_returns_title_only_when_it_renamed(app_module):
+    from backend import sessions as sess
+    meta = sess.create_session()
+    assert sess.bump_session(meta["id"], message_count=1) is None
+    assert sess.bump_session(
+        meta["id"], message_count=2,
+        auto_rename_from="怎么解读这次体检报告") == "怎么解读这次体检报告"
+    # Already named: later turns neither rename nor report a title.
+    assert sess.bump_session(
+        meta["id"], message_count=4, auto_rename_from="后续追问") is None
+    assert sess.bump_session("missing-sid", message_count=1) is None
+
+
 def test_manual_rename_disables_auto_rename(app_module):
     from backend import sessions as sess
     meta = sess.create_session()
@@ -2090,3 +2103,25 @@ def test_repeated_task_observation_does_not_rewrite_timestamp(app_module, monkey
     assert sess.set_runtime_task_overlay(sid, "task-repeat", state="completed", summary="Finished", updated_at=30)
     assert len(writes) == 1
     assert sess.get_runtime_task_overlays(sid)["task-repeat"]["state"] == "completed"
+
+
+def test_update_model_skips_write_when_model_unchanged(app_module, monkeypatch):
+    from backend import sessions as sess
+    sid = "update-model-same-session"
+    sess.register_session(sid, name="same model")
+    sess.update_model(sid, "claude-sonnet-4-6")
+    original = sess._save_index
+    writes = []
+
+    def save(items):
+        writes.append(items)
+        return original(items)
+
+    monkeypatch.setattr(sess, "_save_index", save)
+    sess.update_model(sid, "claude-sonnet-4-6")
+    assert writes == []
+    sess.update_model("update-model-missing-session", "claude-sonnet-4-6")
+    assert writes == []
+    sess.update_model(sid, "codex:gpt-5.6-sol")
+    assert len(writes) == 1
+    assert sess.get_session(sid)["model"] == "codex:gpt-5.6-sol"

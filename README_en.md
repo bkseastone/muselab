@@ -58,10 +58,10 @@
 | **Agent execution and extensions** | Tool calls, subagent timelines, code diffs, Hook status, and model usage, with support for Skills, MCP, and Hook configuration |
 | **Continuous session workflows** | Session tabs, background execution, persistent message queues, session forks, and last-turn retries |
 | **Global task management** | Task states and results across sessions, with background tasks, scheduled tasks, and push notifications |
-| **Long-term memory** | Dreaming to consolidate task experience, hybrid recall, source evidence tracebacks, and manual correction; disabled by default and configured separately |
+| **Long-term memory** | Dreaming to consolidate task experience; the Agent searches, traces source evidence and maintains memories through MCP tools, and external CLIs such as Claude Code or Ducc can share the same memory; supports manual correction, disabled by default and configured separately |
 | **Multiple models and providers** | Claude OAuth, API keys, Codex through a separate local gateway, and configurable Anthropic-compatible endpoints |
 | **File previews and editing** | Markdown, HTML, images, PDF, XLSX, CSV, TSV, and text previews, with Markdown editing and split preview |
-| **Desktop and mobile** | Desktop browsers and the mobile PWA access the same working files and sessions, with English/Chinese UI and multiple themes |
+| **Desktop, mobile, and Apple Watch** | Desktop browsers and the mobile PWA share working files and sessions, with English/Chinese UI and multiple themes; Apple Watch Shortcuts support dictation, recent sessions, reply reading, and follow-up messages |
 
 Configuration: [Workspaces](docs/personalize-claude-md.md) · [Providers](docs/providers.md) · [Codex Gateway](docs/codex-gateway.md) · [Long-term memory](docs/memory.md).
 
@@ -100,7 +100,7 @@ For installation or runtime issues, run `bash scripts/doctor.sh` from the reposi
 **[📚 Full documentation index](docs/README.md)**
 
 - **Get started:** [Quick start](docs/quickstart.md) · [Linux install](docs/install-linux.md) · [macOS install](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
-- **Usage:** [Workbench controls](docs/workbench-ui.md) · [Configure workspace CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Terminal](docs/terminal.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md) · [Long-term memory](docs/memory.md)
+- **Usage:** [Workbench controls](docs/workbench-ui.md) · [Configure workspace CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Terminal](docs/terminal.md) · [Mobile PWA](docs/mobile.md) · [Apple Watch](docs/apple-watch-console.md) · [Scheduled tasks](docs/scheduler.md) · [Long-term memory](docs/memory.md)
 - **Models:** [Providers](docs/providers.md) · [Codex Gateway](docs/codex-gateway.md) · [Add a provider](docs/add-provider.md) · [Model routing](docs/routing.md)
 - **Internals:** [Architecture](docs/architecture.md) · [Sessions](docs/backend-sessions.md) · [Files API](docs/backend-files.md) · [Security model](docs/backend-security.md) · [Frontend](docs/frontend.md) · [Infrastructure](docs/infrastructure.md)
 - **Reference:** [Configuration](docs/configuration.md) · [Data & backup](docs/data-and-backup.md) · [Troubleshooting](docs/troubleshooting.md) · [Glossary](docs/glossary.md)
@@ -109,6 +109,6 @@ For installation or runtime issues, run `bash scripts/doctor.sh` from the reposi
 
 ## Status
 
-Current version: v2.0.0. Before updating an existing installation, read the [Upgrade guide](docs/upgrade.md) and back up your data.
+Current version: v2.1.0. Before updating an existing installation, read the [Upgrade guide](docs/upgrade.md) and back up your data.
 
 [MIT](LICENSE)

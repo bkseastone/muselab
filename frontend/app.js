@@ -1,3 +1,8 @@
+// Third-party editor instances and DOM caches must stay outside Alpine's deep
+// proxy: CodeMirror relies on object identity in its measurement/undo internals.
+let museEditor = null;
+let museEditorPreview = { version: 0, blocks: [], scrollTargets: {}, patching: false };
+const museEditorAssets = new Map();
 const museRichMessages = new WeakMap();
 const museTranscriptPerf = new Map();
 // One bounded worker, shared by history decoration and code highlighting.
@@ -23,10 +28,20 @@ const museRichWorker = (() => {
     try {
       const version = document.querySelector('meta[name="muselab-asset-version"]')?.content || "";
       if (!worker) worker = new Worker("/static/render-worker.js?v=" + encodeURIComponent(version));
-      worker.onmessage = event => finish(event.data.failed ? null : event.data.html);
+      worker.onmessage = event => {
+        if (event.data.parsing) {
+          // CPU work remains bounded independently of worker/vendor downloads.
+          clearTimeout(timer);
+          timer = setTimeout(() => finish(null, true), 5000);
+          return;
+        }
+        finish(event.data.failed ? null : event.data.html);
+      };
       worker.onerror = () => finish(null, true);
-      timer = setTimeout(() => finish(null, true), 5000);
-      worker.postMessage(job.data);
+      // Cold workers also fetch their parser lazily. A slow transport is not
+      // a stalled parser; the worker announces when actual parsing begins.
+      timer = setTimeout(() => finish(null, true), 60000);
+      worker.postMessage({ ...job.data, reportParsing: true });
     } catch (_) { finish(null, true); }
   }
   return (data, valid = () => true) => new Promise(resolve => {
@@ -315,6 +330,7 @@ const _EMPTY_ACTIVE_SESSION_PANE = Object.freeze({
   _draining: false,
   _loadingEarlier: false,
   _historyHydrationError: false,
+  _historyLaterError: false,
   atBottom: true,
 });
 
@@ -383,7 +399,7 @@ const CHAT_MUX_STREAM_EVENTS = [
   "compact_progress", "task_started", "task_progress", "task_notification",
   "scheduled_tasks",
   "queue_steering",
-  "rate_limit", "ask_user_question", "permission_request",
+  "rate_limit", "ask_user_question", "ask_user_question_resolved", "permission_request",
   "permission_request_resolved", "permission_mode_changed",
   "permission_mode_change_failed", "ping", "done", "error", "cancelled",
   "resync",
@@ -602,6 +618,8 @@ function portal() {
     _terminalTouchWheelDispatching: false,
     _terminalReconnectTimer: null,
     _terminalConnectSeq: 0,
+    _terminalTicketAbort: null,
+    _terminalTicketTimeoutMs: 8000,
     _terminalSelectionCleanup: null,
     _terminalLoadPromise: null,
     TERMINAL_SCROLLBACK_MOBILE: 3000,
@@ -729,17 +747,23 @@ function portal() {
     // (memoryFiles / mcpTools / agents) actually expand.
     ctxExpanded: {},
     editing: false, editText: "",
-    cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, mode: "plaintext", dirty: false },
+    cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, bytes: 0, mode: "plaintext", dirty: false },
     // ===== Live markdown preview (split editor) =====
     // editorIsMd: the file currently in the editor is markdown → the live
     //   preview pane is available. Non-md files force editorView back to "edit".
     // editorView: layout while editing an md file — "edit" | "split" | "preview".
-    //   Persisted in localStorage so it survives reloads. Defaults to split.
+    //   Each Markdown editing session starts in split view.
     // livePreviewHtml: mdRender() output of the current buffer, recomputed
     //   (debounced) on every CM change so the right pane tracks edits live.
     editorIsMd: false,
     editorView: "split",
-    livePreviewHtml: "",
+    editorFontSize: Math.max(14, Math.min(24, Number(localStorage.getItem("muselab_editor_font_size")) || 16)),
+    editorLoading: false, editorError: "", editorSaveState: "",
+    markdownOutlineOpen: false,
+    markdownOutline: [],
+    editorPreviewBusy: false, editorPreviewError: "",
+    _cmMountVersion: 0,
+    _saveEditInFlight: false,
     _livePreviewTimer: null,
     tabs: [],   // open file tabs: [{path, name}]
     editorTabPickerOpen: false,  // open-tabs quick-switch dropdown (left tab bar)
@@ -782,6 +806,10 @@ function portal() {
       history: [],
       unreadCount: 0,
       loading: false,
+      tasksSeq: 0,
+      draftSeq: 0,
+      saveSeq: 0,
+      saving: false,
       // SDK Cron jobs are runtime-owned and belong to one Claude session.
       // They are read-only here; creation/deletion remains the native tool's
       // job, while this projection makes the otherwise invisible jobs and
@@ -792,6 +820,8 @@ function portal() {
       nativeLoading: false,
       nativeError: "",
       nativeLoadSeq: 0,
+      // Which of the three surfaces is showing: native | scheduled | background.
+      tab: "scheduled",
       // Task ids whose DELETE request is waiting for a running turn to cancel.
       // Kept separate from server `run.status` so a slow, destructive action
       // remains visibly owned by the row that initiated it.
@@ -912,6 +942,7 @@ function portal() {
     _todoLiveSource: null,
     _todoLiveSeq: 0,
     _todoLiveTimer: null,
+    _todoLiveController: null,
     _todoLiveVisibilityBound: false,
     _activityPinPending: {},
     _activityGroupPending: {},
@@ -1005,9 +1036,13 @@ function portal() {
     IME_STALE_AFTER_MS: 5000,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
+    _paletteFileAbort: null,
+    _paletteSearchTimer: null,
+    _paletteSearchGeneration: 0,
     _sessionsInitialized: false,
     _sessionInitPromise: null,
     _sessionListPullPromise: null,
+    _sessionListGeneration: 0,
     _sessionListTimeoutMs: 8000,
     _sessionReadTimeoutMs: 15000,
     _mobileKeyboardGeometryOpen: false,
@@ -1079,7 +1114,8 @@ function portal() {
     // old quote action, these never rewrite `input`; they render as removable
     // context chips above the composer and are folded into the actual prompt
     // only when Send snapshots this exact tab's draft.
-    pendingQuotes: [],    // [{id, source, role, sessionId, messageId, path, text, truncated}]
+    pendingQuotes: [],    // [{id, source, role, sessionId, messageId, path, text, truncated, label}]
+    composerQuoteFocus: null, // pending quote whose marker the composer caret touches
     // Image annotation editor (L1: pen / rect / arrow / eraser + 5 colors + 3 sizes).
     // Opened via the ✎ button on an .img-chip. State is module-scoped on `this`
     // so the modal template can read it via x-show / :class. _baseBitmap is the
@@ -1308,6 +1344,7 @@ function portal() {
     },
     htmlAnnotation: { active:false, loading:false, selection:null, comment:"", error:"" },
     async toggleHtmlAnnotation() {
+      if (this._isExternalFilePath(this.selected)) return;
       if (!this._htmlAnnotationController) {
         const { createHtmlAnnotation } = await import("/static/modules/html-annotation.mjs");
         this._htmlAnnotationController = createHtmlAnnotation(this);
@@ -1323,6 +1360,7 @@ function portal() {
 
     settings: {
       show: false,
+      saving: false,
       providers: [],
       contextGroups: [],
       contextLimits: { providers: {}, models: {} },
@@ -1330,7 +1368,7 @@ function portal() {
       contextSaving: false,
       contextError: "",
       draftKeys: {},
-      draftDefaults: { model: "", permission: "", busy_send_mode: "adjust" },
+      draftDefaults: { model: "", permission: "", busy_send_mode: "adjust", subagent_model: "" },
       // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
       // notify_normal server-side toggles. Subscription state is now the
       // sole on/off; see `notifyEnabled` at the top of this object.
@@ -1386,7 +1424,8 @@ function portal() {
           rerank: { enabled: false, base_url: "", api_key: "",
             model: "", timeout_seconds: 3 },
           retrieval: { dense_candidates: 20, lexical_candidates: 20,
-            final_limit: 6, max_context_chars: 0, soft_timeout_ms: 0 },
+            final_limit: 6, max_context_chars: 0, soft_timeout_ms: 0,
+            recall_mode: "hint" },
           consolidation: { episode_turns: 6, episode_idle_minutes: 30,
             dreamer_enabled: true, verifier_enabled: true,
             skill_learning_enabled: true, min_reflection_episodes: 2,
@@ -1445,11 +1484,12 @@ function portal() {
     // Session picker dropdown open state (replaces native <select> so each
     // row can have an inline delete button).
     sessionPickerOpen: false,
-    // Per-group expand state for the session picker. Keys are group keys
-    // ("earlier", "month"); true = user clicked "show all". Reset when the
-    // picker closes or when the search query changes (search already shows
-    // everything so expansion is irrelevant).
-    pickerGroupExpanded: {},
+    sessionHistoryLoading: false,
+    sessionHistoryError: false,
+    _sessionHistoryLoaded: false,
+    _sessionHistoryRequestSeq: 0,
+    // One page budget across all date groups, including pinned sessions.
+    sessionHistoryVisibleCount: 20,
     // Inline rename inside a picker row. Keeps the keyboard popup tied to
     // the original user click (iOS Safari requires synchronous focus()).
     renamingPickerSid: "",
@@ -1718,6 +1758,15 @@ function portal() {
         }
       }
       if (ev.key === "Escape") {
+        if (this.terminalManagerOpen) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.terminalManagerOpen = false;
+          this.$nextTick(() => {
+            this._focusWithoutScroll(this.$refs.terminalManagerButton);
+          });
+          return;
+        }
         if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
@@ -2066,6 +2115,7 @@ function portal() {
       this.$watch("editing", v => {
         this.dismissTransientPreviewQuote(true);
         v ? this.mountCM() : this.unmountCM();
+        if (!v) this.$nextTick(() => this._refreshMarkdownOutline());
       });
       // Removed: pane-open toast — the panel opening is self-evident.
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
@@ -2074,7 +2124,10 @@ function portal() {
       // whenever the active file changes (tree click, tab switch, chat link,
       // boot restore). Fire once now too in case `selected` was restored
       // before this watcher attached.
+      this.$watch("renderedMd", () => this.$nextTick(() => this._refreshMarkdownOutline()));
       this.$watch("selected", (p) => {
+        this.markdownOutlineOpen = false;
+        this.markdownOutline = [];
         this.dismissTransientPreviewQuote(true);
         this.loadSelectedMeta(p);
       });
@@ -2154,6 +2207,7 @@ function portal() {
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
     onChatInputBlur(ev) {
       this._resetImeCompositionState(ev);
+      this.composerQuoteFocus = null;
       const target = ev && (ev.target || ev.currentTarget);
       const settledOwner = target && target._museImeSettledOwnerSid;
       // The composer bridge intentionally ignores model writes while focused.
@@ -2894,7 +2948,44 @@ function portal() {
       }
     },
 
-    _cm: null,
+    _getCM() { return museEditor ? museEditor.cm : null; },
+    _syncEditorScroll(source) {
+      const cm = this._getCM(), preview = this.$refs.editorPreview?.parentElement;
+      if (!cm || !preview || !this.editing || !this.editorIsMd || this.editorView !== "split") return;
+      const info = cm.getScrollInfo();
+      const top = source === "editor" ? info.top : preview.scrollTop;
+      const expected = museEditorPreview.scrollTargets[source];
+      delete museEditorPreview.scrollTargets[source];
+      // Ignore the echo of our own write; retain genuine wheel/keyboard input.
+      if (expected !== undefined && Math.abs(top - expected) < 1) return;
+      if (museEditorPreview.patching) return;
+      const editorMax = Math.max(0, info.height - info.clientHeight);
+      const previewMax = Math.max(0, preview.scrollHeight - preview.clientHeight);
+      const fromMax = source === "editor" ? editorMax : previewMax;
+      if (!fromMax) return;
+      const progress = Math.max(0, Math.min(1, top / fromMax));
+      if (source === "editor") {
+        const target = progress * previewMax;
+        if (Math.abs(preview.scrollTop - target) < 1) return;
+        museEditorPreview.scrollTargets.preview = Math.round(target);
+        preview.scrollTop = target;
+      } else {
+        const target = progress * editorMax;
+        if (Math.abs(info.top - target) < 1) return;
+        museEditorPreview.scrollTargets.editor = target;
+        cm.scrollTo(null, target);
+      }
+    },
+    _editorText() {
+      if (!museEditor) return String(this.editText || "");
+      if (museEditor.text === null) museEditor.text = museEditor.cm.getValue();
+      return museEditor.text;
+    },
+    setEditorFontSize(size) {
+      this.editorFontSize = Math.max(14, Math.min(24, Number(size) || 16));
+      try { localStorage.setItem("muselab_editor_font_size", this.editorFontSize); } catch (_) {}
+      this.$nextTick(() => this._getCM()?.refresh());
+    },
     cmMode(path) {
       if (!path) return "text/plain";
       const ext = path.split(".").pop().toLowerCase();
@@ -2918,118 +3009,109 @@ function portal() {
       return map[ext] || "text/plain";
     },
     async mountCM() {
-      // CodeMirror is lazy-loaded — kick off the fetch (no-op if already
-      // present) and only proceed once the global is exposed. Without this
-      // wait, every first edit-mode entry per session would silently fall
-      // through and the textarea fallback would render.
-      if (!window.CodeMirror) {
-        try { await this._loadCodemirror(); }
-        catch (e) { console.warn("[muselab] CodeMirror lazy load failed:", e); return; }
-      }
-      this.$nextTick(() => {
-        if (!window.CodeMirror) { console.warn("[muselab] CodeMirror not loaded"); return; }
+      this.unmountCM();
+      const version = this._cmMountVersion;
+      const path = this.selected, workspace = this.fileWorkspacePath();
+      const valid = () => this.editing && this.selected === path
+        && this._workspaceIsCurrent(workspace) && this._cmMountVersion === version;
+      this.editorLoading = true;
+      this.editorError = "";
+      try {
+        // Core readiness is insufficient: await the modes, addons and CSS too.
+        await this._loadCodemirror();
+        await this.$nextTick();
+        if (!valid()) return;
         const host = this.$refs.cmHost;
-        if (!host) { console.warn("[muselab] no cmHost ref"); return; }
-        host.innerHTML = "";
-        // Reset the live-editor ref BEFORE (re)mounting. saveEdit/_editorDirty
-        // read this._cm as the source of truth when a CM instance is active;
-        // if init fails and we fall back to a <textarea>, it must stay null so
-        // those paths use the editText buffer instead.
-        this._cm = null;
-        const modeStr = this.cmMode(this.selected);
-        try {
-          const cm = window.CodeMirror(host, {
-            value: String(this.editText || ""),
-            mode: modeStr,
-            lineNumbers: true,
-            lineWrapping: true,
-            tabSize: 2,
-            indentUnit: 2,
-            theme: this.theme === "light" ? "default" : "material-darker",
-            // Ctrl/Cmd+S inside the editor → save. Without this, on some
-            // browsers the browser's own "save page" dialog can fire even
-            // when the document-level keydown handler exists, because
-            // CodeMirror's contenteditable subtree captures the event
-            // first. Hooking it here is the most defensive spot.
-            extraKeys: {
-              "Ctrl-S": () => { this.saveEdit(); },
-              "Cmd-S":  () => { this.saveEdit(); },
-            },
-          });
-          // Initial status
+        if (!host) return;
+        const modeStr = this.cmMode(path);
+        const text = String(this.editText || "");
+        const cm = window.CodeMirror(host, {
+          value: text, mode: modeStr, lineNumbers: true, lineWrapping: true,
+          tabSize: 2, indentUnit: 2,
+          theme: this.theme === "dark" ? "material-darker" : "default",
+          extraKeys: {
+            "Ctrl-S": () => { this.saveEdit(); },
+            "Cmd-S": () => { this.saveEdit(); },
+          },
+        });
+        const state = museEditor = {
+          cm, text, cleanGen: text === this.rawText ? cm.changeGeneration() : -1, chars: text.length,
+          bytes: new TextEncoder().encode(text).length, statsTimer: null,
+          refreshTimer: null, composing: false,
+        };
+        window.__muselab_cm = cm;
+        const refreshStatus = () => {
+          if (museEditor !== state) return;
+          const c = cm.getCursor();
           this.cmStatus = {
-            line: 1, col: 1, sel: 0,
-            lines: cm.lineCount(),
-            chars: cm.getValue().length,
-            mode: this.shortMode(modeStr),
-            dirty: false,
+            line: c.line + 1, col: c.ch + 1, sel: cm.getSelection().length,
+            lines: cm.lineCount(), chars: state.chars, bytes: state.bytes,
+            mode: this.shortMode(modeStr), dirty: !cm.isClean(state.cleanGen),
           };
-          // Expose the live instance and capture a "clean" generation marker.
-          // dirty is then O(1) via cm.isClean(gen) instead of an O(doc) string
-          // compare against rawText on every keystroke.
-          this._cm = cm;
-          const cleanGen = cm.changeGeneration();
-          // Per-keystroke status refresh, kept off the O(doc) hot path:
-          //   • dirty   → cm.isClean(gen), O(1)
-          //   • line/col/lines/sel → CM-internal, cheap
-          //   • chars   → only changes on content edits, so we recompute it
-          //               with ONE getValue() in the `change` handler and reuse
-          //               the cached count on pure cursor moves.
-          // We deliberately no longer mirror the whole buffer into the reactive
-          // `editText` on every keystroke (was O(doc) + triggered Alpine effects
-          // and a second O(doc) dirty compare). saveEdit() pulls cm.getValue()
-          // on demand instead — a big file now costs ~1 full read per *edit*,
-          // not 3+ per keystroke. NOTE: CM passes the instance as the first arg
-          // to cursorActivity handlers, so refreshStatus must be CALLED, not
-          // passed directly — hence the () => wrappers.
-          const refreshStatus = (charCount) => {
-            const c = cm.getCursor();
-            this.cmStatus = {
-              line: c.line + 1, col: c.ch + 1,
-              sel: cm.getSelection().length,
-              lines: cm.lineCount(),
-              chars: charCount === undefined
-                ? (this.cmStatus ? this.cmStatus.chars : 0)
-                : charCount,
-              mode: this.shortMode(modeStr),
-              dirty: !cm.isClean(cleanGen),
-            };
-          };
-          // Char count is the ONLY O(doc) field (cm.getValue().length). Running
-          // it synchronously on every keystroke is the per-key typing lag on
-          // large files. Update the cheap fields (line/col/sel/lines/dirty)
-          // instantly and debounce just the char count so typing stays smooth.
-          let _charTimer = null;
-          const scheduleCharCount = () => {
-            if (_charTimer) clearTimeout(_charTimer);
-            _charTimer = setTimeout(() => {
-              _charTimer = null;
-              refreshStatus(cm.getValue().length);
-            }, 200);
-          };
-          cm.on("change", () => {
-            refreshStatus();        // cheap fields now, cached char count
-            scheduleCharCount();    // O(doc) char count, debounced off hot path
-            // Live markdown preview: keep the right pane in step with edits.
-            // Debounced + cheap-path render inside _scheduleLivePreview so the
-            // heavy mdRender (KaTeX + DOM walk) never runs on the keystroke hot
-            // path. No-op when the file isn't md or the preview pane is hidden.
-            if (this.editorIsMd && this.editorView !== "edit") this._scheduleLivePreview();
-          });
-          cm.on("cursorActivity", () => refreshStatus());
-          window.__muselab_cm = cm;
-          setTimeout(() => { cm.refresh(); refreshStatus(cm.getValue().length); }, 50);
-        } catch (e) {
-          console.error("[muselab] CodeMirror init failed:", e);
-          this.toast(
-            (this.lang === "zh" ? "编辑器初始化失败：" : "Editor init failed: ")
-              + e.message, "error", 6000);
-          host.innerHTML = '<textarea style="width:100%;height:100%;padding:14px;background:var(--c-bg-0);color:var(--c-fg-0);border:0;font:13px ui-monospace,monospace;resize:none"></textarea>';
-          const ta = host.querySelector("textarea");
-          ta.value = this.editText;
-          ta.addEventListener("input", () => { this.editText = ta.value; });
-        }
-      });
+        };
+        state.refreshStatus = refreshStatus;
+        const change = (_cm, edits) => {
+          if (museEditor !== state) return;
+          state.text = null;
+          for (const edit of edits) {
+            state.chars += edit.text.join("\n").length - edit.removed.join("\n").length;
+          }
+          this.editorSaveState = "";
+          refreshStatus();
+          clearTimeout(state.statsTimer);
+          state.statsTimer = setTimeout(() => {
+            if (museEditor !== state) return;
+            state.bytes = new TextEncoder().encode(this._editorText()).length;
+            refreshStatus();
+          }, 300);
+          this._scheduleLivePreview();
+        };
+        const input = cm.getInputField();
+        const compositionStart = () => { state.composing = true; this._cancelLivePreview(); };
+        const compositionEnd = () => { state.composing = false; this._scheduleLivePreview(); };
+        input.addEventListener("compositionstart", compositionStart);
+        input.addEventListener("compositionend", compositionEnd);
+        const scroll = () => { if (museEditor === state) this._syncEditorScroll("editor"); };
+        cm.on("changes", change);
+        cm.on("cursorActivity", refreshStatus);
+        cm.on("scroll", scroll);
+        state.dispose = () => {
+          cm.off("changes", change);
+          cm.off("cursorActivity", refreshStatus);
+          cm.off("scroll", scroll);
+          input.removeEventListener("compositionstart", compositionStart);
+          input.removeEventListener("compositionend", compositionEnd);
+        };
+        refreshStatus();
+        state.refreshTimer = setTimeout(() => {
+          if (museEditor === state) { cm.refresh(); refreshStatus(); }
+        }, 0);
+        this._scheduleLivePreview(0);
+      } catch (e) {
+        if (!valid()) return;
+        this.editorError = this.lang === "zh"
+          ? "高级编辑器加载失败，已启用文本编辑；可重试。"
+          : "Editor could not load. Text editing is available; you can retry.";
+        const host = this.$refs.cmHost;
+        if (!host) return;
+        host.replaceChildren();
+        const ta = document.createElement("textarea");
+        ta.className = "editor-fallback";
+        ta.setAttribute("aria-label", this.lang === "zh" ? "文本编辑器" : "Text editor");
+        ta.value = this.editText;
+        ta.addEventListener("input", () => {
+          this.editText = ta.value;
+          this.editorSaveState = "";
+          this.cmStatus = { ...this.cmStatus, chars: ta.value.length,
+            bytes: new TextEncoder().encode(ta.value).length,
+            dirty: ta.value !== this.rawText };
+          this._scheduleLivePreview();
+        });
+        host.appendChild(ta);
+        this._scheduleLivePreview(0);
+      } finally {
+        if (valid()) this.editorLoading = false;
+      }
     },
     shortMode(mode) {
       // CM 内部 mode 名标准化成显示用短名
@@ -3040,68 +3122,182 @@ function portal() {
       return mode;
     },
     unmountCM() {
-      const host = this.$refs.cmHost;
-      if (host) host.innerHTML = "";
+      ++this._cmMountVersion;
+      this._cancelLivePreview();
+      if (museEditor) {
+        clearTimeout(museEditor.statsTimer);
+        clearTimeout(museEditor.refreshTimer);
+        museEditor.dispose?.();
+        // Blur releases CodeMirror's focus polling before its DOM is removed.
+        museEditor.cm.getInputField().blur();
+      }
+      museEditor = null;
       window.__muselab_cm = null;
+      const host = this.$refs.cmHost;
+      if (host) host.replaceChildren();
+      this.$refs.editorPreview?.replaceChildren();
+      museEditorPreview.blocks = [];
+      museEditorPreview.scrollTargets = {};
+      museEditorPreview.patching = false;
+      this.editorLoading = false;
     },
 
-    // ===== Live markdown preview (split editor) =====
-    // True if the path looks like markdown — the only file kind that gets the
-    // split live-preview affordance. Other text/code files edit full-width.
     _isMdPath(p) {
-      if (!p) return false;
-      const lp = p.toLowerCase();
-      return lp.endsWith(".md") || lp.endsWith(".markdown");
+      return /\.(md|markdown)$/i.test(p || "");
     },
-    // Debounced render of the current editor buffer into livePreviewHtml.
-    // mdRender is heavy (marked + DOMPurify + KaTeX); 200ms after the last
-    // keystroke is responsive without rendering mid-word on every key. Reads
-    // the live CM value when present, else the editText buffer (CM-init-fail
-    // textarea fallback). Re-highlights code blocks once the DOM settles.
-    _scheduleLivePreview() {
-      if (this._livePreviewTimer) clearTimeout(this._livePreviewTimer);
+    _cancelLivePreview() {
+      clearTimeout(this._livePreviewTimer);
+      this._livePreviewTimer = null;
+      ++museEditorPreview.version;
+      this.editorPreviewBusy = false;
+    },
+    _scheduleLivePreview(delay) {
+      this._cancelLivePreview();
+      if (!this.editing || !this.editorIsMd || this.editorView === "edit"
+          || museEditor?.composing) return;
+      this.editorPreviewBusy = true;
       this._livePreviewTimer = setTimeout(() => {
         this._livePreviewTimer = null;
-        this._renderLivePreview();
-      }, 200);
+        void this._renderLivePreview();
+      }, delay ?? (this.cmStatus.chars > 100000 ? 350 : 180));
     },
-    _renderLivePreview() {
-      if (!this.editorIsMd) return;
-      const src = this._cm ? this._cm.getValue() : String(this.editText || "");
-      // Cheap path: marked + DOMPurify only, skipping the KaTeX typeset and
-      // file-path DOM walk (the documented ~300ms costs) so the preview tracks
-      // typing without jank. Math shows as raw $$…$$ until the deferred full
-      // render below typesets it. This is the same trick chat uses mid-stream.
-      this.livePreviewHtml = this._resolveMdImages(this._mdRenderUncached(src, { streaming: true }));
-      this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
-      // If the doc carries math, do ONE full render (KaTeX) after a longer
-      // idle so equations fill in once the user truly pauses — not on every
-      // keystroke. mdRender is LRU-cached, so a repeat pause is near-free.
-      if (this._mathTimer) clearTimeout(this._mathTimer);
-      if (/\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(src)) {
-        this._mathTimer = setTimeout(() => {
-          this._mathTimer = null;
-          if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
-          const cur = this._cm ? this._cm.getValue() : String(this.editText || "");
-          this.livePreviewHtml = this._renderPreviewMd(cur);
-          this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
-        }, 600);
+    async _renderLivePreview() {
+      if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
+      const version = ++museEditorPreview.version;
+      const root = this.$refs.editorPreview;
+      const path = this.selected, workspace = this.fileWorkspacePath();
+      const valid = () => version === museEditorPreview.version && this.editing
+        && this.selected === path && this._workspaceIsCurrent(workspace)
+        && this.editorView !== "edit" && root === this.$refs.editorPreview;
+      if (!root) return;
+      this.editorPreviewBusy = true;
+      this.editorPreviewError = "";
+      const yieldFrame = () => new Promise(resolve => setTimeout(resolve, 0));
+      try {
+        const src = this._stripFrontmatter(this._editorText());
+        const prepared = this._prepareMarkdown(src);
+        // Parse the entire document in the worker so reference links and block
+        // syntax remain correct. Sanitize/typeset/patch bounded groups on the
+        // page, yielding between groups and retaining unchanged DOM subtrees.
+        let chunks = await museRichWorker({ kind: "markdown-blocks", text: prepared.input }, valid);
+        if (!valid()) return;
+        if (chunks === null) {
+          // Worker failures must not freeze input with a synchronous retry.
+          this.editorPreviewError = this.lang === "zh"
+            ? "预览暂不可用，当前显示原文。点击重试。"
+            : "Preview unavailable; showing source. Retry to render.";
+          const node = document.createElement("pre");
+          node.textContent = src;
+          root.replaceChildren(node);
+          museEditorPreview.blocks = [];
+          return;
+        }
+        if (/\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(src)) {
+          try { await this._loadKatex(); } catch (_) {}
+          if (!valid()) return;
+        }
+        const old = museEditorPreview.blocks;
+        const next = [];
+        for (let i = 0; i < chunks.length; i++) {
+          if (!valid()) return;
+          const chunk = chunks[i];
+          const key = !!window.renderMathInElement + ":" + this._unmaskMath(chunk.html, prepared.math);
+          if (old[i]?.key === key) next.push(old[i]);
+          else {
+            const node = document.createElement("div");
+            node.className = "editor-preview-block";
+            node.innerHTML = this._resolveMdImages(this._mdRenderUncached(this._unmaskMath(chunk.source, prepared.math),
+              { raw: chunk.html, prepared }));
+            next.push({ key, node });
+            await yieldFrame();
+          }
+        }
+        if (!valid()) return;
+        const scroller = root.parentElement;
+        const scrollTop = scroller.scrollTop;
+        // Replacing a tall visible block with the default 300px placeholder
+        // collapses scrollHeight and clamps scrollTop to zero. Seed the new
+        // blocks with the old geometry before touching the live DOM. Batch all
+        // reads first so incremental rendering does not force layout per write.
+        const heights = Array.from(root.children, node => node.getBoundingClientRect().height);
+        next.forEach(({ node }, i) => {
+          if (root.children[i] !== node && heights[i] > 0) {
+            node.style.containIntrinsicSize = `auto ${heights[i]}px`;
+          }
+        });
+        museEditorPreview.patching = version;
+        // Commit in small batches. Every partial commit remains owned by this
+        // generation; a successor reconciles against the actual DOM children.
+        for (let i = 0; i < next.length; i++) {
+          if (!valid()) return;
+          const { node } = next[i];
+          if (root.children[i] !== node) {
+            if (root.children[i]) root.replaceChild(node, root.children[i]);
+            else root.appendChild(node);
+            this.highlightCode(".editor-live-preview .markdown", [node]);
+          }
+          if (i % 8 === 7) await yieldFrame();
+        }
+        if (!valid()) return;
+        while (root.children.length > next.length) root.lastElementChild.remove();
+        museEditorPreview.blocks = next;
+        scroller.scrollTop = scrollTop;
+        museEditorPreview.scrollTargets.preview = scroller.scrollTop;
+        museEditorPreview.patching = false;
+        // Reconcile after the new layout; exact event echoes cannot drive the
+        // opposite pane back through a temporary layout-clamped position.
+        delete museEditorPreview.scrollTargets.editor;
+        this._syncEditorScroll("editor");
+      } catch (_) {
+        if (valid()) this.editorPreviewError = this.lang === "zh"
+          ? "预览更新失败，点击重试。" : "Preview update failed. Retry.";
+      } finally {
+        // An invalidated render must not release its successor's scroll lock.
+        if (museEditorPreview.patching === version) museEditorPreview.patching = false;
+        if (valid()) {
+          this.editorPreviewBusy = false;
+          this._refreshMarkdownOutline();
+        }
       }
     },
-    // View-mode switch (edit | split | preview) for the markdown editor.
-    // No-op for non-md files (editorIsMd false). Persisted so the choice
-    // sticks across files and reloads. Switching INTO a preview-showing mode
-    // renders immediately so the pane isn't blank until the next keystroke.
+    markdownOutlineAvailable() {
+      return this.previewSurface === "file" && (this.editing
+        ? this.editorIsMd && this.editorView !== "edit" : this.previewMode === "md");
+    },
+    _markdownOutlineRoot() {
+      return this.editing ? this.$refs.editorPreview : this.$refs.markdownPreview;
+    },
+    toggleMarkdownOutline() {
+      this.markdownOutlineOpen = !this.markdownOutlineOpen;
+      if (this.markdownOutlineOpen) this.$nextTick(() => this._refreshMarkdownOutline());
+      this.$nextTick(() => this._getCM()?.refresh());
+    },
+    _refreshMarkdownOutline() {
+      // Only inspect rendered headings while the outline is open. No parsing,
+      // layout measurements or per-keystroke DOM scans in the closed state.
+      if (!this.markdownOutlineOpen || !this.markdownOutlineAvailable()) return;
+      const root = this._markdownOutlineRoot();
+      const items = Array.from(root?.querySelectorAll("h1,h2,h3,h4,h5,h6") || [], (node, index) => {
+        node.dataset.outlineIndex = index;
+        return { index, level: Number(node.tagName.slice(1)), text: node.textContent.trim() };
+      });
+      if (JSON.stringify(items) !== JSON.stringify(this.markdownOutline)) this.markdownOutline = items;
+    },
+    jumpMarkdownHeading(index) {
+      if (!this.markdownOutlineAvailable() || (this.editing && this.editorPreviewBusy)) return;
+      const root = this._markdownOutlineRoot();
+      const node = root?.querySelector(`[data-outline-index="${Number(index)}"]`);
+      if (!node) return;
+      node.scrollIntoView({ block: "start", inline: "nearest", behavior: "instant" });
+      // Move keyboard reading focus without adding every heading to tab order.
+      node.setAttribute("tabindex", "-1");
+      node.focus({ preventScroll: true });
+    },
     setEditorView(mode) {
-      if (!this.editorIsMd) return;
+      if (!this.editorIsMd || !["edit", "split", "preview"].includes(mode)) return;
       this.editorView = mode;
-      localStorage.setItem("muselab_editor_view", mode);
-      if (mode !== "edit") this._renderLivePreview();
-      // CM needs a refresh after its container width changes (split ↔ full),
-      // otherwise the gutter/cursor positions go stale until the next click.
-      if (mode !== "preview" && this._cm) {
-        this.$nextTick(() => { try { this._cm.refresh(); } catch (e) {} });
-      }
+      this._scheduleLivePreview(0);
+      if (mode !== "preview") this.$nextTick(() => this._getCM()?.refresh());
     },
 
     initTheme() {
@@ -3645,9 +3841,8 @@ function portal() {
         }
       });
     },
-    async _attachFile(file) {
+    async _attachFile(file, { ownerSid = this.currentId, waitFor = null } = {}) {
       if (this.workspaceSwitching) return;
-      const ownerSid = this.currentId;
       if (!ownerSid) return;
       this._captureComposerState(ownerSid);
       const ownerState = this._ensureTabState(ownerSid);
@@ -3664,62 +3859,31 @@ function portal() {
         return;
       }
 
-      // Diagnostic timing — when uploads feel slow the user has no way to
-      // tell if it's compression CPU on the phone or network throughput.
-      // We split the timeline into "compress" / "data-url" / "upload" and
-      // surface only aggregate timing/size in a slow-upload toast. Never log the
-      // original filename: attachment names can contain private document titles.
-      const t0 = performance.now();
-      let tCompressEnd = t0;
-
+      // Register the chip before image preparation or a preceding batch item
+      // can yield. Send must see every selected attachment as pending work.
       let entry;
       if (kind === "image") {
-        // Compress BEFORE generating the preview + upload — both reuse
-        // the smaller file.
-        file = await this._maybeCompressImage(file);
-        tCompressEnd = performance.now();
-        // Generate a small base64 thumbnail (≤160 px, JPEG 70%) stored
-        // directly in the image entry. This survives session reload,
-        // tab switches, and iOS Safari's blob-URL lifecycle quirks —
-        // the data URI is a self-contained string that never expires.
-        // The chip and the sent-message bubble both use this thumbnail.
-        const preview = await this._imageToThumbDataURL(file);
-        if (!ownsDraft()) return;
-        // Stash the compressed File on the entry so the in-chip "✎ Annotate"
-        // button can re-open the bitmap in the image editor without
-        // round-tripping back to the server. Memory cost is small (~300 KB
-        // per image after compression), cleared on send.
-        const raw = { id: null, mime: file.type, preview,
+        const raw = { id: null, mime: file.type, preview: "",
                        uploading: true, progress: 0, progressKnown: false,
                        error: false, file };
         ownerDraft.pendingImages.push(raw);
-        // Alpine v3 wraps each pushed item in a Proxy. The local `raw`
-        // reference still points at the original (non-proxied) object;
-        // mutating raw.uploading bypasses the Proxy's set trap and
-        // doesn't fire reactivity → the chip's `:class="{uploading:...}"`
-        // binding never re-evaluates and the progress bar slides forever
-        // even after the upload completes. Bug observed 2026-05-21.
-        // Pull the proxied version back out of the array so subsequent
-        // mutations go through Alpine's reactive layer.
+        // Mutate the Alpine proxy so progress/preparation changes render.
         entry = ownerDraft.pendingImages[ownerDraft.pendingImages.length - 1];
       } else {
         const raw = { id: null, name: file.name, kind,
                        uploading: true, progress: 0, progressKnown: false,
                        error: false };
         ownerDraft.pendingDocs.push(raw);
-        // Same Alpine-proxy gotcha as above — must use the proxied
-        // reference for entry.uploading = false to actually trigger UI.
         entry = ownerDraft.pendingDocs[ownerDraft.pendingDocs.length - 1];
       }
-
-      const tUploadStart = performance.now();
-      const fd = new FormData();
-      fd.append("file", file);
       const uploadController = new AbortController();
+      // Runtime-only cancellation must not become part of recovered/queued
+      // attachment payloads when entries are copied or serialized.
+      Object.defineProperty(entry, "_uploadController", {
+        value: uploadController, configurable: true,
+      });
       ownerDraft._uploadControllers.add(uploadController);
-      const uploadTimeout = setTimeout(
-        () => uploadController.abort(), 5 * 60 * 1000,
-      );
+      let uploadTimeout = null;
       const ownsEntry = () => ownsDraft()
         && (ownerDraft.pendingImages.includes(entry) || ownerDraft.pendingDocs.includes(entry));
       const updateProgress = percent => {
@@ -3735,6 +3899,30 @@ function portal() {
         );
       };
       try {
+        // A batch reserves all chips together but prepares/uploads serially to
+        // avoid decoding several full-resolution photos at once on mobile.
+        if (waitFor) await waitFor;
+        if (!ownsEntry() || uploadController.signal.aborted) return;
+        // Timing uses aggregate durations/size, never attachment filenames.
+        const t0 = performance.now();
+        let tCompressEnd = t0;
+        if (kind === "image") {
+          file = await this._maybeCompressImage(file);
+          if (!ownsEntry() || uploadController.signal.aborted) return;
+          tCompressEnd = performance.now();
+          // A small data URL survives tab switches and iOS blob-URL lifetimes.
+          const preview = await this._imageToThumbDataURL(file);
+          if (!ownsEntry() || uploadController.signal.aborted) return;
+          entry.mime = file.type;
+          entry.file = file;
+          entry.preview = preview;
+        }
+        const tUploadStart = performance.now();
+        const fd = new FormData();
+        fd.append("file", file);
+        uploadTimeout = setTimeout(
+          () => uploadController.abort(), 5 * 60 * 1000,
+        );
         const r = await this._uploadAttachment(fd, {
           signal: uploadController.signal,
           onProgress: updateProgress,
@@ -3792,12 +3980,27 @@ function portal() {
       } finally {
         clearTimeout(uploadTimeout);
         ownerDraft._uploadControllers.delete(uploadController);
+        delete entry._uploadController;
       }
+    },
+    async _attachFiles(files) {
+      if (this.workspaceSwitching) return;
+      const ownerSid = this.currentId;
+      let pending = Promise.resolve();
+      // Invoke every item before awaiting: the entire batch keeps this owner
+      // and becomes visible to a send triggered during its first upload.
+      for (const file of files) {
+        const item = this._attachFile(file, { ownerSid, waitFor: pending });
+        // A rejected item can finish before the previous transfer. Preserve
+        // that previous tail so the next valid image cannot bypass it.
+        pending = Promise.all([pending, item]);
+      }
+      await pending;
     },
     async onAttachPicked(ev) {
       const files = Array.from(ev.target.files || []);
       ev.target.value = "";
-      for (const f of files) await this._attachFile(f);
+      await this._attachFiles(files);
     },
     async onAttachDrop(ev) {
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
@@ -3816,14 +4019,18 @@ function portal() {
       }
       if (files.length) {
         ev.preventDefault();
-        for (const f of files) await this._attachFile(f);
+        await this._attachFiles(files);
       }
     },
     removePendingImage(i) {
       // preview is now a data URL (base64) — no revoke needed.
-      this.pendingImages.splice(i, 1);
+      const [entry] = this.pendingImages.splice(i, 1);
+      if (entry && entry._uploadController) entry._uploadController.abort();
     },
-    removePendingDoc(i) { this.pendingDocs.splice(i, 1); },
+    removePendingDoc(i) {
+      const [entry] = this.pendingDocs.splice(i, 1);
+      if (entry && entry._uploadController) entry._uploadController.abort();
+    },
 
     // ===== image annotation editor (L1) =====
     // Open the editor over pendingImages[i]. The chip must have already
@@ -4524,6 +4731,12 @@ function portal() {
       if (!uuid || !sid) return;
       if (this._isMobileLayout()) this.setMobileTab("chat");
       const activeState = this.tabState && this.tabState[sid];
+      const wasAtBottom = activeState ? activeState.atBottom : true;
+      // Each click owns the jump; a newer click supersedes deferred or
+      // in-flight ones so only the latest target may report or scroll.
+      const jumpSeq = activeState
+        ? (activeState._historyJumpSeq = (Number(activeState._historyJumpSeq) || 0) + 1)
+        : 0;
       if (activeState) activeState.atBottom = false;
       const tryScroll = () => {
         if (sid !== this.currentId) return false;
@@ -4545,9 +4758,30 @@ function portal() {
         if (!st) return;
         const idx = st.messages.findIndex(em => em && em.uuid === uuid);
         if (idx < 0) {
+          if (st.streaming || st.es) {
+            // A live repository must stay contiguous with its streaming tail,
+            // so it cannot be replaced by an around window. Keep following the
+            // reply and perform the jump as soon as the turn settles.
+            st.atBottom = wasAtBottom;
+            this._deferHistoryJump(sid, st, m, jumpSeq);
+            return;
+          }
           (async () => {
-            const loaded = await this._loadAroundMessage(sid, uuid);
-            if (!loaded || this.tabState[sid] !== st || sid !== this.currentId) return;
+            let loaded = false;
+            try {
+              loaded = await this._loadAroundMessage(sid, uuid);
+            } catch (_) {
+              loaded = false;
+            }
+            if (this.tabState[sid] !== st || sid !== this.currentId
+                || st._historyJumpSeq !== jumpSeq) return;
+            if (!loaded) {
+              this.toast(this.lang === "zh"
+                ? "无法加载该消息所在的历史，请重试"
+                : "Could not load the history around that message; please retry",
+              "error");
+              return;
+            }
             this.$nextTick(() => {
               const pane = this._paneElement(sid);
               this.highlightCode(".chat-body", pane ? [pane] : null);
@@ -4556,14 +4790,26 @@ function portal() {
           })();
           return;
         }
-        for (let i = idx; i < st.messageRange.visibleStart; i++) {
+        const range = st.messageRange;
+        let nextStart = Math.min(idx, range.visibleStart);
+        let nextEnd = Math.max(idx + 1, range.visibleEnd);
+        const windowSize = this._historyWindowSize();
+        if (nextEnd - nextStart > windowSize) {
+          // Spanning from the current window to a distant resident target would
+          // mount (and synchronously render) every row in between. Mount one
+          // window around the target; scrolling reveals either side.
+          nextStart = Math.max(0, idx - Math.floor(windowSize / 2));
+          nextEnd = Math.min(st.messages.length, nextStart + windowSize);
+        }
+        for (let i = nextStart; i < nextEnd; i++) {
           const em = st.messages[i];
           if (em.role === "assistant" && em.text && !em.html) {
             em.html = this._renderHistoryMessage(em);
           }
         }
-        st.messageRange.visibleStart = Math.min(idx, st.messageRange.visibleStart);
-        st.messageRange.visibleEnd = Math.max(idx + 1, st.messageRange.visibleEnd);
+        range.visibleStart = nextStart;
+        range.visibleEnd = nextEnd;
+        this._enforceMessageRangeInvariant(st);
         this._scheduleHistoryViewport(st, "around", uuid);
         st._hasMoreHistory = st.messageRange.visibleStart > 0
           || st.messageRange.offset > 0;
@@ -4576,6 +4822,23 @@ function portal() {
           }, 50);
         });
       });
+    },
+    _deferHistoryJump(sid, st, m, jumpSeq) {
+      if (st._historyJumpTimer) clearInterval(st._historyJumpTimer);
+      this.toast(this.lang === "zh"
+        ? "回复进行中，该消息需要从更早的历史加载；本轮结束后自动跳转"
+        : "A reply is running; the jump will happen once this turn ends");
+      st._historyJumpTimer = setInterval(() => {
+        const superseded = this.tabState[sid] !== st
+          || st._historyJumpSeq !== jumpSeq;
+        if (!superseded && (st.streaming || st.es)) return;
+        clearInterval(st._historyJumpTimer);
+        st._historyJumpTimer = null;
+        // Leaving the session abandons the request rather than yanking the
+        // viewport when the reader comes back later.
+        if (superseded || sid !== this.currentId) return;
+        this._scrollToUserMsg(m, sid);
+      }, 500);
     },
     // Short preview text for an outline row — first line, trimmed.
     outlineText(m) {
@@ -4906,12 +5169,18 @@ function portal() {
       }
       return null;
     },
-    // Normalize a model-emitted path into something openByPathToasted can hand
-    // to /api/files/list. Handles three things the model commonly does wrong:
-    //   - absolute path under the workspace root → strip the root prefix
-    //   - "~/..." path              →  return "" (we don't know HOME-vs-ROOT)
-    //   - path prefixed by the workspace basename → strip the duplicate
-    // Returns "" for paths we can't safely open (would 403 / 404 on backend).
+    _isExternalFilePath(path) {
+      return typeof path === "string" && (path.startsWith("/") || path.startsWith("~/"));
+    },
+    _fileReadUrl(endpoint, path) {
+      return "/api/files/" + endpoint + "?path=" + encodeURIComponent(path)
+        + (this._isExternalFilePath(path) ? "&external=1" : "");
+    },
+    _fileReadRequest(path) {
+      return this._isExternalFilePath(path) ? { path, external: true } : { path };
+    },
+    // Keep external paths intact for authenticated read-only preview. Paths
+    // inside the current workspace retain their ordinary relative identity.
     _normalizeWorkspacePath(p) {
       if (!p) return "";
       const info = this.contextInfo || {};
@@ -4923,9 +5192,9 @@ function portal() {
         if (root && (p === root || p.startsWith(root + "/"))) {
           return p.slice(root.length).replace(/^\/+/, "");
         }
-        return "";
+        return p;
       }
-      if (p.startsWith("~/")) return "";
+      if (p.startsWith("~/")) return p;
       // Model often writes "<root-basename>/foo/bar.md" as if the workspace
       // root were its parent. Strip the duplicated basename if doing so
       // leaves a non-empty remainder.
@@ -5451,7 +5720,7 @@ function portal() {
       // Markdown/HTML/math structure; otherwise escape once and preserve line
       // breaks. This is both safe (no raw HTML enters the result) and visually
       // equivalent for ordinary prose.
-      if (text.length >= 64 * 1024) {
+      if (opts.raw === undefined && text.length >= 64 * 1024) {
         // A single huge fenced dump is common in agent output and does not need
         // marked + DOMPurify to discover its structure. Escaping it directly is
         // equivalent, keeps the full code available, and avoids a multi-second
@@ -5631,7 +5900,8 @@ function portal() {
         }
       }
       // Markdown file-preview pane keeps its own rendered string.
-      if (typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
+      if (this.editing && this.editorIsMd) this._scheduleLivePreview();
+      if (!this.editing && typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
         this._mdCacheDelete(this.rawText);
         this.renderedMd = this._renderPreviewMd(this.rawText);
       }
@@ -5646,7 +5916,7 @@ function portal() {
       // path/with/slashes.ext  OR  bare.ext  (+ optional :line[:col])
       // Ext must START with a letter to avoid eating version strings like 1.2.3.
       // \p{L}\p{N} (unicode flag) so Chinese/Japanese filenames also match.
-      const RE = /^([\p{L}\p{N}_@./~+-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
+      const RE = /^([\p{L}\p{N}_@./~+ -]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
       const toRel = (p) => this._normalizeWorkspacePath(p);
       // 1) inline <code> whose text looks like a path
       const codes = rootEl.querySelectorAll("code");
@@ -5819,6 +6089,29 @@ function portal() {
     async openByPathToasted(path) {
       const ownerWorkspace = this.fileWorkspacePath();
       const requestHeaders = this.fileHdr();
+      const seq = this._chatFileOpenSeq = (this._chatFileOpenSeq || 0) + 1;
+      if (this._isExternalFilePath(path)) {
+        const previewSeq = this._previewLoadSeq;
+        const isCurrent = () => seq === this._chatFileOpenSeq
+          && previewSeq === this._previewLoadSeq && this._workspaceIsCurrent(ownerWorkspace);
+        try {
+          const r = await this._fetchWithDeadline(
+            this._fileReadUrl("stat", path), { headers: requestHeaders });
+          if (!isCurrent()) return;
+          if (!r.ok) {
+            this.toast(this.lang === "zh"
+              ? (r.status === 403 ? "该文件受保护或没有读取权限" : "文件不存在或无法预览")
+              : (r.status === 403 ? "File is protected or not readable" : "File not found or unavailable"), "warn");
+            return;
+          }
+          const file = await r.json();
+          if (!isCurrent()) return;
+          await this.openFile(file, { reveal: true });
+        } catch (error) {
+          if (isCurrent()) this.errToast("generic", String(error?.message || error));
+        }
+        return;
+      }
       // HEAD-equivalent check via list on the parent dir is fragile (binary
       // files, images etc. don't go through /api/files/read). Just delegate
       // to openFile and let it set previewMode='unsupported' / pdf / img,
@@ -5829,11 +6122,11 @@ function portal() {
       try {
         const r = await fetch("/api/files/list?path=" + encodeURIComponent(parent),
           { headers: requestHeaders });
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
         let hit = null;
         if (r.ok) {
           const data = await r.json();
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
           hit = (data.entries || []).find(e => e.name === name) || null;
         }
         // Direct ROOT-relative lookup missed. The model commonly emits a path
@@ -5844,7 +6137,7 @@ function portal() {
         // open. Multiple candidates always go through explicit disambiguation.
         if (!hit) {
           const matches = await this._findChatFileCandidates(path, name, requestHeaders);
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
           let resolved = "";
           if (matches.length === 1) {
             resolved = matches[0].path;
@@ -5857,12 +6150,12 @@ function portal() {
                 : `"${path}" matches ${matches.length} files. Pick one to open:`,
               choices: matches.map(m => ({ label: m.path, value: m.path })),
             });
-            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+            if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
             if (!resolved) return;   // cancelled
           }
           if (resolved) {
             await this.openFile({ path: resolved, name }, { reveal: true });
-            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+            if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});
             return;
           }
@@ -5874,7 +6167,7 @@ function portal() {
           return;
         }
         await this.openFile({ path, name }, { reveal: true });
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (seq !== this._chatFileOpenSeq || !this._workspaceIsCurrent(ownerWorkspace)) return;
         // Mirror the click into the file tree: expand parents + scroll the
         // row into view so the user sees where the file lives. Use background
         // mode — a chat-link click wants the file's CONTENT (the preview
@@ -5894,18 +6187,17 @@ function portal() {
     // list) can't reach it. Route through the dedicated /api/chat/task-output
     // endpoint via openFile's readUrl override. No tree reveal (not in tree).
     async openTaskOutput(ts) {
-      if (!ts || !ts.output_file) {
+      const urls = this._taskOutputUrls(ts);
+      if (!ts || !urls.length) {
         this.toast(this.lang === "zh" ? "没有结果文件" : "No result file", "warn");
         return;
       }
-      const path = ts.output_file;
+      const path = ts.output_file || `${ts.task_id}.output`;
       const name = path.split("/").pop();
-      const ownerSid = ts.owner_session_id || this.currentId;
-      const url = "/api/chat/task-output?session_id="
-        + encodeURIComponent(ownerSid)
-        + "&path=" + encodeURIComponent(path);
       try {
-        await this.openFile({ path, name }, { readUrl: url, reveal: true });
+        await this.openFile({ path, name }, {
+          readUrl: urls[0], reveal: !!ts.output_file,
+        });
       } catch (e) {
         this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
       }
@@ -5939,17 +6231,43 @@ function portal() {
         return { key, label: labels[key] || key, value: String(display ?? "") };
       });
     },
-    async _loadTaskDetailOutput(status, requestId) {
+    // Candidate /task-output URLs, best first. A card that recorded
+    // `output_file` is read by path; every card with a task id can also be
+    // resolved by id, which finds the file under a rollover predecessor's
+    // session dir and covers overlays that never captured the path.
+    _taskOutputUrls(status) {
       const path = String(status && status.output_file || "");
-      const ownerSid = String(status && status.owner_session_id || this.currentId || "");
-      if (!path || !ownerSid) return;
+      const taskId = String(status && status.task_id || "");
+      const ownerSid = String(status && status.owner_session_id || "");
+      const urls = [];
+      if (path && (ownerSid || this.currentId)) {
+        urls.push("/api/chat/task-output?session_id="
+          + encodeURIComponent(ownerSid || this.currentId)
+          + "&path=" + encodeURIComponent(path));
+      }
+      if (taskId && this.currentId) {
+        urls.push("/api/chat/task-output?session_id="
+          + encodeURIComponent(this.currentId)
+          + "&task_id=" + encodeURIComponent(taskId)
+          + (ownerSid ? "&owner_session_id=" + encodeURIComponent(ownerSid) : ""));
+      }
+      return urls;
+    },
+    _taskOutputKey(status) {
+      return String(status && (status.output_file || status.task_id) || "")
+        + "|" + String(status && status.state || "");
+    },
+    async _loadTaskDetailOutput(status, requestId) {
+      const urls = this._taskOutputUrls(status);
+      if (!urls.length) return;
       this.taskDetail.loading = true;
       this.taskDetail.error = "";
       try {
-        const url = "/api/chat/task-output?session_id="
-          + encodeURIComponent(ownerSid)
-          + "&path=" + encodeURIComponent(path);
-        const response = await fetch(url, { headers: this.hdr() });
+        let response = null;
+        for (const url of urls) {
+          response = await fetch(url, { headers: this.hdr() });
+          if (response.ok) break;
+        }
         if (!response.ok) {
           let reason = "";
           try {
@@ -5961,10 +6279,11 @@ function portal() {
         const output = await response.text();
         if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
         this.taskDetail.output = output;
-        this.taskDetail.loadedPath = path;
+        this.taskDetail.loadedPath = this._taskOutputKey(status);
       } catch (error) {
         if (requestId !== this._taskDetailRequestId || !this.taskDetail.show) return;
         this.taskDetail.error = String(error && error.message || error || "");
+        this.taskDetail.loadedPath = this._taskOutputKey(status);
       } finally {
         if (requestId === this._taskDetailRequestId) this.taskDetail.loading = false;
       }
@@ -5999,7 +6318,7 @@ function portal() {
     async openTaskDetailOutput() {
       const status = this.taskDetail.status
         ? { ...this.taskDetail.status } : null;
-      if (!status || !status.output_file) return;
+      if (!status || !(status.output_file || status.task_id)) return;
       this.closeTaskDetail();
       await this.openTaskOutput(status);
     },
@@ -6014,8 +6333,8 @@ function portal() {
       const next = this._normalizeTaskStatusPreview({ ...current, ...status });
       this.taskDetail.status = next;
       if (message) this.taskDetail.source = this._taskDetailSource(message);
-      const nextPath = String(next.output_file || "");
-      if (nextPath && nextPath !== this.taskDetail.loadedPath
+      const nextKey = this._taskOutputKey(next);
+      if ((next.output_file || next.task_id) && nextKey !== this.taskDetail.loadedPath
           && !this.taskDetail.loading) {
         const requestId = ++this._taskDetailRequestId;
         void this._loadTaskDetailOutput(next, requestId);
@@ -6442,13 +6761,15 @@ function portal() {
         data = null;
       }
       if (!r.ok) {
+        // HTTP/2 commonly leaves statusText empty, and upstream failures may
+        // return HTML instead of JSON. Preserve the status for caller feedback.
+        const error = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
         if (opts.toastError) {
-          const msg = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
           this.toast(
-            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + msg,
+            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + error,
             "error", 4000);
         }
-        return { ok: false, status: r.status, data, error: (data && data.detail) || r.statusText };
+        return { ok: false, status: r.status, data, error };
       }
       return { ok: true, status: r.status, data };
     },
@@ -7001,16 +7322,32 @@ function portal() {
         this._modalFocusStack = this._modalFocusStack.filter(item => item !== key);
         this._modalFocusStack.push(key);
       }
+      const surface = this._focusSurfaceState[key];
+      const retryAfterShow = key === "activity-move" || key === "session-todo";
       this.$nextTick(() => {
-        const state = this._focusSurfaceState[key];
-        if (!state) return;
-        const root = document.querySelector(state.rootSelector);
-        if (!root) return;
-        const focusable = this._focusableElements(root);
-        const preferred = state.initialSelector
-          ? root.querySelector(state.initialSelector) : null;
-        const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
-        this._focusWithoutScroll(target);
+        const focusSurface = () => {
+          const state = this._focusSurfaceState[key];
+          if (!state) return false;
+          if (retryAfterShow && (state !== surface
+              || (key === "activity-move" ? !this.activity.moveMenu.show : !this.sessionTodoOpen)
+              || this._modalFocusStack[this._modalFocusStack.length - 1] !== key)) {
+            return false;
+          }
+          const root = document.querySelector(state.rootSelector);
+          if (!root) return false;
+          // A user may already have moved within the surface before the retry.
+          if (retryAfterShow && root.contains(document.activeElement)) return true;
+          const focusable = this._focusableElements(root);
+          const preferred = state.initialSelector
+            ? root.querySelector(state.initialSelector) : null;
+          const target = focusable.includes(preferred) ? preferred : (focusable[0] || root);
+          return this._focusWithoutScroll(target);
+        };
+        if (!focusSurface() && retryAfterShow) {
+          // Alpine x-show schedules its visibility change in rAF, which can
+          // follow nextTick. Retry once after that paint, without polling.
+          this._afterPaint(focusSurface);
+        }
       });
     },
     _closeFocusSurface(key, restore = true) {
@@ -7855,11 +8192,9 @@ function portal() {
     // Backwards-compat wrapper — call _rebindSelect("model") directly.
     async _rebindModelSelect() { await this._rebindSelect("model"); },
 
-    // Model switch:
-    //   - empty session: PATCH model in place (no point in creating an empty fork)
-    //   - session with messages: confirm modal "切换模型需要新建会话" —
-    //     confirm → create new session with chosen model, jump to it.
-    //     cancel  → revert dropdown.
+    // Model switch: always PATCH in place, history included. The backend
+    // rebuilds the runtime and resumes the same transcript; it answers 409
+    // (and the dropdown reverts) while the session has active scheduled tasks.
     async onModelChange() {
       const newM = this.model;
       if (!this.currentId) return;
@@ -7878,9 +8213,7 @@ function portal() {
         && this.tabState[sid] === ownerState
         && this._conversationWorkspaceIsCurrent(ownerWorkspace);
       // Finish any already-requested effort/tier write before deciding what the
-      // current session owns. Crucially, do not PATCH a compatibility reset yet:
-      // a history-session model switch still has a confirm step, and Cancel must
-      // leave the source session byte-for-byte unchanged.
+      // current session owns.
       if (!await this._awaitRuntimeSettingPatches(sid, ownerState)) return;
       if (!ownsSelection()) {
         if (this.currentId === sid) this.model = oldM;
@@ -7901,168 +8234,93 @@ function portal() {
         ? currentEffort : "auto";
       const nextTier = this._supportsFast(newM) ? currentTier : "";
 
-      // Decide empty vs has-messages from BOTH the persisted message_count
-      // AND the in-memory messages array — take the max. Two failure modes
-      // we need to cover simultaneously:
-      //   (a) sessions list metadata loaded before messages stream in →
-      //       the active pane is temporarily empty but persisted count > 0 →
-      //       prefer persisted count.
-      //   (b) user switches model mid-first-turn (or before the FIRST turn's
-      //       bump_session has fired) → persisted count still 0 but the active
-      //       pane already has user + streaming-assistant bubbles →
-      //       prefer in-memory length. The old single-source logic took
-      //       persisted=0 here and silently switched without the "新建会话?"
-      //       confirm (2026-05-23 user feedback).
-      const persistedFromMeta = (cur && typeof cur.message_count === "number")
-        ? cur.message_count : 0;
-      const persistedCount = Math.max(persistedFromMeta, this.activeSessionPane().messages.length || 0);
-
-      // Empty session — switch in place (no point creating an empty fork).
-      // Still toast so the user gets visual confirmation the switch happened.
-      if (persistedCount === 0) {
-        const seq = ++ownerState._modelPatchSeq;
-        ownerState._runtimeSettingsGeneration += 1;
-        const expected = {
-          seq,
-          value: newM,
-          fallback: oldM,
-          at: Date.now(),
-        };
-        ownerState._modelExpected = expected;
-        const abandon = () => {
-          if (this.tabState[sid] === ownerState
-              && ownerState._modelPatchSeq === seq
-              && ownerState._modelExpected === expected) {
-            ownerState._modelExpected = null;
-            if (this.currentId === sid) this.model = oldM;
-          }
-          return false;
-        };
-        try {
-          if (!await this._ensureSessionRegistered(sid)) {
-            throw new Error("session registration failed");
-          }
-          // Registration can take long enough for a workspace/tab switch or a
-          // newer model intent. Never send this PATCH to that stale owner.
-          if (!ownsSelection() || ownerState._modelPatchSeq !== seq) {
-            return abandon();
-          }
-          const r = await this._serializeRuntimeSettingPatch(ownerState, async () => {
-            if (!ownsSelection() || ownerState._modelPatchSeq !== seq) return null;
-            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
-              method: "PATCH",
-              headers: { ...this.hdr(), "Content-Type": "application/json" },
-              body: JSON.stringify({
-                model: newM,
-                effort: nextEffort,
-                service_tier: nextTier,
-              }),
-            });
+      // Toast so the user gets visual confirmation the switch happened.
+      const seq = ++ownerState._modelPatchSeq;
+      ownerState._runtimeSettingsGeneration += 1;
+      const expected = {
+        seq,
+        value: newM,
+        fallback: oldM,
+        at: Date.now(),
+      };
+      ownerState._modelExpected = expected;
+      const abandon = () => {
+        if (this.tabState[sid] === ownerState
+            && ownerState._modelPatchSeq === seq
+            && ownerState._modelExpected?.seq === seq) {
+          ownerState._modelExpected = null;
+          if (this.currentId === sid) this.model = oldM;
+        }
+        return false;
+      };
+      try {
+        if (!await this._ensureSessionRegistered(sid)) {
+          throw new Error("session registration failed");
+        }
+        // Registration can take long enough for a workspace/tab switch or a
+        // newer model intent. Never send this PATCH to that stale owner.
+        if (!ownsSelection() || ownerState._modelPatchSeq !== seq) {
+          return abandon();
+        }
+        const r = await this._serializeRuntimeSettingPatch(ownerState, async () => {
+          if (!ownsSelection() || ownerState._modelPatchSeq !== seq) return null;
+          return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+            method: "PATCH",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: newM,
+              effort: nextEffort,
+              service_tier: nextTier,
+            }),
           });
-          if (!r) return abandon();
-          if (!r.ok) {
-            abandon();
-            if (this.currentId === sid) this.toast(this.t("slash.failed"), "error");
-            return false;
-          }
-          if (this.tabState[sid] !== ownerState
-              || ownerState._modelPatchSeq !== seq) return false;
-          const active = this.sessions.find(s => s.id === sid);
-          if (active) {
-            active.model = newM;
-            active.effort = nextEffort;
-            active.service_tier = nextTier;
-          }
-          ownerState.effort = nextEffort;
-          ownerState.serviceTier = nextTier;
-          if (ownerState._modelExpected) {
-            ownerState._modelExpected.fallback = newM;
-          }
-          if (ownsSelection()) {
-            this.model = newM;
-            this.effort = nextEffort;
-            this.serviceTier = nextTier;
-          }
-          await this.refreshSessions();
-          if (ownsSelection()) this.savePrefs();
-          const label = this.modelLabel(newM);
-          if (ownsSelection()) {
-            this.toast(this.lang === "zh"
-              ? `已切到 ${label}（空会话，无需新建）`
-              : `Switched to ${label} (empty session, no fork needed)`,
-              "success", 1800);
-          }
-        } catch (e) {
+        });
+        if (!r) return abandon();
+        if (!r.ok) {
           abandon();
-          if (ownsSelection()) {
-            this.toast(this.t("slash.failed"), "error");
+          if (this.currentId === sid) {
+            let detail = "";
+            if (r.status === 409) {
+              try { detail = (await r.json()).detail || ""; } catch {}
+            }
+            this.toast(detail || this.t("slash.failed"), "error");
           }
           return false;
         }
-        return true;
-      }
-
-      // Session has history — confirm + create new.
-      const label = this.modelLabel(newM);
-      const ok = await this.confirm({
-        title: this.t("model.switch_title"),
-        body: this.t("model.switch_body", { label }),
-        okText: this.t("model.switch_new"),
-      });
-      if (!ok) {
-        if (this.currentId === sid) this.model = oldM;
-        return;
-      }
-      if (!ownsSelection()) {
-        if (this.currentId === sid) this.model = oldM;
+        if (this.tabState[sid] !== ownerState
+            || ownerState._modelPatchSeq !== seq) return false;
+        const active = this.sessions.find(s => s.id === sid);
+        if (active) {
+          active.model = newM;
+          active.effort = nextEffort;
+          active.service_tier = nextTier;
+        }
+        ownerState.effort = nextEffort;
+        ownerState.serviceTier = nextTier;
+        if (ownerState._modelExpected) {
+          ownerState._modelExpected.fallback = newM;
+        }
+        if (ownsSelection()) {
+          this.model = newM;
+          this.effort = nextEffort;
+          this.serviceTier = nextTier;
+        }
+        await this.refreshSessions();
+        if (ownsSelection()) this.savePrefs();
+        const label = this.modelLabel(newM);
+        if (ownsSelection()) {
+          this.toast(this.lang === "zh"
+            ? `已切到 ${label}`
+            : `Switched to ${label}`,
+            "success", 1800);
+        }
+      } catch (e) {
+        abandon();
+        if (ownsSelection()) {
+          this.toast(this.t("slash.failed"), "error");
+        }
         return false;
       }
-      try {
-        const r = await fetch("/api/chat/sessions", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          // open_ids: same open-tab protection as newSession() (model switching
-          // also creates a session, which triggers the empty-session recycler).
-          body: JSON.stringify({
-            name: "", model: newM, cwd: ownerWorkspace,
-            effort: "auto", service_tier: "",
-            open_ids: this.openTabIds || [],
-          }),
-        });
-        if (!r.ok) {
-          if (this.currentId === sid) this.model = oldM;
-          this.toast(this.t("slash.failed"), "error");
-          return;
-        }
-        const meta = await r.json();
-        await this.refreshSessions();
-        // Model switching creates a brand-new empty session — wire it up as a tab the
-        // same way newSession() does (tabState + openTabIds + activate).
-        const newSt = this._ensureTabState(meta.id);
-        newSt.messages.length = 0;
-        newSt._loaded = true;
-        newSt.effort = this._normalizeEffort(meta.effort);
-        newSt.serviceTier = this._normalizeServiceTier(meta.service_tier);
-        if (!this.openTabIds.includes(meta.id)) {
-          this.openTabIds.push(meta.id);
-          this._writeChatTabStore(this.openTabIds);
-        }
-        if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
-          this._captureComposerState(sid);
-          this.currentId = meta.id;
-          this._activateTabState(meta.id);
-          this.workspaceLastSession = {
-            ...this.workspaceLastSession,
-            [ownerWorkspace]: meta.id,
-          };
-        }
-        this._fetchTabUsage(meta.id);
-        this.savePrefs();
-        this.toast(this.t("model.new_session_ok", { label }), "success", 2000);
-      } catch (e) {
-        if (this.currentId === sid) this.model = oldM;
-        this.toast(this.t("slash.failed"), "error");
-      }
+      return true;
     },
 
     // ===== Effort knob =====
@@ -8410,7 +8668,7 @@ function portal() {
       } catch (_) {
         if (this.tabState[sid] !== st || st._permissionPatchSeq !== seq) return false;
         const fallback = expected.fallback;
-        if (st._permissionExpected === expected) st._permissionExpected = null;
+        if (st._permissionExpected?.seq === seq) st._permissionExpected = null;
         const current = this.sessions.find(s => s.id === sid);
         if (current) {
           current.permission = fallback;
@@ -8489,7 +8747,7 @@ function portal() {
         && this._conversationWorkspaceIsCurrent(ownerWorkspace);
       const abandon = () => {
         if (this.tabState[sid] === st && st._effortPatchSeq === seq
-            && st._effortExpected === expected) {
+            && st._effortExpected?.seq === seq) {
           st._effortExpected = null;
           st.effort = expected.fallback;
           if (this.currentId === sid) this.effort = expected.fallback;
@@ -8631,7 +8889,7 @@ function portal() {
         && this._conversationWorkspaceIsCurrent(ownerWorkspace);
       const abandon = () => {
         if (this.tabState[sid] === st && st._serviceTierPatchSeq === seq
-            && st._serviceTierExpected === expected) {
+            && st._serviceTierExpected?.seq === seq) {
           st._serviceTierExpected = null;
           st.serviceTier = expected.fallback;
           if (this.currentId === sid) this.serviceTier = expected.fallback;
@@ -8853,6 +9111,7 @@ function portal() {
         subagentThreads: [],
         subagentsLoading: false,
         subagentsLoaded: false,
+        subagentsHydratedAt: 0,
         subagentGeneration: 0,
         hookTraces: [],
         hookTracesLoading: false,
@@ -9042,6 +9301,10 @@ function portal() {
         // Single-flight guards for older/newer server windows.
         _fetchingOlder: false,
         _fetchingLater: false,
+        // Downward reveal of a historical (around/jumped) window. The error
+        // flag keeps a visible status until the next downward gesture retries.
+        _loadingLater: false,
+        _historyLaterError: false,
         // History responses may complete out of order on the same tab. Replacing
         // requests advance the epoch so older/later page responses cannot write
         // stale coordinates into a newer canonical repository.
@@ -9092,6 +9355,8 @@ function portal() {
       }
       if (st.runtimeUiRevision === undefined) st.runtimeUiRevision = "";
       if (st._fetchingLater === undefined) st._fetchingLater = false;
+      if (st._loadingLater === undefined) st._loadingLater = false;
+      if (st._historyLaterError === undefined) st._historyLaterError = false;
       if (!Number.isInteger(st._historyRequestSeq)) st._historyRequestSeq = 0;
       if (!Number.isInteger(st._historyReplaceOwner)) st._historyReplaceOwner = 0;
       if (!Number.isInteger(st._historyEpoch)) st._historyEpoch = 0;
@@ -9504,7 +9769,7 @@ function portal() {
       const st = this.tabState[sid];
       const draft = st.draft || {};
       const hasContent = !!(String(draft.input || "").trim()
-        || (draft.pendingQuotes || []).length
+        || this._sendableQuotes(draft.pendingQuotes, draft.input).length
         || (draft.pendingImages || []).length
         || (draft.pendingDocs || []).length);
       if (!hasContent) {
@@ -9512,7 +9777,7 @@ function portal() {
       }
       return "";
     },
-    _busySendDelivery(sid, activeTurnId = undefined, hasAttachments = undefined) {
+    _busySendDelivery(sid, activeTurnId = undefined) {
       if (this._normalizeBusySendMode(this.busySendMode) !== "adjust") {
         return "queue";
       }
@@ -9520,15 +9785,12 @@ function portal() {
       const turnId = activeTurnId === undefined
         ? String((st && st.activeTurnId) || "")
         : String(activeTurnId || "");
-      const draft = (st && st.draft) || {};
-      const attachmentIntent = hasAttachments === undefined
-        ? !!((draft.pendingImages || []).length || (draft.pendingDocs || []).length)
-        : !!hasAttachments;
       // Native SDK steering is bound to one immutable foreground turn and is
-      // text-only.  Every state that is already known to be ineligible should
-      // advertise ordinary FIFO immediately instead of briefly promising an
-      // adjustment that the queue endpoint must downgrade after the POST.
-      if (!st || !turnId || attachmentIntent || st.compacting
+      // text-only (the server turns attachments into on-disk paths in the
+      // steering text).  Every state that is already known to be ineligible
+      // should advertise ordinary FIFO immediately instead of briefly
+      // promising an adjustment that the queue endpoint must downgrade.
+      if (!st || !turnId || st.compacting
           || (!st.streaming && (st.backgroundActive || st._draining)) || st.parentTurnId
           || !this._pendingQueueAllowsAdjustment(st, turnId)) {
         return "queue";
@@ -9537,7 +9799,6 @@ function portal() {
     },
     async _resolveBusyAdjustmentTurnId(
       sid, st, expectedStreamOwnerToken = "", activeTurnId = "",
-      hasAttachments = false,
     ) {
       const streamOwnerToken = String(expectedStreamOwnerToken || "");
       const ownerStillCurrent = () => !!streamOwnerToken
@@ -9548,7 +9809,7 @@ function portal() {
       const accept = value => {
         const turnId = String(value || "");
         return turnId
-          && this._busySendDelivery(sid, turnId, hasAttachments) === "adjust"
+          && this._busySendDelivery(sid, turnId) === "adjust"
           ? turnId : "";
       };
       const known = accept(activeTurnId || (st && st.activeTurnId));
@@ -9562,7 +9823,7 @@ function portal() {
       // returns immediately without an extra request.
       if (!st || this.tabState[sid] !== st
           || this._normalizeBusySendMode(this.busySendMode) !== "adjust"
-          || hasAttachments || !st.streaming || st.compacting
+          || !st.streaming || st.compacting
           || st.backgroundActive || st._draining || st.parentTurnId
           || !this._pendingQueueAllowsAdjustment(st)) {
         return "";
@@ -9806,6 +10067,9 @@ function portal() {
         : ["Pending " + pending, ...(review ? ["Needs review " + review] : [])].join(" · ");
     },
     queueItemLabel(item, st = this.activeSessionPane()) {
+      if (st?._queueMutating?.['remove:' + item.id] || st?._queueMutating?.discard) {
+        return this.lang === "zh" ? "正在取消" : "Cancelling";
+      }
       const label = this.queueDeliveryLabel(item);
       if (this.queueItemIssue(item)) return label;
       const pending = this.queueDisplayItems(st).filter(row => !this.queueItemIssue(row));
@@ -9962,7 +10226,14 @@ function portal() {
         if (!r.ok) return;   // graceful: leave the current mirror untouched
         data = await r.json();
       } catch (_e) { return; }
-      if (this.tabState[sid] !== st || seq < st._queueAppliedSeq) return;
+      if (this.tabState[sid] !== st) return;
+      return this._applyQueueSnapshot(sid, data, seq);
+    },
+    _applyQueueSnapshot(sid, data, sequence = undefined) {
+      const st = this.tabState[sid];
+      if (!st || !data || !Array.isArray(data.items)) return false;
+      const seq = sequence === undefined ? ++st._queueSyncSeq : sequence;
+      if (seq < st._queueAppliedSeq) return false;
       const revision = Math.max(0, Number(data.revision) || 0);
       if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
@@ -9976,7 +10247,14 @@ function portal() {
         // id-bound resource ticket below. Expired ids (available:false) are
         // counted so the bubble can show "附件已过期".
         const previous = previousItems.get(it.id);
-        const atts = it.attachments || [];
+        // Mutation receipts contain the authoritative queue, without resolving
+        // attachment thumbnails again. Preserve previews for surviving IDs.
+        const resolvedAttachments = Array.isArray(it.attachments);
+        const sameAttachments = previous && (previous.image_ids || "") === (it.image_ids || "");
+        const atts = resolvedAttachments ? it.attachments : (sameAttachments ? [
+          ...(previous.images || []).map(im => ({ ...im, kind: "image", available: true })),
+          ...(previous.docs || []).map(doc => ({ ...doc, available: true })),
+        ] : []);
         const images = atts
           .filter(a => a.available && a.kind === "image")
           .map(a => (previous?.images || []).find(im => im.id === a.id)
@@ -9987,7 +10265,8 @@ function portal() {
             id: a.id, kind: a.kind || "text",
             name: a.name || (a.kind === "pdf" ? "document.pdf" : "file"),
           }));
-        const expiredCount = atts.filter(a => !a.available).length;
+        const expiredCount = resolvedAttachments ? atts.filter(a => !a.available).length
+          : (sameAttachments ? previous.expiredCount || 0 : 0);
         return {
           id: it.id,
           text: it.text || "",
@@ -10060,12 +10339,25 @@ function portal() {
           || this.queueActionBusy(sid, key)) return null;
       this._setQueueActionBusy(st, key, true);
       try {
-        const r = await fetch(url, options);
-        if (!r.ok) throw new Error(`queue mutation failed: HTTP ${r.status}`);
+        const r = await this._fetchWithDeadline(url, options, 8000);
+        if (!r.ok) throw Object.assign(new Error("queue mutation rejected"), { status: r.status });
+        const data = await r.json();
+        if (this.tabState[sid] === st && !this._applyQueueSnapshot(sid, data)) {
+          this._syncQueueFromServer(sid);
+        }
         return r;
       } catch (_e) {
         if (this.tabState[sid] === st) {
-          this.toast(this.lang === "zh" ? failureZh : failureEn, "error", 3500);
+          const uncertain = !_e.status;
+          const text = _e.status === 409
+            ? (this.lang === "zh" ? "暂时无法撤回，消息可能已开始处理，正在核对状态"
+              : "Withdrawal unavailable; the message may have started. Checking status")
+            : uncertain
+              ? (this.lang === "zh" ? "操作结果待确认，正在核对消息状态"
+                : "Operation not confirmed. Checking message status")
+              : (this.lang === "zh" ? failureZh : failureEn);
+          this.toast(text, uncertain ? "warn" : "error", 3500);
+          this._syncQueueFromServer(sid);
         }
         return null;
       } finally {
@@ -10157,6 +10449,8 @@ function portal() {
       const permission = this._normalizePermissionMode(sid === this.currentId ? this.permission : meta?.permission, "default");
       const record = { requestId, kind: "queue", input, ownerSid: sid, status: "ready",
         admissionOwner: st._stoppingTurnId ? "" : String(st._composerSubmitToken || ""),
+        streamOwner: st._stoppingTurnId ? "" : String(st._streamOwnerToken || ""),
+        requestedDelivery: st._stoppingTurnId ? "queue" : this._normalizeBusySendMode(this.busySendMode),
         pendingImages: images, pendingDocs: docs, pendingQuotes: quotes,
         payload: { client_message_id: requestId, text: this._composerPromptText(input, quotes),
           display_text: input, selection_quotes: quotes,
@@ -10241,9 +10535,16 @@ function portal() {
               receipt = record.status === "ready" ? { state: "not_found" }
                 : await this._submissionReceipt(ownerSid, record.requestId, record.kind);
               if (receipt.state === "not_found" && record.payload) {
-                if (!record.sentAt && record.admissionOwner
-                    && st._streamOwnerToken === record.admissionOwner
-                    && this._busySendDelivery(sid, st.activeTurnId, !!record.payload.image_ids) === "adjust") {
+                // Recover a temporary missing turn id only while its original
+                // stream still owns this pane. Never retarget an admitted retry
+                // or upgrade an explicitly queued message after settings change.
+                const sameStream = record.streamOwner && record.streamOwner === st._streamOwnerToken
+                  && (!record.payload.active_turn_id || record.payload.active_turn_id === st.activeTurnId);
+                const admittedOwner = record.admissionOwner && st._streamOwnerToken === record.admissionOwner
+                  && (!record.payload.active_turn_id || record.payload.active_turn_id === st.activeTurnId);
+                if (!record.sentAt && (record.requestedDelivery || "adjust") === "adjust"
+                    && (sameStream || admittedOwner)
+                    && this._busySendDelivery(sid, st.activeTurnId) === "adjust") {
                   record.payload.delivery = "adjust";
                   record.payload.active_turn_id = String(st.activeTurnId);
                 }
@@ -10439,9 +10740,9 @@ function portal() {
       );
       let activeTurnId = String(item.active_turn_id || "");
       const streamOwnerToken = String(item.stream_owner_token || "");
-      if (delivery !== "adjust" && !activeTurnId && !image_ids) {
+      if (delivery !== "adjust" && !activeTurnId) {
         const resolvedTurnId = await this._resolveBusyAdjustmentTurnId(
-          sid, enqueueState, streamOwnerToken, "", false,
+          sid, enqueueState, streamOwnerToken, "",
         );
         if (resolvedTurnId) {
           activeTurnId = resolvedTurnId;
@@ -10918,6 +11219,16 @@ function portal() {
         return false;
       }
       if (!status) { again(); return false; }
+      // The predecessor owns its live SDK stream. Refresh inherited timelines
+      // separately from parent-history revisions, including while the child
+      // is answering a new prompt. Reuse this poller with a bounded cadence.
+      if (st.subagentThreads.length || st.messages.some(message =>
+        message.role === "tool_use" && ["Agent", "Task"].includes(message.name)
+      )) {
+        void this.hydrateSubagents(childSid, st, {
+          quiet: true, minIntervalMs: 5000,
+        });
+      }
       const reported = Number(
         status.runtime_background_tasks_pending ?? status.background_tasks_pending,
       );
@@ -11733,7 +12044,6 @@ function portal() {
         "Could not remove the queued message; it is still queued",
       );
       if (!r) return;
-      await this._syncQueueFromServer(sid);
     },
     async editPendingQueueItem(sid, idx) {
       // Lift the queued text — AND its attachments (FIX ③) — back into the
@@ -11765,7 +12075,6 @@ function portal() {
       // draft was restored unconditionally, so re-send could execute both the
       // untouched queue item and its apparent replacement.
       if (!r) return;
-      await this._syncQueueFromServer(sid);
       if (this.tabState[sid] !== st) return;
       const draft = st.draft;
       draft.input = displayText;
@@ -11805,7 +12114,6 @@ function portal() {
         "Could not discard the queue; messages are still queued",
       );
       if (!r) return;
-      await this._syncQueueFromServer(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
     // from the backend and merge it into tabState[sid].sessionUsage. Limit
@@ -11863,6 +12171,7 @@ function portal() {
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
       this.pendingQuotes = draft.pendingQuotes;
+      this.composerQuoteFocus = null;
       this._sendWaitingForUpload = !!draft._sendWaitingForUpload;
       this.$nextTick(() => {
         if (this.currentId === id && this.$refs.chatInput) {
@@ -13074,13 +13383,17 @@ function portal() {
         return await this._pullSessionListOnce(false, requestedIds.join(","));
       }
       this._sessionListPullPromise = this._pullSessionListOnce(conditional, extraIds);
+      const pull = this._sessionListPullPromise;
       try {
-        return await this._sessionListPullPromise;
+        return await pull;
       } finally {
-        this._sessionListPullPromise = null;
+        // A confirmed deletion can detach this read and start a fresh one.
+        // Completing the old read must not release that new shared owner.
+        if (this._sessionListPullPromise === pull) this._sessionListPullPromise = null;
       }
     },
     async _pullSessionListOnce(conditional = false, extraIds = "") {
+      const generation = this._sessionListGeneration;
       const headers = { ...this.hdr() };
       if (conditional && this._sessionsEtag) {
         headers["If-None-Match"] = this._sessionsEtag;
@@ -13116,6 +13429,7 @@ function portal() {
         // but the response body fails or stalls. The next poll owns a new read.
         return false;
       }
+      if (generation !== this._sessionListGeneration) return false;
       if (r.status === 304) {
         // A transcript revision may have been deferred while its local stream
         // owned the pane. Drain it even when the list body itself is unchanged.
@@ -13124,7 +13438,14 @@ function portal() {
       }
       if (!r.ok || !data || !Array.isArray(data.sessions)) return false;
       this._applySessionRedirects(data.session_redirects || {}, data.sessions);
-      this._applySessionList(data.sessions);
+      let rows = data.sessions;
+      if (this.sessionPickerOpen && this._sessionHistoryLoaded) {
+        // A recent-window poll cannot tell us an older row was deleted. Keep
+        // the history snapshot while browsing; reopening refreshes it in full.
+        const present = new Set(rows.map(row => row.id));
+        rows = [...rows, ...this.sessions.filter(row => !present.has(row.id))];
+      }
+      this._applySessionList(rows);
       // Commit the cache validator only after its complete body is installed.
       this._sessionsEtag = r.headers.get("etag") || "";
       return true;
@@ -14264,6 +14585,12 @@ function portal() {
           showHidden: !!this.showHidden,
           openFilesCollapsed: !!this.openFilesCollapsed,
           openFilesHeight: this.openFilesHeight,
+          // Pane layout belongs to the workspace too: a docs project may want
+          // a wide preview while a code project keeps the file tree open.
+          leftOpen: !!this.leftOpen,
+          previewOpen: !!this.previewOpen,
+          leftWidth: this.leftWidth,
+          previewWidth: this.previewWidth,
         },
       };
       this._workspaceRuntimeCaches.delete(cwd);
@@ -14290,8 +14617,19 @@ function portal() {
         expanded: Array.from(this.expanded || []),
       });
     },
+    _applyWorkspaceLayout(surface = {}) {
+      if (typeof surface.leftOpen === "boolean") this.leftOpen = surface.leftOpen;
+      if (typeof surface.previewOpen === "boolean") this.previewOpen = surface.previewOpen;
+      const width = v => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+      if (width(surface.leftWidth)) this.leftWidth = surface.leftWidth;
+      if (width(surface.previewWidth)) this.previewWidth = surface.previewWidth;
+    },
     async _changeWorkspaceSurface(path) {
       if (!path || path === this.activeWorkspace) return true;
+      // Workspace navigation replaces the editor just like a file switch.
+      // Guard the shared entry point so tabs and task deep-links cannot silently
+      // discard a dirty buffer. Callers must retain the current session on cancel.
+      if (!this._confirmLoseEdits()) return false;
       const previous = this.activeWorkspace;
       if (previous) this._captureWorkspaceSurface(previous);
       this._stopFileEvents(false);
@@ -14313,7 +14651,7 @@ function portal() {
       ++this._selectedMetaSeq;
       ++this._trashLoadSeq;
       this._cancelMentionLookup();
-      ++this._paletteFileSeq;
+      this._cancelPaletteFileSearch();
       this.palette.fileResults = [];
       this.palette.fileQuery = "";
       this.palette.fileLoading = false;
@@ -14348,6 +14686,9 @@ function portal() {
         ? surface.openFilesHeight : null;
       this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
       this._pendingExpanded = Array.from(this.expanded);
+      // A workspace never captured before inherits the current layout instead
+      // of snapping to factory widths.
+      this._applyWorkspaceLayout(surface);
 
       const selected = typeof surface.previewSelected === "string"
         ? surface.previewSelected : "";
@@ -14986,7 +15327,7 @@ function portal() {
       const cwd = session && session.cwd;
       if (cwd && cwd !== this.currentWorkspacePath()
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
-        await this._changeWorkspaceSurface(cwd);
+        if (!await this._changeWorkspaceSurface(cwd)) return false;
       }
       let opened = false;
       if (!this.openTabIds.includes(id)) {
@@ -15033,7 +15374,7 @@ function portal() {
         // previews and chat together. Ignore stale/unregistered paths.
         if (workspace && workspace !== this.currentWorkspacePath()
             && this.sessionWorkspaces.some(w => w.path === workspace)) {
-          await this._changeWorkspaceSurface(workspace);
+          if (!await this._changeWorkspaceSurface(workspace)) return false;
         }
         if (!this.sessions.find(s => s.id === id)) {
           // P2: the windowed list won't include an OLD session unless we ask
@@ -15121,7 +15462,9 @@ function portal() {
 
     // Defensive helpers used by inline templates — keep them tiny so Alpine
     // never has to re-parse complex expressions on every reactive tick.
-    isTabStreaming(tid) {
+    // History rows already own reactive session metadata; reuse it instead
+    // of scanning the entire catalog for every status binding.
+    isTabStreaming(tid, session = null) {
       const st = this.tabState[tid];
       if (st && st.streaming) return true;
       // FIX ⑩: cross-device sync. tabState only knows about turns THIS browser
@@ -15129,7 +15472,7 @@ function portal() {
       // server-authoritative `active` flag on the session record (set from
       // chat.py's _active_turns). So the blue "streaming" dot lights up on
       // every device, not just the one that sent the message.
-      const s = this.sessions.find(x => x.id === tid);
+      const s = session || this.sessions.find(x => x.id === tid);
       if (!s) return false;
       // New backends distinguish a transcript-writing turn/continuation from
       // a detached background process. Fork is safe in the latter state but
@@ -15162,10 +15505,10 @@ function portal() {
             }
           : session);
     },
-    isTabBackgroundActive(tid) {
+    isTabBackgroundActive(tid, session = null) {
       const st = this.tabState[tid];
       if (st && (st.backgroundActive || st.inheritedBackgroundTaskCount > 0)) return true;
-      const s = this.sessions.find(x => x.id === tid);
+      const s = session || this.sessions.find(x => x.id === tid);
       return !!(s && s.background_active);
     },
     _setScheduledTaskState(tid, active, count = 0) {
@@ -15179,18 +15522,27 @@ function portal() {
           }
         : session);
     },
-    isTabScheduledActive(tid) {
+    isTabScheduledActive(tid, session = null) {
       const st = this.tabState[tid];
       if (st && st.scheduledDeliveryActive) return true;
-      const session = this.sessions.find(item => item.id === tid);
-      return !!(session && session.scheduled_active);
+      const s = session || this.sessions.find(item => item.id === tid);
+      return !!(s && s.scheduled_active);
     },
-    isTabRunning(tid) {
-      return this.isTabScheduledActive(tid)
-        || this.isTabBackgroundActive(tid)
-        || this.isTabStreaming(tid);
+    // Yellow dot = only detached work (background task / schedule) is alive.
+    // A turn that is actively streaming always wins and stays blue.
+    isTabDetachedOnly(tid, session = null) {
+      if (this.isTabStreaming(tid, session)) return false;
+      return this.isTabScheduledActive(tid, session)
+        || this.isTabBackgroundActive(tid, session);
     },
-    isTabUnread(tid) {
+    // Dot priority: blue (streaming) > green (unread reply) > yellow
+    // (detached background/schedule only). Yellow never hides a green dot.
+    isTabRunning(tid, session = null) {
+      if (this.isTabStreaming(tid, session)) return true;
+      return this.isTabDetachedOnly(tid, session)
+        && !this.isTabUnread(tid, session);
+    },
+    isTabUnread(tid, session = null) {
       // True when this tab's most recent turn finished while the user was
       // on a different tab AND they haven't activated this tab since.
       // The active tab can never be unread by construction (activateTab
@@ -15205,7 +15557,7 @@ function portal() {
       // already flipped false. The old `!st.streaming`-only guard let the
       // green "done" dot light up alongside the accent "in-progress" dot in
       // exactly those windows (2026-05-30 both-dots bug report).
-      if (this.isTabRunning(tid)) return false;
+      if (this.isTabStreaming(tid, session)) return false;
       const st = this.tabState[tid];
       return !!(st && st.unread);
     },
@@ -15317,8 +15669,17 @@ function portal() {
           if (!r.ok) throw new Error("HTTP " + r.status);
           const loaded = await r.json();
           const localKey = m._k;
+          // An adopted live row already has rendered HTML/stream text from
+          // its own snapshot; rebuild it from the canonical body when they
+          // differ instead of leaving the older presentation mounted.
+          const hadPresentation = m.role === "assistant"
+            && (!!m.html || m._streamPlain === true);
+          const loadedText = String((loaded && loaded.text) || "");
+          const stalePresentation = hadPresentation
+            && this._assistantPresentationDiffers(m, loadedText);
           Object.assign(m, loaded, { _k: localKey, body_state: "loaded" });
-          if (m.role === "assistant") this._queueHistoryRichRender(m, sid);
+          if (stalePresentation) this._invalidateAssistantPresentation(m, loadedText, sid);
+          else if (m.role === "assistant") this._queueHistoryRichRender(m, sid);
           if (m._is_compact_summary) delete m._compactHtml;
           return true;
         } catch (_) {
@@ -15654,6 +16015,8 @@ function portal() {
     async hydrateSubagents(sid, expectedState = null, opts = {}) {
       const state = expectedState || this._ensureTabState(sid);
       if (!sid || this.tabState[sid] !== state || state.subagentsLoading) return false;
+      const minInterval = Math.max(0, Number(opts.minIntervalMs) || 0);
+      if (minInterval && Date.now() - state.subagentsHydratedAt < minInterval) return false;
       const generation = ++state.subagentGeneration;
       state.subagentsLoading = true;
       try {
@@ -15698,6 +16061,7 @@ function portal() {
         }
         state.subagentThreads = incoming;
         state.subagentsLoaded = true;
+        state.subagentsHydratedAt = Date.now();
         return true;
       } catch (_) {
         if (!opts.quiet) {
@@ -16107,14 +16471,17 @@ function portal() {
     // compute its index once per render and cache it — the template calls
     // isLatestEditTool() once per rendered message, and the old per-call
     // forward scan made that O(n²), a real freeze contributor on long
-    // sessions. Cache key is currentId:length (same scheme as
-    // _taskSubjectMapForMessages): the only events that move the latest-edit
-    // index are appends / evictions (length changes) and tab switches
-    // (currentId changes); in-place streaming text mutations don't. Writing
-    // the cache only on key change keeps it loop-safe under Alpine.
+    // sessions. Cache key is currentId:length:firstKey:lastKey. The events
+    // that move the latest-edit index are appends, window slides and tab
+    // switches; in-place streaming text mutations don't. Once the visible
+    // window is full an append also trims the head, so length alone stays
+    // constant and would return a stale index — the first/last `_k` change
+    // on every slide, and reading them is O(1). Writing the cache only on key
+    // change keeps it loop-safe under Alpine.
     _latestEditToolIdx(paneMsgs = this.activeSessionPane().messages, tid = this.currentId) {
       const msgs = paneMsgs || [];
-      const key = (tid || "_") + ":" + msgs.length;
+      const key = (tid || "_") + ":" + msgs.length + ":"
+        + (msgs[0]?._k || "") + ":" + (msgs[msgs.length - 1]?._k || "");
       const cached = this._cachedLatestEditIdx;
       if (cached && cached.key === key) return cached.idx;
       // Last Edit/Write/MultiEdit tool_use in the list…
@@ -17163,14 +17530,19 @@ function portal() {
     //     `skillFrontmatter`. The template read `item.name` for all of them,
     //     so expanding Memory files — the 2nd largest real row — produced 14
     //     rows of blank labels. Normalised to {label, title, meta, tokens}.
+    //  4. "Autocompact buffer" (33K) is headroom the CLI RESERVES, not tokens
+    //     in the context: totalTokens/percentage exclude it, yet as a peer of
+    //     `used` it filled the bar to ~65% under a "48%" header. It is drawn
+    //     as a separate hatched "reserved" segment and row instead.
     _ctxBuildView(data) {
       const cats = Array.isArray(data && data.categories) ? data.categories : [];
-      const used = [], deferred = [];
+      const used = [], deferred = [], reserved = [];
       let freeTokens = 0;
       for (const c of cats) {
         const name = String((c && c.name) || "");
         if (/free\s*space/i.test(name)) { freeTokens += Number(c.tokens) || 0; continue; }
         if (/\(\s*deferred\s*\)/i.test(name)) { deferred.push(c); continue; }
+        if (/auto\s*-?\s*compact/i.test(name)) { reserved.push(c); continue; }
         used.push(c);
       }
       const sum = list => list.reduce((a, c) => a + (Number(c.tokens) || 0), 0);
@@ -17180,7 +17552,7 @@ function portal() {
         if (kids.length) children[c.name] = kids;
       }
       return {
-        used, deferred, freeTokens,
+        used, deferred, reserved, freeTokens,
         usedTotal: sum(used),
         deferredTotal: sum(deferred),
         children,
@@ -17263,6 +17635,18 @@ function portal() {
       this.ctxExpanded[name] = !this.ctxExpanded[name];
     },
 
+    // Ring severity. A guessed denominator must not raise an alarm: pct is
+    // computed against it, so a DUCC 1M session once showed a full red ring
+    // (182%) while the popup's measured window said 23%. Estimated usage
+    // (tokenizer-based totals) is equally unfit for a threshold.
+    ctxRingTone() {
+      const u = this.activeSessionPane().sessionUsage || {};
+      if (u.context_limit_is_estimate || u.context_is_estimate) return "";
+      const pct = u.context_used_pct || 0;
+      if (pct >= 90) return "danger";
+      if (pct >= 70) return "warn";
+      return "";
+    },
     ctxRingTitle() {
       const u = this.activeSessionPane().sessionUsage || {};
       const used = u.context_used || 0;
@@ -17667,8 +18051,8 @@ function portal() {
       if (!this.editing || !targets.includes(this.selected)) return context;
       if (!this._confirmLoseEdits()) return null;
       context.editorPath = this.selected;
-      context.editorText = this._cm ? this._cm.getValue() : this.editText;
-      context.editorRef = this._cm;
+      context.editorText = this._editorText();
+      context.editorRef = this._getCM();
       return context;
     },
     async _syncUploadedFiles(
@@ -17701,8 +18085,8 @@ function portal() {
         // afterwards, or kept typing while bytes were in flight, preserve that
         // newer buffer instead of letting upload completion silently close it.
         const sameEditor = uploadContext.editorPath === path
-          && uploadContext.editorRef === this._cm;
-        const liveText = this._cm ? this._cm.getValue() : this.editText;
+          && uploadContext.editorRef === this._getCM();
+        const liveText = this._editorText();
         if (!sameEditor || liveText !== uploadContext.editorText) {
           this.cmStatus = { ...this.cmStatus, dirty: true };
           this._previewNeedsReload = path;
@@ -17827,7 +18211,8 @@ function portal() {
       if (!q) return local;
       // Server search has answered for THIS exact query → use the full-workspace
       // result set (reaches sessions outside the recent window).
-      if (this._sessionSearchQuery === q && Array.isArray(this._sessionSearchResults)) {
+      if (!this._sessionHistoryLoaded && this._sessionSearchQuery === q
+          && Array.isArray(this._sessionSearchResults)) {
         return this._sessionSearchResults.filter(belongsHere);
       }
       // Not yet (debounce / network in flight) → instant local feedback over
@@ -17842,9 +18227,14 @@ function portal() {
     // Fired from the search input's @input.debounce.300ms. Stale-guarded: a
     // slow response for a query the box has since moved off of is dropped.
     async _searchSessions() {
+      this.sessionHistoryVisibleCount = 20;
       const raw = (this.sessionPickerSearch || "").trim();
       const q = raw.toLowerCase();
-      if (!q) { this._sessionSearchResults = null; this._sessionSearchQuery = ""; return; }
+      if (!q || this._sessionHistoryLoaded) {
+        this._sessionSearchResults = null;
+        this._sessionSearchQuery = "";
+        return;
+      }
       try {
         const r = await fetch("/api/chat/sessions?q=" + encodeURIComponent(raw),
                               { headers: this.hdr() });
@@ -17856,10 +18246,8 @@ function portal() {
         this._sessionSearchQuery = q;
       } catch (_) { /* keep the local fallback */ }
     },
-    // Bucket the filtered list into Pinned / Today / Yesterday / Last 7d /
-    // Last 30d / Earlier so a few hundred sessions stay scannable. Pinned
-    // always floats to the top; the rest are based on updated_at
-    // (epoch seconds — same source as the existing sort).
+    // History uses local calendar dates, matching the user's clock even at
+    // midnight or across daylight-saving changes. Pinned rows stay first.
     groupedFilteredSessions() {
       // The popup is x-show (not x-if), so this binding stays live even while
       // hidden — without this guard the full filter+bucket reran on every
@@ -17873,52 +18261,85 @@ function portal() {
       return this._groupedSessionsCache;
     },
     _computeGroupedFilteredSessions() {
-      const items = this.filteredSessions();
+      const timestamp = s => Number(s.updated_at || s.created_at || 0);
+      const items = this.filteredSessions().slice().sort((a, b) =>
+        Number(!!b.pinned) - Number(!!a.pinned) || timestamp(b) - timestamp(a)
+      ).slice(0, this.sessionHistoryVisibleCount);
       if (!items.length) return [];
-      const now = new Date();
-      const startOfToday = new Date(now.getFullYear(), now.getMonth(),
-                                     now.getDate()).getTime() / 1000;
-      const startOfYesterday = startOfToday - 86400;
-      const startOf7d = startOfToday - 7 * 86400;
-      const startOf30d = startOfToday - 30 * 86400;
-      const pinned = [], today = [], yest = [], week = [], month = [], earlier = [];
+      const dateKey = date => [date.getFullYear(),
+        String(date.getMonth() + 1).padStart(2, "0"),
+        String(date.getDate()).padStart(2, "0")].join("-");
+      const todayKey = dateKey(new Date());
+      const pinned = [], today = [], unknown = [];
+      const dates = new Map();
       for (const s of items) {
         if (s.pinned) { pinned.push(s); continue; }
-        const t = s.updated_at || s.created_at || 0;
-        if (t >= startOfToday) today.push(s);
-        else if (t >= startOfYesterday) yest.push(s);
-        else if (t >= startOf7d) week.push(s);
-        else if (t >= startOf30d) month.push(s);
-        else earlier.push(s);
+        const t = timestamp(s);
+        const date = new Date(t * 1000);
+        if (t <= 0 || !Number.isFinite(date.getTime())) {
+          unknown.push(s); continue;
+        }
+        const key = dateKey(date);
+        if (key === todayKey) { today.push(s); continue; }
+        if (!dates.has(key)) dates.set(key, []);
+        dates.get(key).push(s);
       }
       const zh = this.lang === "zh";
-      const searching = !!(this.sessionPickerSearch || "").trim();
-      // Groups with a limit collapse to PICKER_GROUP_LIMIT items until the
-      // user expands them. Search bypasses limits — when the user is looking
-      // for something specific they want to see everything.
-      const LIMIT = 20;
-      const _group = (key, label, arr, limited = false) => {
-        if (!arr.length) return null;
-        const expanded = searching || !limited || !!this.pickerGroupExpanded[key];
-        const visibleItems = expanded ? arr : arr.slice(0, LIMIT);
-        return { key, label, items: arr, visibleItems,
-                 limited, hiddenCount: arr.length - visibleItems.length };
-      };
+      const group = (key, label, items) => items.length ? { key, label, items } : null;
       return [
-        _group("pinned",    zh ? "置顶"       : "Pinned",       pinned),
-        _group("today",     zh ? "今天"        : "Today",        today),
-        _group("yesterday", zh ? "昨天"        : "Yesterday",    yest),
-        _group("week",      zh ? "最近 7 天"   : "Last 7 days",  week),
-        _group("month",     zh ? "最近 30 天"  : "Last 30 days", month,  true),
-        _group("earlier",   zh ? "更早"        : "Earlier",      earlier, true),
+        group("pinned", zh ? "置顶" : "Pinned", pinned),
+        group("today", zh ? "今天" : "Today", today),
+        ...[...dates.keys()].sort().reverse().map(key =>
+          group(key, key, dates.get(key))),
+        group("unknown", zh ? "日期未知" : "Unknown date", unknown),
       ].filter(Boolean);
+    },
+    loadMoreHistorySessions() {
+      this.sessionHistoryVisibleCount = Math.min(
+        this.sessionHistoryVisibleCount + 20, this.filteredSessions().length);
+    },
+    async _loadHistorySessions() {
+      if (!this.sessionPickerOpen || this.sessionHistoryLoading) return;
+      const seq = ++this._sessionHistoryRequestSeq;
+      const workspace = this.currentWorkspacePath();
+      const ownsRequest = () => this.sessionPickerOpen
+        && seq === this._sessionHistoryRequestSeq
+        && workspace === this.currentWorkspacePath();
+      this.sessionHistoryLoading = true;
+      this.sessionHistoryError = false;
+      try {
+        let data;
+        const response = await this._fetchWithDeadline(
+          "/api/chat/sessions?limit=0", { headers: this.hdr() },
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+          async response => { if (response.ok) data = await response.json(); },
+        );
+        if (!ownsRequest()) return;
+        if (!response.ok || !data || !Array.isArray(data.sessions)) {
+          this.sessionHistoryError = true;
+          return;
+        }
+        // Full reads are owned by opening the picker, never by the 10s poll.
+        // Applying through the normal path preserves optimistic names/settings
+        // and makes old rows available to open, pin, rename and delete actions.
+        this._applySessionRedirects(data.session_redirects || {}, data.sessions);
+        this._applySessionList(data.sessions);
+        this._sessionHistoryLoaded = true;
+        this._sessionsEtag = "";
+      } catch (_) {
+        if (ownsRequest()) this.sessionHistoryError = true;
+      } finally {
+        if (seq === this._sessionHistoryRequestSeq) this.sessionHistoryLoading = false;
+      }
     },
     toggleHistoryPicker(ev) {
       if (this.sessionPickerOpen) { this.closeHistoryPicker(); return; }
       if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
       const btn = ev && ev.currentTarget;
+      this.sessionHistoryVisibleCount = 20;
       this.sessionPickerOpen = true;
-      this.pickerGroupExpanded = {};  // reset collapse state on each open
+      this._sessionHistoryLoaded = false;
+      void this._loadHistorySessions();
       this._openFocusSurface(
         "history-picker", ".chat-tab-history .session-picker-pop",
         ".session-picker-search", btn, false,
@@ -17927,6 +18348,10 @@ function portal() {
     closeHistoryPicker(restoreFocus = true, cancelRename = true) {
       if (!this.sessionPickerOpen && !this._focusSurfaceState["history-picker"]) return;
       this.sessionPickerOpen = false;
+      this._sessionHistoryRequestSeq++;
+      this._sessionHistoryLoaded = false;
+      this.sessionHistoryLoading = false;
+      this.sessionHistoryError = false;
       if (cancelRename) this.pickerCancelInlineRename();
       this._closeFocusSurface("history-picker", restoreFocus);
     },
@@ -18062,17 +18487,17 @@ function portal() {
       const ok = !!(response && response.ok);
       if (!ok) {
         const canonicalSid = this._resolveSessionRedirectId(sid);
-        if (this._sessionNameExpected[canonicalSid] === expectedName) {
-          delete this._sessionNameExpected[canonicalSid];
-        }
-        // Do not undo a newer rename that completed while this request was in
-        // flight. Roll back only when our optimistic value still owns the row.
+        // Alpine proxies stored objects; compare the request sequence rather
+        // than object identity. Matching text alone cannot identify an owner
+        // when a later rename intentionally returns to the same label.
+        const owned = this._sessionNameExpected[canonicalSid]?.seq === renameSeq;
+        if (owned) delete this._sessionNameExpected[canonicalSid];
         const current = this.sessions.find(row => row.id === canonicalSid);
-        if (current && current.name === name) {
+        if (owned && current && current.name === name) {
           this._applyRenamedSession(canonicalSid, previousName);
           renamePerf.status = "rollback";
         }
-        this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
+        if (owned) this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error", 3000);
       } else {
         let payload = null;
         try { payload = await response.json(); } catch (_) { payload = null; }
@@ -18082,7 +18507,7 @@ function portal() {
           sid = responseSid;
           this._applyRenamedSession(sid, name);
         }
-        const owned = this._sessionNameExpected[sid] === expectedName;
+        const owned = this._sessionNameExpected[sid]?.seq === renameSeq;
         if (owned) {
           expectedName.settled = true;
           if (expectedName.echoed) delete this._sessionNameExpected[sid];
@@ -20057,14 +20482,18 @@ function portal() {
         // A quiet reload returns transport previews again. Never replace a body
         // the user already loaded from the canonical block endpoint with that
         // unloaded preview; block_id identifies immutable transcript content.
-        const loadedBody = existing.body_state === "loaded"
-          && m.body_state === "unloaded"
+        // A body still being fetched is equally authoritative: keep its
+        // current text and in-flight state instead of flashing the preview.
+        const retainedBodyState = m.body_state === "unloaded"
+          && (existing.body_state === "loaded" || existing.body_state === "loading")
+          ? existing.body_state : "";
+        const loadedBody = retainedBodyState
           ? {
               text: existing.text,
               preview: existing.preview,
               html: existing.html,
               bash: existing.bash,
-              body_state: "loaded",
+              body_state: retainedBodyState,
               body_available: existing.body_available,
               body_length: existing.body_length,
               body_ref: existing.body_ref,
@@ -20219,7 +20648,21 @@ function portal() {
         if (!matched || !matched._k || used.has(matched)
             || adopted.has(index)) return false;
         const canonical = result[index];
-        const canonicalText = String(canonical && canonical.text || "");
+        // A large canonical body arrives as a bounded preview (body_state
+        // "unloaded"). Body loading is normally started by the row's x-init
+        // observer, which never re-runs for an adopted, already-mounted live
+        // row — so the reply stayed cut at the preview until a hard refresh.
+        // Keep the complete live text on screen while the canonical body is
+        // fetched explicitly below; the body load then replaces it.
+        const deferredBody = matched.role === "assistant"
+          && canonical.body_state === "unloaded"
+          && !!canonical.body_available && !!canonical.body_ref;
+        const previewText = String(canonical && canonical.text || "");
+        const liveText = String(matched.text || "");
+        const keepLiveText = deferredBody
+          && liveText.length > previewText.length
+          && liveText.startsWith(previewText);
+        const canonicalText = keepLiveText ? liveText : previewText;
         const staleAssistantPresentation =
           this._assistantPresentationDiffers(matched, canonicalText);
         used.add(matched);
@@ -20243,6 +20686,7 @@ function portal() {
         } : null;
         const canonicalFields = { ...canonical };
         delete canonicalFields._k;
+        if (keepLiveText) delete canonicalFields.text;
         for (const [key, value] of Object.entries(canonicalFields)) {
           if (!this._sameCanonicalValue(matched[key], value)) matched[key] = value;
         }
@@ -20277,6 +20721,7 @@ function portal() {
           this._invalidateAssistantPresentation(
             matched, canonicalText, st._sid);
         }
+        if (deferredBody) this._loadMessageBody(matched, st._sid);
         result[index] = matched;
         return true;
       };
@@ -20884,6 +21329,67 @@ function portal() {
         st._fetchingLater = false;
       }
     },
+    // A jumped/around window ends before the latest message. When the reader
+    // scrolls toward that end, mount the next resident batch, fetching the next
+    // canonical page first when the resident repository is exhausted. Rows are
+    // appended below the viewport, so the reading position does not move.
+    // Live panes keep their own frozen-range / paused-tail semantics.
+    async _revealLaterHistory(sid) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st || st._loadingLater || st.streaming || st.es
+          || !this._messageRangeHasLater(st)) return false;
+      st._loadingLater = true;
+      st._historyLaterError = false;
+      try {
+        const range = st.messageRange;
+        if (range.visibleEnd >= st.messages.length) {
+          const loaded = await this._fetchLaterWindow(sid);
+          if (this.tabState[sid] !== st) return false;
+          if (loaded <= 0) {
+            st._historyLaterError = range.visibleEnd >= st.messages.length
+              && this._messageRangeHasLater(st);
+            return false;
+          }
+        }
+        const batch = st.messages.slice(
+          range.visibleEnd, range.visibleEnd + this._historyMountWindowSize());
+        for (const m of batch) {
+          if (m.role === "assistant" && m.text && !m.html) {
+            const html = await this._renderHistoryMessageAsync(m, () =>
+              this.tabState[sid] === st && st.messages.includes(m));
+            if (html !== null) m.html = html;
+          }
+          m._noAnim = true;
+        }
+        // Rendering yields; a replacement or live turn may own the range now.
+        if (this.tabState[sid] !== st || st.streaming || st.es || !batch.length
+            || st.messages.indexOf(batch[0]) !== range.visibleEnd) return false;
+        range.visibleEnd = Math.min(st.messages.length, range.visibleEnd + batch.length);
+        this._enforceMessageRangeInvariant(st);
+        this._scheduleHistoryViewport(st, "newer");
+        if (sid === this.currentId) {
+          this.$nextTick(() => {
+            const pane = this.tabState[sid] === st ? this._paneElement(sid) : null;
+            if (!pane) return;
+            const els = batch.map(m => m._k && pane.querySelector(
+              `.msg[data-message-key="${CSS.escape(m._k)}"]`)).filter(Boolean);
+            if (els.length) this.highlightCode(".chat-body", els);
+          });
+        }
+        return true;
+      } catch (_) {
+        st._historyLaterError = true;
+        return false;
+      } finally {
+        st._loadingLater = false;
+      }
+    },
+    _chatNearLaterEdge(el) {
+      // One viewport of lookahead keeps the next batch mounted before the
+      // reader reaches the physical end of the current window.
+      return !!el && el.scrollHeight - el.scrollTop - el.clientHeight
+        < Math.max(el.clientHeight, 200);
+    },
     // Per-message placeholder height (px) for content-visibility's
     // contain-intrinsic-size. A flat `auto 200px` (styles.css) made the
     // scrollbar jump every time a tall bubble (long text / code block) first
@@ -21038,6 +21544,8 @@ function portal() {
       sid = sid || this.currentId;
       const st = sid && this.tabState[sid];
       if (!st) return false;
+      // Explicitly returning to the latest message abandons a deferred jump.
+      if (trigger === "jump") st._historyJumpSeq = (Number(st._historyJumpSeq) || 0) + 1;
       const report = trigger !== "programmatic" || this._messageRangeHasLater(st)
         || st._pendingExternalUpdate;
       const started = performance.now();
@@ -21278,6 +21786,9 @@ function portal() {
         if (!leave) return false;
       }
       this.settings.show = false;
+      this._settingsSurfaceGeneration = (this._settingsSurfaceGeneration || 0) + 1;
+      this._settingsSaveOwner = null;
+      this.settings.saving = false;
       return true;
     },
     async discardSettingsDrafts() {
@@ -21331,6 +21842,9 @@ function portal() {
       finally { this.settings.serviceLoading = false; }
     },
     async openSettings(activePage = "") {
+      this._settingsSurfaceGeneration = (this._settingsSurfaceGeneration || 0) + 1;
+      this._settingsSaveOwner = null;
+      this.settings.saving = false;
       if (!this._settingsDraftGuard) {
         const { createSettingsDraftGuard } = await import("/static/modules/settings-drafts.mjs");
         this._settingsDraftGuard = createSettingsDraftGuard(this);
@@ -21378,6 +21892,7 @@ function portal() {
         busy_send_mode: this._normalizeBusySendMode(
           d.defaults && d.defaults.busy_send_mode,
         ),
+        subagent_model: (d.defaults && d.defaults.subagent_model) || "",
       };
       if (d.defaults && d.defaults.permission) {
         this.defaultPermission = d.defaults.permission;
@@ -22346,7 +22861,9 @@ function portal() {
           return;
         }
         this._replaceHookScope(await response.json());
-        this.cancelHookDraft();
+        // Cancel and scope changes can open another draft while saving.
+        // Only the editor that submitted this request may be dismissed.
+        if (hooks.draft === draft) this.cancelHookDraft();
         this.toast(this.lang === "zh"
           ? "Hook 已保存，下轮会话自动重载" : "Hook saved; runtime reloads next turn", "success");
       } catch (_) {
@@ -22505,10 +23022,16 @@ function portal() {
       } catch (e) { /* silent */ }
     },
     async refreshMcpList() {
+      const seq = (this._mcpListRequestSeq || 0) + 1;
+      this._mcpListRequestSeq = seq;
+      const surface = this._settingsSurfaceGeneration || 0;
       try {
         const r = await fetch("/api/settings/mcp", { headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
+        // A previous settings surface or list read cannot revert newer config.
+        if (seq !== this._mcpListRequestSeq
+          || surface !== (this._settingsSurfaceGeneration || 0)) return;
         this.settings.mcpServers = d.servers || [];
         this.settings.mcpExamples = d.examples || [];
       } catch (e) { /* silent — UI shows empty state */ }
@@ -22547,7 +23070,7 @@ function portal() {
       }
     },
     async addMcpFromDraft() {
-      const d = this.settings.mcpDraft;
+      const d = JSON.parse(JSON.stringify(this.settings.mcpDraft));
       const name = (d.name || "").trim();
       const remote = d.transport === "remote";
       // Build the request body per transport. Remote → {type:http, url,
@@ -22579,7 +23102,9 @@ function portal() {
       });
       if (r.ok) {
         this.toast(this.t("set.mcp.added"), "success", 1500);
-        this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
+        if (JSON.stringify(this.settings.mcpDraft) === JSON.stringify(d)) {
+          this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
+        }
         this.refreshMcpList();
       } else {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
@@ -22694,6 +23219,19 @@ function portal() {
         prefix: p.prefix || "",
         models: (p.models || []).join("\n"),
         api_key: "",
+      };
+    },
+
+    // Removed rows can still finish queued Alpine bindings. Resolve every
+    // field against the current map without recreating a departed draft.
+    _providerDraftField(pid, field) {
+      const app = this;
+      return {
+        get value() { return app.settings.providerDrafts[pid]?.[field] ?? ""; },
+        set value(value) {
+          const draft = app.settings.providerDrafts[pid];
+          if (draft) draft[field] = value;
+        },
       };
     },
 
@@ -22838,7 +23376,7 @@ function portal() {
     },
 
     async addProviderFromDraft() {
-      const n = this.settings.providerNew;
+      const n = JSON.parse(JSON.stringify(this.settings.providerNew));
       const body = {
         id: null,
         base_url: (n.base_url || "").trim(),
@@ -22847,7 +23385,8 @@ function portal() {
       };
       if ((n.api_key || "").trim()) body.api_key = n.api_key.trim();
       const ok = await this._submitProvider(body, null);
-      if (ok) {
+      // A completed save only clears the draft it submitted.
+      if (ok && JSON.stringify(this.settings.providerNew) === JSON.stringify(n)) {
         this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
       }
     },
@@ -23052,10 +23591,17 @@ function portal() {
         this.errToast("delete", await response.text());
         return false;
       }
+      // The successful DELETE is authoritative even if the next catalog read
+      // fails. Drop older in-flight snapshots without retaining permanent ids,
+      // so a later canonical restore remains discoverable by a fresh read.
+      ++this._sessionListGeneration;
+      this._sessionListPullPromise = null;
+      this._sessionsEtag = "";
+      this.sessions = this.sessions.filter(meta => meta.id !== sid);
+      this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
+      delete this._optimisticMetas[sid];
       this._disposeTabRuntime(sid);
       this._deletePersistedChatDraft(sid);
-      await this.refreshSessions();
-      this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
       if (this.currentId === sid) {
         const workspaceSessions = this.workspaceSessions();
         if (workspaceSessions.length === 0) {
@@ -23070,6 +23616,7 @@ function portal() {
           await this.switchSession();
         }
       }
+      await this.refreshSessions();
       this._writeChatTabStore(this.openTabIds);
       this.savePrefs();
       return true;
@@ -23190,6 +23737,41 @@ function portal() {
     },
 
     async saveSettings() {
+      if (this.settings.saving) return false;
+      const owner = {
+        id: (this._settingsSaveSequence || 0) + 1,
+        generation: this._settingsSurfaceGeneration || 0, saved: false,
+      };
+      this._settingsSaveSequence = owner.id;
+      this._settingsSaveOwner = owner.id;
+      this.settings.saving = true;
+      try {
+        return await this._saveSettingsDraft(owner);
+      } catch (error) {
+        if (owner.saved) {
+          this.toast(this.lang === "zh"
+            ? "设置已保存，刷新设置视图失败，请稍后重试"
+            : "Settings saved; refreshing the settings view failed. Please retry later.", "warn");
+        } else if (this._settingsSaveOwner === owner.id) {
+          const message = error?.name === "SyntaxError"
+            ? (this.lang === "zh" ? "无法确认保存响应，请重试" : "Could not confirm the save response. Please retry.")
+            : this._settingsReadError(error);
+          this.toast((this.lang === "zh" ? "保存失败：" : "Save failed: ") + message, "error");
+        }
+        return false;
+      } finally {
+        if (this._settingsSaveOwner === owner.id) {
+          this._settingsSaveOwner = null;
+          this.settings.saving = false;
+        }
+      }
+    },
+    async _saveSettingsDraft(owner) {
+      const ownsForm = () => this._settingsSaveOwner === owner.id
+        && owner.generation === (this._settingsSurfaceGeneration || 0);
+      const providerKeys = Object.fromEntries(Object.entries(this.settings.draftKeys || {})
+        .filter(([, value]) => value && value.trim())
+        .map(([key, value]) => [key, value.trim()]));
       const submittedDefaults = JSON.parse(JSON.stringify(this.settings.draftDefaults));
       // Flush an open Claude model-list edit first so the global Save captures
       // it too (see _flushAnthropicModelDraft). modelChanges folds into the
@@ -23199,8 +23781,10 @@ function portal() {
       try {
         modelChanges = await this._flushAnthropicModelDraft();
       } catch (e) {
-        this.toast((this.lang === "zh" ? "模型列表保存失败：" : "Model list save failed: ") + e.message, "error", 4000);
-        return;
+        if (ownsForm()) {
+          this.toast((this.lang === "zh" ? "模型列表保存失败：" : "Model list save failed: ") + e.message, "error", 4000);
+        }
+        return false;
       }
       const body = {
         default_model: submittedDefaults.model,
@@ -23208,6 +23792,7 @@ function portal() {
         busy_send_mode: this._normalizeBusySendMode(
           submittedDefaults.busy_send_mode,
         ),
+        subagent_model: submittedDefaults.subagent_model || "",
       };
       // Send every typed provider key through the generic provider_keys
       // map. Backend whitelists against PROVIDER_KEYS (derived from
@@ -23217,10 +23802,6 @@ function portal() {
       // still accepted by the backend for backwards compat, but we don't
       // emit it anymore — drift between FE k2f and backend Pydantic was
       // the exact bug that hid Kimi / Qwen / MiMo from Settings UI.
-      const providerKeys = {};
-      for (const [envK, v] of Object.entries(this.settings.draftKeys || {})) {
-        if (v && v.trim()) providerKeys[envK] = v.trim();
-      }
       if (Object.keys(providerKeys).length > 0) body.provider_keys = providerKeys;
       const r = await fetch("/api/settings", {
         method: "PUT",
@@ -23229,14 +23810,19 @@ function portal() {
       });
       if (r.ok) {
         const d = await r.json();
-        for (const [key, value] of Object.entries(providerKeys)) {
-          if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+        owner.saved = true;
+        if (ownsForm()) {
+          for (const [key, value] of Object.entries(providerKeys)) {
+            if ((this.settings.draftKeys[key] || "").trim() === value) this.settings.draftKeys[key] = "";
+          }
+          this._settingsDraftGuard?.accept("defaults", submittedDefaults);
+          this._settingsDraftGuard?.accept("keys", Object.fromEntries(
+            Object.keys(this.settings.draftKeys).map(key => [key, ""])));
+          // Other sections have their own explicit Save; never hide their drafts.
+          if (!this.settingsDirty()) this.settings.show = false;
         }
-        this._settingsDraftGuard?.accept("defaults", submittedDefaults);
-        this._settingsDraftGuard?.accept("keys", Object.fromEntries(
-          Object.keys(this.settings.draftKeys).map(key => [key, ""])));
-        // Other sections have their own explicit Save; never hide their drafts.
-        if (!this.settingsDirty()) this.settings.show = false;
+        // Confirmed writes still update global defaults/catalog after the form
+        // closes. Only the current form can accept drafts or change visibility.
         // Prefer `updated_count` (user-facing tally) over `updated.length`
         // (raw env-key count). Backend dedupes the MUSELAB_MODEL +
         // MUSELAB_DEFAULT_MODEL pair so changing the model dropdown reads
@@ -23299,7 +23885,9 @@ function portal() {
         this.fetchContextInfo();
       } else {
         const prefix = this.lang === "zh" ? "保存失败：" : "Save failed: ";
-        this.toast(prefix + (await r.text()), "error");
+        const detail = await r.text();
+        if (ownsForm()) this.toast(prefix + detail, "error");
+        return false;
       }
     },
     async deleteSession() {
@@ -23866,7 +24454,9 @@ function portal() {
         this.childCache = tree.childCache;
         this.expanded = tree.expanded;
         this._pendingExpanded = Array.from(this.expanded);
-        this._scheduleFileTreeViewportSync(true);
+        // A refreshed snapshot is still the same view; workspace changes own
+        // scroll resets. Resetting here made every manual refresh jump to top.
+        this._scheduleFileTreeViewportSync();
         const truncatedParents = Array.isArray(payload.truncated_parents)
           ? payload.truncated_parents : [];
         snapshotHasTruncatedParents = truncatedParents.length > 0;
@@ -24751,9 +25341,40 @@ function portal() {
         return ok === true;
       });
     },
-    reloadTree(options = {}) {
+    async reloadTree(options = {}) {
+      const list = this._fileTreeList();
+      const workspace = this.fileWorkspacePath();
+      const generation = this._workspaceGeneration(workspace);
+      const rowHeight = this._fileTreeRowHeight();
+      const top = list ? list.scrollTop : 0;
+      const index = Math.floor(top / rowHeight);
+      const path = this.visible[index]?.path;
+      const offset = top - index * rowHeight;
+      const left = list ? list.scrollLeft : 0;
+      let moved = false;
+      const onMove = () => { moved = true; };
+      const events = ["wheel", "touchstart", "pointerdown", "keydown"];
+      for (const event of events) list?.addEventListener(event, onMove, { passive: true });
       this._pendingExpanded = Array.from(this.expanded);
-      return this.loadRoot(options);
+      try {
+        const pending = this.loadRoot(options);
+        const seq = this._treeLoadSeq;
+        const ok = await pending;
+        await this.$nextTick();
+        if (list && !moved && this._workspaceIsCurrent(workspace)
+            && this._workspaceGenerationIsCurrent(workspace, generation)
+            && this._treeLoadSeq === seq && list === this._fileTreeList()) {
+          // Keep the first visible file at the same pixel offset even when new
+          // siblings arrive above it. If removed, retain the nearest position.
+          const nextIndex = this.visible.findIndex(node => node.path === path);
+          list.scrollTop = nextIndex < 0 ? top : nextIndex * this._fileTreeRowHeight() + offset;
+          list.scrollLeft = left;
+          this._syncFileTreeViewport(list);
+        }
+        return ok;
+      } finally {
+        for (const event of events) list?.removeEventListener(event, onMove);
+      }
     },
     // In-place removal of a node (and its descendants, if a dir) from the
     // visible flat-list. Avoids the full reloadTree() that delete used to
@@ -26150,7 +26771,10 @@ function portal() {
       return saved;
     },
     onPreviewViewportScroll() {
-      this.dismissTransientPreviewQuote(true);
+      // Scrolling hides the contextual actions, but the native range still
+      // belongs to this document. Keep it so wheel/drag selection can span
+      // multiple screens and the selected text remains available to copy.
+      this.dismissTransientPreviewQuote(false);
       clearTimeout(this._previewViewSaveTimer);
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
@@ -26333,8 +26957,21 @@ function portal() {
       }
       return bytes;
     },
-    _previewCacheDel(path) {
-      if (!this._previewCache || !path) return;
+    _previewCacheDel(path, ownerWorkspace = this.fileWorkspacePath()) {
+      if (!path) return;
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        // A completed write can belong to an inactive workspace. Its LRU
+        // snapshot must forget the old body without evicting an identically
+        // named file in the current workspace.
+        const runtime = this._workspaceRuntimeCaches.get(ownerWorkspace);
+        if (!runtime || !Array.isArray(runtime.previewCache)) return;
+        const old = runtime.previewCache.find(([cachedPath]) => cachedPath === path)?.[1];
+        runtime.previewCache = runtime.previewCache.filter(([cachedPath]) => cachedPath !== path);
+        runtime.previewCacheBytes = Math.max(0,
+          (Number(runtime.previewCacheBytes) || 0) - ((old && old._cacheBytes) || 0));
+        return;
+      }
+      if (!this._previewCache) return;
       const old = this._previewCache.get(path);
       if (old && Number.isFinite(this._previewCacheBytes)) {
         this._previewCacheBytes = Math.max(0,
@@ -26694,6 +27331,9 @@ function portal() {
       const name = String(draft.name || "").trim();
       const command = String(draft.command || "").trim();
       if (!name || !command || draft.saving) return;
+      const submitted = {
+        name: draft.name, command: draft.command, is_default: !!draft.is_default,
+      };
       draft.saving = true;
       const path = draft.id
         ? `/api/terminals/profiles/${encodeURIComponent(draft.id)}`
@@ -26720,10 +27360,18 @@ function portal() {
             })),
             data,
           ];
-      this.terminalProfileId = data.id;
-      this._terminalProfilePrefLoaded = true;
-      this.cancelTerminalProfileEdit();
-      this._scheduleSavePrefs();
+      if (this.terminalProfileEditor === draft) {
+        this.terminalProfileId = data.id;
+        this._terminalProfilePrefLoaded = true;
+        // A save acknowledges its submitted fields, not later typing. Keep
+        // the returned identity so the next save updates this same profile.
+        draft.id = data.id;
+        if (draft.name === submitted.name && draft.command === submitted.command
+            && !!draft.is_default === submitted.is_default) {
+          this.cancelTerminalProfileEdit();
+        }
+        this._scheduleSavePrefs();
+      }
     },
     async deleteTerminalProfile() {
       const draft = this.terminalProfileEditor;
@@ -27367,11 +28015,51 @@ function portal() {
         this._terminalTouchCleanup = null;
       };
     },
+    async _requestTerminalTicket(id, headers, signal) {
+      let response, data;
+      try {
+        await this._fetchWithDeadline(
+          `/api/terminals/${id}/ticket`, { method: "POST", headers, signal },
+          Math.max(100, Number(this._terminalTicketTimeoutMs) || 8000),
+          async incoming => {
+            response = incoming;
+            // These statuses cannot recover by minting another ticket. Do not
+            // wait on a stalled error body before reporting the HTTP failure.
+            if ([401, 403, 404].includes(incoming.status)) {
+              try { void incoming.body?.cancel()?.catch(() => {}); } catch (_) {}
+              return;
+            }
+            try { data = await incoming.json(); }
+            catch (error) {
+              if (error.name !== "SyntaxError") throw error;
+              data = null;
+            }
+          },
+        );
+      } catch (error) {
+        // Preserve an HTTP failure received before its body stalled. A timeout
+        // on otherwise successful headers is a transport failure and may retry.
+        const status = response && !response.ok ? response.status : 0;
+        return { ok: false, status, error: status ? `HTTP ${status}` : error.message };
+      }
+      if (!response.ok) {
+        return { ok: false, status: response.status,
+          error: data?.detail || response.statusText || `HTTP ${response.status}` };
+      }
+      return { ok: true, status: response.status, data };
+    },
     async openTerminal(id, { reconnect = false, reveal = true } = {}) {
       const row = this.terminals.find(item => item.id === id);
       if (!row) return;
+      const ownerWorkspace = this.fileWorkspacePath();
+      const requestHeaders = this.fileHdr(ownerWorkspace);
       this._teardownTerminalView();
       const seq = ++this._terminalConnectSeq;
+      const isCurrent = () => seq === this._terminalConnectSeq
+        && this.activeTerminalId === id && this.previewSurface === "terminal"
+        && this._workspaceIsCurrent(ownerWorkspace);
+      let connectionTerm = null;
+      let ticketController = null;
       this.activeTerminalId = id;
       this.previewSurface = "terminal";
       this.terminalManagerOpen = false;
@@ -27381,8 +28069,9 @@ function portal() {
       this._scheduleSavePrefs();
       try {
         await this._loadTerminalLib();
-        if (seq !== this._terminalConnectSeq || this.activeTerminalId !== id) return;
+        if (!isCurrent()) return;
         await this.$nextTick();
+        if (!isCurrent()) return;
         const host = this.$refs.terminalHost;
         if (!host) throw new Error("terminal host missing");
         host.replaceChildren();
@@ -27433,6 +28122,10 @@ function portal() {
         term.loadAddon(fit);
         term.open(host);
         this._terminal = term;
+        // Capture through Alpine's getter: it may wrap the xterm instance in
+        // a reactive proxy, so comparing with the raw constructor value fails.
+        connectionTerm = this._terminal;
+        const ownsTerminal = () => isCurrent() && this._terminal === connectionTerm;
         this._terminalFit = fit;
         this._attachTerminalTouchScroll(host, term);
         this._attachTerminalSelectionCopy(host, term);
@@ -27475,38 +28168,45 @@ function portal() {
           // single most important key in a terminal. Cmd+C / Ctrl+Shift+C only.
           const copy = key === "c"
             && (event.metaKey || (event.ctrlKey && event.shiftKey));
-          // Paste takes plain Ctrl+V as well as Cmd+V / Ctrl+Shift+V. Leaving
-          // plain Ctrl+V to xterm encoded it as \x16 (readline's literal-next)
-          // and sent that to the program instead of the clipboard text, which
-          // full-screen TUIs surface as a bogus input error. Nothing is lost:
-          // \x16 is an obscure quoted-insert prefix, while Ctrl+V is what
-          // people actually press. altKey is excluded because AltGr layouts
-          // report Ctrl+Alt for ordinary characters.
+          // Let the browser's trusted paste event reach xterm, including on
+          // LAN HTTP where navigator.clipboard is unavailable. Returning false
+          // only skips xterm's key encoding (Ctrl+V would become \x16); leaving
+          // the default event intact preserves its native paste handler.
+          // Exclude AltGr, which reports Ctrl+Alt for ordinary characters.
           const paste = key === "v" && !event.altKey
             && (event.metaKey || event.ctrlKey);
           if (copy) {
             this.terminalCopy();
             return false;
           }
-          if (paste) {
-            // Stop xterm from encoding Ctrl+V as \x16 — we read the clipboard
-            // ourselves and send the text, so the raw control byte must never
-            // reach the shell. preventDefault also keeps the browser from
-            // dropping the text into xterm's hidden helper textarea.
-            event.preventDefault();
-            this.terminalPaste();
-            return false;
-          }
+          if (paste) return false;
           return true;
         });
         if (reveal || !this._isMobileLayout()) term.focus();
 
-        const ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
-          method: "POST",
-          headers: this.fileHdr(),
-        });
-        if (!ticketResponse.ok) throw new Error(ticketResponse.error || "ticket failed");
-        if (seq !== this._terminalConnectSeq) return;
+        this._terminalTicketAbort = new AbortController();
+        ticketController = this._terminalTicketAbort;
+        const ownsTicket = () => ownsTerminal()
+          && this._terminalTicketAbort === ticketController
+          && !ticketController.signal.aborted;
+        let ticketResponse;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (!ownsTicket()) return;
+          // Only mint a fresh connection ticket: retrying must never allocate
+          // another PTY or restart the process after a transient proxy failure.
+          ticketResponse = await this._requestTerminalTicket(
+            id, requestHeaders, ticketController.signal,
+          );
+          if (!ownsTicket()) return;
+          if (ticketResponse.ok) break;
+          const transient = [0, 502, 503, 504].includes(ticketResponse.status);
+          if (!transient || attempt === 2) {
+            throw new Error(ticketResponse.error || `HTTP ${ticketResponse.status}`);
+          }
+          this.terminalConnection = reconnect ? "reconnecting" : "connecting";
+          await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 250 : 750));
+        }
+        if (!ownsTicket()) return;
         const scheme = location.protocol === "https:" ? "wss:" : "ws:";
         const socket = new WebSocket(
           `${scheme}//${location.host}/api/terminals/${encodeURIComponent(id)}/ws`,
@@ -27566,14 +28266,21 @@ function portal() {
           if (seq === this._terminalConnectSeq) this.terminalConnection = "reconnecting";
         };
       } catch (error) {
-        if (seq !== this._terminalConnectSeq) return;
+        if (!isCurrent() || (connectionTerm && this._terminal !== connectionTerm)) return;
         this.terminalConnection = "error";
         this.toast((this.lang === "zh" ? "终端连接失败：" : "Terminal connection failed: ")
           + error.message, "error");
+      } finally {
+        if (ticketController && this._terminalTicketAbort === ticketController) {
+          this._terminalTicketAbort = null;
+        }
       }
     },
     _teardownTerminalView() {
       ++this._terminalConnectSeq;
+      const ticketController = this._terminalTicketAbort;
+      this._terminalTicketAbort = null;
+      if (ticketController) ticketController.abort();
       clearTimeout(this._terminalReconnectTimer);
       this._terminalReconnectTimer = null;
       if (this._terminalResizeObserver) this._terminalResizeObserver.disconnect();
@@ -27634,10 +28341,18 @@ function portal() {
       }
     },
     async terminalPaste() {
+      const term = this._terminal, socket = this._terminalSocket;
+      const connectSeq = this._terminalConnectSeq;
+      if (!term || !socket || socket.readyState !== WebSocket.OPEN) return;
+      const isOwner = () => this._terminal === term && this._terminalSocket === socket
+        && this._terminalConnectSeq === connectSeq && socket.readyState === WebSocket.OPEN;
       try {
         const text = await navigator.clipboard.readText();
-        if (text) this._terminalSend(text);
+        // Clipboard permission prompts may outlive a terminal switch/reconnect.
+        // xterm owns newline normalization and the shell's bracketed-paste mode.
+        if (text && isOwner()) term.paste(text);
       } catch (_) {
+        if (!isOwner()) return;
         this.toast(this.lang === "zh"
           ? "剪贴板访问受限，请按 Ctrl+V 或 Ctrl+Shift+V"
           : "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V",
@@ -27808,7 +28523,7 @@ function portal() {
         // it to "md" once rawText is set. Setting it early would briefly show
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path),
+        const r = await fetch(this._fileReadUrl("read", n.path),
                               { headers: this.fileHdr(), signal: controller.signal });
         if (_stale()) return false;
         if (r.ok) {
@@ -27857,13 +28572,18 @@ function portal() {
         reusedHtmlFrame = this._touchHtmlPreviewFrame(n.path);
         this.previewMode = "html";
       }
-      else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) this.previewMode = "img";
-      else if (ext === "pdf") this.previewMode = "pdf";
+      else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "pdf"].includes(ext)) {
+        // Mount only after authorization is ready. An image mounted with the
+        // temporary about:blank URL fires error before its ticket arrives.
+        await this._mintPreviewTicket(n.path, controller.signal);
+        if (_stale()) return false;
+        this.previewMode = ext === "pdf" ? "pdf" : "img";
+      }
       else if (["xlsx", "xlsm", "xltx", "xltm"].includes(ext)) {
         // xlsx preview: backend serializes the workbook into capped per-sheet
         // string matrices so the frontend just renders <table>s. No formula
         // evaluation; cells show the last-cached value.
-        const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
+        const r = await fetch(this._fileReadUrl("xlsx", n.path),
                               { headers: this.fileHdr(), signal: controller.signal });
         if (_stale()) return false;
         if (r.ok) {
@@ -27911,7 +28631,7 @@ function portal() {
         // `opts.readUrl` lets callers point at a non-workspace backend route
         // (e.g. bg-task .output files under /tmp via /api/chat/task-output)
         // that the workspace-scoped /api/files/read can't reach.
-        const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
+        const readUrl = opts.readUrl || (this._fileReadUrl("read", n.path));
         const r = await fetch(readUrl, {
           headers: this.fileHdr(), signal: controller.signal,
         });
@@ -27958,6 +28678,34 @@ function portal() {
       }
       return loadOk;
     },
+    _renderSpreadsheetRows(element, rows, rowOffset = 0, header = false) {
+      // Preview responses replace read-only row matrices as a whole. One
+      // effect per grid avoids tens of thousands of cell-level bindings that
+      // block painting on a supported 500 × 50 worksheet.
+      const fragment = document.createDocumentFragment();
+      const tag = header ? "th" : "td";
+      const values = _rawAlpine(rows) || [];
+      for (let index = 0; index < values.length; index++) {
+        const row = document.createElement("tr");
+        const number = document.createElement(tag);
+        number.className = "xlsx-rownum";
+        number.textContent = header ? "" : rowOffset + index + 1;
+        row.appendChild(number);
+        for (const value of values[index]) {
+          const cell = document.createElement(tag);
+          // Match x-text's native DOM conversion and x-bind:title's removal
+          // of null/undefined/false. Cell contents never become markup.
+          cell.textContent = value;
+          if (value != null && value !== false) cell.title = value;
+          row.appendChild(cell);
+        }
+        fragment.appendChild(row);
+      }
+      // These plain nodes have no Alpine effects or listeners to clean up.
+      // Keep its observer from walking the entire grid during each replacement;
+      // the surrounding tbody/thead effect keeps its normal Alpine lifecycle.
+      Alpine.mutateDom(() => element.replaceChildren(fragment));
+    },
     async csvLoadPage(requestedOffset = this.csvOffset) {
       if (!this.csvPath) return false;
       // A newly-opened CSV must supersede an older in-flight CSV instead of
@@ -27973,7 +28721,7 @@ function portal() {
       const _csvStale = () => loadSeq !== this._csvLoadSeq
         || this.csvPath !== reqPath || this.selected !== reqPath;
       try {
-        const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
+        const url = this._fileReadUrl("csv", reqPath)
                     + `&offset=${reqOffset}&limit=${this.csvLimit}`;
         const r = await fetch(url, { headers: this.fileHdr(), signal: controller.signal });
         if (_csvStale()) return false;
@@ -28093,6 +28841,7 @@ function portal() {
       return true;
     },
     async revealInTree(path, opts = {}) {
+      if (this._isExternalFilePath(path)) return false;
       const workspace = opts.ownerWorkspace || this.fileWorkspacePath();
       const generation = this._workspaceGeneration(workspace);
       if (!path || !this._workspaceIsCurrent(workspace)) return false;
@@ -28155,8 +28904,11 @@ function portal() {
           this._clearPreviewState();
         } else {
           const next = this.tabs[Math.min(idx, this.tabs.length - 1)];
-          this.openByPath(next.path);
-          return;   // openByPath → openFile → savePrefs runs there
+          // The close action already confirmed discarding this buffer. Asking
+          // again after removing its tab could leave a closed file selected.
+          // Preserve the adjacent tab's temporary/pinned state as well.
+          this.openFile(next, { preview: !!next.preview, editsConfirmed: true });
+          return;   // openFile schedules the updated preview preferences
         }
       }
       this.savePrefs();
@@ -28235,7 +28987,7 @@ function portal() {
         && this.selected === path;
       if (!path) { this.selectedMeta = null; return; }
       try {
-        const r = await fetch("/api/files/stat?path=" + encodeURIComponent(path),
+        const r = await fetch(this._fileReadUrl("stat", path),
                               { headers: this.fileHdr() });
         if (!isOwner()) return;
         if (!r.ok) { this.selectedMeta = null; return; }
@@ -28251,7 +29003,8 @@ function portal() {
     fileBreadcrumb(path) {
       const parts = String(path || "").split("/").filter(Boolean);
       parts.pop(); // the pane title already owns the basename
-      const root = this.lang === "zh" ? "根目录" : "Workspace root";
+      const root = this._isExternalFilePath(path) ? "/"
+        : (this.lang === "zh" ? "根目录" : "Workspace root");
       if (!parts.length) return root;
       const tail = parts.slice(-3);
       return `${parts.length > 3 ? "…" : root} › ${tail.join(" › ")}`;
@@ -28350,7 +29103,7 @@ function portal() {
         await this._fetchWithDeadline("/api/files/preview-ticket", {
           method: "POST",
           headers: { ...this.fileHdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ path: p }),
+          body: JSON.stringify(this._fileReadRequest(p)),
           signal,
         }, this.REQUEST_DEADLINE_MS, async response => {
           if (!response.ok) throw new Error(`preview ticket failed (${response.status})`);
@@ -28402,7 +29155,7 @@ function portal() {
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
-      return "/api/files/raw?path=" + encodeURIComponent(p)
+      return this._fileReadUrl("raw", p)
         + "&ticket=" + encodeURIComponent(ticket) + workspace + v
         + (opts.preview ? "&preview=1" : "");
     },
@@ -28498,22 +29251,28 @@ function portal() {
     },
     async downloadFile(p) {
       if (!p) return;
+      // Lazy helpers and ticket requests can outlive a workspace switch. Keep
+      // both the credential and final URL bound to the workspace clicked.
+      const ownerWorkspace = this.fileWorkspacePath();
+      const headers = { ...this.fileHdr(ownerWorkspace), "Content-Type": "application/json" };
+      const request = this._fileReadRequest(p);
+      const readUrl = this._fileReadUrl("download", p);
       let capabilities;
       let ticket;
       try {
         capabilities = await this._fileCapabilities();
         ticket = await capabilities.mintTicket(
           "/api/files/download-ticket",
-          { ...this.fileHdr(), "Content-Type": "application/json" },
-          { path: p },
+          headers,
+          request,
         );
       } catch (error) {
         this.errToast("generic", String((error && error.message) || error));
         return;
       }
-      const workspace = this.fileWorkspacePath()
-        ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      const url = "/api/files/download?path=" + encodeURIComponent(p)
+      const workspace = ownerWorkspace
+        ? "&workspace=" + encodeURIComponent(ownerWorkspace) : "";
+      const url = readUrl
         + "&ticket=" + encodeURIComponent(ticket) + workspace;
       capabilities.triggerDownload(url, p.split("/").pop() || "download");
     },
@@ -29389,18 +30148,255 @@ function portal() {
       };
     },
 
+    // Inline quotes: the composer carries a plain-text marker such as
+    // "[引用1]" at the caret where the quote was taken. On send, the first
+    // occurrence of each marker is replaced by the quote content, so the
+    // agent receives every quote at the exact position the user placed it.
+    // Later occurrences stay as plain references to the same id.
+    _quoteLabelNumber(quote) {
+      const match = /(\d+)/.exec(String((quote && quote.label) || ""));
+      return match ? Number(match[1]) : 0;
+    },
+
+    _nextQuoteLabel(quotes) {
+      const used = new Set((quotes || []).map(q => this._quoteLabelNumber(q)));
+      let n = 1;
+      while (used.has(n)) n += 1;
+      return this.lang === "zh" ? `[引用${n}]` : `[Quote ${n}]`;
+    },
+
+    _inlineQuoteSourceAttr(quote) {
+      const source = quote.source === "chat"
+        ? this.previewQuoteSourceName(quote)
+        : String(quote.path || this.selected || "");
+      return source.replace(/["\n\r]/g, "'");
+    },
+
+    _inlineQuoteBlock(quote) {
+      const id = this._quoteLabelNumber(quote);
+      const truncated = quote.truncated ? ' truncated="true"' : "";
+      const text = String(quote.text || "").replace(/<\/quote>/gi, "<\\/quote>");
+      return `<quote id="${id}" source="${this._inlineQuoteSourceAttr(quote)}"${truncated}>\n`
+        + `${text}\n</quote>`;
+    },
+
+    // First occurrence offset of every labelled quote's marker in `body`.
+    _inlineQuotePlacements(body, quotes) {
+      const text = String(body || "");
+      const placements = [];
+      for (const quote of quotes || []) {
+        if (!quote || !quote.label || !String(quote.text || "").trim()) continue;
+        const at = text.indexOf(quote.label);
+        if (at >= 0) placements.push({ quote, at, end: at + quote.label.length });
+      }
+      return placements.sort((a, b) => a.at - b.at);
+    },
+
+    quoteIsPlaced(quote, input = this.input) {
+      return !!(quote && quote.label && String(input || "").includes(quote.label));
+    },
+
+    // An inline quote lives only as its marker in the text: once the marker
+    // is deleted the quote is gone, exactly like deleted text. Legacy quotes
+    // (no label) keep their chip and are still sent.
+    _sendableQuotes(quotes, input) {
+      return (quotes || []).filter(q => q && (!q.label || this.quoteIsPlaced(q, input)));
+    },
+
+    _pruneUnplacedQuotes(draft) {
+      if (!draft || !Array.isArray(draft.pendingQuotes)) return;
+      const keep = this._sendableQuotes(draft.pendingQuotes, draft.input);
+      if (keep.length !== draft.pendingQuotes.length) {
+        draft.pendingQuotes.splice(0, draft.pendingQuotes.length, ...keep);
+      }
+    },
+
+    composerQuoteChips() {
+      return (this.pendingQuotes || []).filter(q => q && !q.label);
+    },
+
+    // Every occurrence of a pending quote marker in `value`, as [at, end).
+    _quoteMarkerSpans(value) {
+      const spans = [];
+      for (const quote of this.pendingQuotes || []) {
+        const label = quote && quote.label;
+        if (!label) continue;
+        for (let at = value.indexOf(label); at >= 0; at = value.indexOf(label, at + 1)) {
+          spans.push({ at, end: at + label.length });
+        }
+      }
+      return spans;
+    },
+
+    composerQuoteMirrorHtml() {
+      const value = String(this.input || "");
+      const spans = this._quoteMarkerSpans(value).sort((a, b) => a.at - b.at);
+      if (!spans.length) return "";
+      let html = "";
+      let cursor = 0;
+      for (const { at, end } of spans) {
+        if (at < cursor) continue;
+        html += this.escape(value.slice(cursor, at))
+          + `<mark class="chat-input-quote-mark">${this.escape(value.slice(at, end))}</mark>`;
+        cursor = end;
+      }
+      // Trailing newline needs a glyph so the mirror's last line has height.
+      return html + this.escape(value.slice(cursor)) + "\u200b";
+    },
+
+    // Keep the mirror's box, text metrics and scroll identical to the
+    // textarea so every highlight sits exactly under its marker.
+    syncComposerQuoteMirror() {
+      const ta = this.$refs && this.$refs.chatInput;
+      const mirror = this.$refs && this.$refs.chatInputMirror;
+      if (!ta || !mirror || !mirror.firstChild) return;
+      const cs = getComputedStyle(ta);
+      for (const prop of ["fontFamily", "fontSize", "fontWeight", "fontStyle",
+        "fontVariant", "letterSpacing", "wordSpacing", "lineHeight", "textIndent",
+        "tabSize", "textTransform", "paddingTop", "paddingLeft", "paddingBottom"]) {
+        mirror.style[prop] = cs[prop];
+      }
+      // The textarea's scrollbar narrows its text area; mirror that width.
+      const scrollbar = Math.max(0, ta.offsetWidth - ta.clientWidth);
+      mirror.style.paddingRight = `calc(${cs.paddingRight} + ${scrollbar}px)`;
+      mirror.style.width = ta.offsetWidth + "px";
+      mirror.style.height = ta.offsetHeight + "px";
+      mirror.scrollTop = ta.scrollTop;
+    },
+
+    updateComposerQuoteFocus(ev) {
+      const ta = ev && ev.target;
+      if (!ta || typeof ta.value !== "string" || !Number.isInteger(ta.selectionEnd)) {
+        this.composerQuoteFocus = null;
+        return;
+      }
+      const caret = ta.selectionEnd;
+      let found = null;
+      for (const quote of this.pendingQuotes || []) {
+        const label = quote && quote.label;
+        if (!label) continue;
+        for (let at = ta.value.indexOf(label); at >= 0; at = ta.value.indexOf(label, at + 1)) {
+          if (caret >= at && caret <= at + label.length) { found = quote; break; }
+        }
+        if (found) break;
+      }
+      if (this.composerQuoteFocus !== found) this.composerQuoteFocus = found;
+    },
+
+    // Backspace/Delete treat a quote marker as one unit. Only the selection is
+    // adjusted; the native deletion still runs, so undo and input events stay
+    // intact.
+    onQuoteMarkerKeydown(ev) {
+      if (!ev || (ev.key !== "Backspace" && ev.key !== "Delete")) return;
+      if (ev.isComposing || ev.keyCode === 229) return;
+      const ta = ev.target;
+      if (!ta || typeof ta.value !== "string") return;
+      const spans = this._quoteMarkerSpans(ta.value);
+      if (!spans.length) return;
+      let start = ta.selectionStart;
+      let end = ta.selectionEnd;
+      if (!Number.isInteger(start) || !Number.isInteger(end)) return;
+      if (start === end) {
+        const back = ev.key === "Backspace";
+        const hit = spans.find(sp => (back
+          ? start > sp.at && start <= sp.end
+          : start >= sp.at && start < sp.end));
+        if (!hit) return;
+        start = hit.at;
+        end = hit.end;
+      } else {
+        for (const sp of spans) {
+          if (sp.at < end && sp.end > start) {
+            start = Math.min(start, sp.at);
+            end = Math.max(end, sp.end);
+          }
+        }
+        if (start === ta.selectionStart && end === ta.selectionEnd) return;
+      }
+      ta.setSelectionRange(start, end);
+    },
+
     _composerPromptText(input, quotes) {
-      const blocks = (quotes || [])
-        .filter(q => q && String(q.text || "").trim())
-        .map(q => this._previewQuoteBlock(q));
       const body = String(input || "").trim();
-      if (body) blocks.push(body);
+      const valid = (quotes || []).filter(q => q && String(q.text || "").trim());
+      // Single pass over the user's own text: quote content inserted for one
+      // marker is never rescanned for another marker.
+      const placements = this._inlineQuotePlacements(body, valid);
+      const placed = new Set(placements.map(p => p.quote));
+      let composed = "";
+      let cursor = 0;
+      for (const { quote, at, end } of placements) {
+        composed += body.slice(cursor, at) + this._inlineQuoteBlock(quote);
+        cursor = end;
+      }
+      composed += body.slice(cursor);
+      // Legacy quotes without a marker are still sent ahead of the message;
+      // an inline quote whose marker was deleted is not sent at all.
+      const blocks = valid
+        .filter(q => !q.label)
+        .map(q => this._previewQuoteBlock(q));
+      if (composed) blocks.push(composed);
       return blocks.join("\n\n").trim();
     },
 
     userSelectionQuotes(message) {
       return Array.isArray(message && message.selectionQuotes)
         ? message.selectionQuotes : [];
+    },
+
+    // Quote cards above a user bubble: inline quotes render inside the text.
+    userQuoteCards(message) {
+      return this.userSelectionQuotes(message).filter(q => q && !q.label);
+    },
+
+    quoteChipName(quote) {
+      const n = this._quoteLabelNumber(quote);
+      const name = this.previewQuoteSourceName(quote);
+      if (!n) return name;
+      return (this.lang === "zh" ? `引用${n}` : `Quote ${n}`) + " · " + name;
+    },
+
+    _inlineQuotePillHtml(n, sourceName, text, truncated) {
+      const excerpt = String(text || "").replace(/\s+/g, " ").trim();
+      const short = excerpt.length > 40 ? excerpt.slice(0, 40).trimEnd() + "…" : excerpt;
+      const full = excerpt.length > 600 ? excerpt.slice(0, 600) + "…" : excerpt;
+      const label = (this.lang === "zh" ? `引用${n}` : `Quote ${n}`)
+        + (sourceName ? " · " + sourceName : "");
+      return `<span class="user-msg-inline-quote" title="${this.escape(full + (truncated ? " …" : ""))}">`
+        + `<span class="user-msg-inline-quote-label">${this.escape(label)}</span>`
+        + `<span class="user-msg-inline-quote-text">${this.escape(short)}</span></span>`;
+    },
+
+    // User bubble HTML with inline quotes rendered as pills. Live/queued
+    // messages carry displayText + selectionQuotes (markers); reloaded
+    // history only has the composed prompt, so its <quote> tags are parsed.
+    userMessageHtml(message) {
+      const text = this.userVisibleText(message);
+      const nl = s => this.escape(s).replace(/\n/g, "<br>");
+      const placements = this._inlineQuotePlacements(text, this.userSelectionQuotes(message));
+      if (placements.length) {
+        let html = "";
+        let cursor = 0;
+        for (const { quote, at, end } of placements) {
+          html += nl(text.slice(cursor, at)) + this._inlineQuotePillHtml(
+            this._quoteLabelNumber(quote), this.previewQuoteSourceName(quote),
+            quote.text, quote.truncated);
+          cursor = end;
+        }
+        return html + nl(text.slice(cursor));
+      }
+      const tag = /<quote id="(\d+)" source="([^"\n]*)"( truncated="true")?>\n([\s\S]*?)\n<\/quote>/g;
+      let html = "";
+      let cursor = 0;
+      let match;
+      while ((match = tag.exec(text)) !== null) {
+        const source = match[2];
+        const name = source.includes("/") ? (source.split("/").pop() || source) : source;
+        html += nl(text.slice(cursor, match.index)) + this._inlineQuotePillHtml(
+          match[1], name, match[4].replace(/<\\\/quote>/gi, "</quote>"), !!match[3]);
+        cursor = match.index + match[0].length;
+      }
+      return cursor ? html + nl(text.slice(cursor)) : nl(text);
     },
 
     userVisibleText(message) {
@@ -29437,33 +30433,54 @@ function portal() {
       }
       this._captureComposerState(this.currentId);
       const draft = this._ensureTabState(this.currentId).draft;
-      if (draft.pendingQuotes.length >= 4) {
-        this.toast(
-          this.lang === "zh" ? "一次最多引用 4 段内容" : "Up to 4 quotes per message",
-          "warn", 2200,
-        );
-        return false;
-      }
-      draft.pendingQuotes.push(this._selectionQuoteSnapshot());
+      this._pruneUnplacedQuotes(draft);
+      const quote = this._selectionQuoteSnapshot();
+      quote.label = this._nextQuoteLabel(draft.pendingQuotes);
+      draft.pendingQuotes.push(quote);
       this.pendingQuotes = draft.pendingQuotes;
+      // Insert the marker where the composer caret was (textareas keep their
+      // selection range after blur); fall back to the end of the draft.
+      const ta = this.$refs.chatInput;
+      const current = this.input || "";
+      const domOwned = ta && ta.value === current;
+      const start = domOwned && Number.isInteger(ta.selectionStart)
+        ? ta.selectionStart : current.length;
+      const end = domOwned && Number.isInteger(ta.selectionEnd)
+        ? Math.max(start, ta.selectionEnd) : start;
+      const next = current.slice(0, start) + quote.label + current.slice(end);
+      const caret = start + quote.label.length;
+      this._setChatInput(next);
+      draft.input = next;
+      this._persistChatDraft(this.currentId, next);
       this.dismissPreviewQuote(true);
       if (this._isMobileLayout()) this.setMobileTab("chat");
       this.$nextTick(() => {
+        const input = this.$refs.chatInput;
+        if (input) {
+          this.autoGrow(input);
+          try { input.setSelectionRange(caret, caret); } catch (_) {}
+          this.updateComposerQuoteFocus({ target: input });
+        }
         // Do not let this delayed convenience-focus steal a newer selection.
         // A fast user (or a busy renderer) can begin selecting another bubble
         // before Alpine reaches this tick; focusing the textarea would then
         // collapse that fresh range and the selection actions never appear.
         const selection = window.getSelection && window.getSelection();
         if (selection && selection.rangeCount && !selection.isCollapsed) return;
-        const ta = this.$refs.chatInput;
-        if (ta) ta.focus();
+        if (input) input.focus();
       });
       return true;
     },
 
     removePendingQuote(index) {
       if (!Number.isInteger(index) || index < 0) return;
-      this.pendingQuotes.splice(index, 1);
+      const [quote] = this.pendingQuotes.splice(index, 1);
+      // Drop the quote's marker(s) too, so no dangling "[引用N]" reaches the agent.
+      if (quote && quote.label && (this.input || "").includes(quote.label)) {
+        const next = this.input.split(quote.label).join("");
+        this._setChatInput(next);
+        this._captureComposerState(this.currentId);
+      }
     },
 
     openPreviewSelectionAsk() {
@@ -30086,31 +31103,31 @@ function portal() {
     // the user opens edit mode on a file preview. Most read-only browsing
     // never needs it.
     async _loadCodemirror() {
-      if (window.CodeMirror) return;
       if (this._cmLoadPromise) return this._cmLoadPromise;
-      // Inject one asset (css/js), de-duping against an already-present tag.
-      const inject = (path) => new Promise((resolve, reject) => {
-        const isCss = path.split(/[?#]/, 1)[0].endsWith(".css");
+      const inject = path => {
         const src = this._staticAssetUrl(path);
-        const sel = isCss
-          ? `link[href="${src}"]` : `script[src="${src}"]`;
-        if (document.querySelector(sel)) {
-          // Already in flight/loaded from a prior attempt — give it a beat.
-          const t0 = Date.now();
-          (function wait() {
-            if (isCss || window.CodeMirror) return resolve();
-            if (Date.now() - t0 > 5000) return resolve(); // don't hang the chain
-            setTimeout(wait, 50);
-          })();
-          return;
-        }
-        const node = isCss
-          ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
-          : Object.assign(document.createElement("script"), { src });
-        node.onload = resolve;
-        node.onerror = () => reject(new Error("load failed: " + src));
-        document.head.appendChild(node);
-      });
+        if (museEditorAssets.has(src)) return museEditorAssets.get(src);
+        const promise = new Promise((resolve, reject) => {
+          const isCss = path.endsWith(".css");
+          const node = isCss
+            ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
+            : Object.assign(document.createElement("script"), { src });
+          // Remote/tunneled cold downloads can exceed 15 seconds. Preserve
+          // the bounded retry path without rejecting an otherwise healthy load.
+          const timer = setTimeout(() => fail(), 60000);
+          const fail = () => {
+            clearTimeout(timer);
+            node.remove();
+            museEditorAssets.delete(src);
+            reject(new Error("Editor asset unavailable"));
+          };
+          node.onload = () => { clearTimeout(timer); resolve(); };
+          node.onerror = fail;
+          document.head.appendChild(node);
+        });
+        museEditorAssets.set(src, promise);
+        return promise;
+      };
       // Was: 18 files loaded SEQUENTIALLY (one .then chain). Over a remote /
       // tunneled link each round-trip stacks — first edit-mode entry took
       // 5-6 s on a high-latency PWA connection. CodeMirror core is the only
@@ -30119,14 +31136,14 @@ function portal() {
       // Theme/base CSS have no JS dependency and ride along concurrently. This
       // collapses ~18 serial RTTs into ~2.
       this._cmLoadPromise = (async () => {
-        const cssP = Promise.all([
+        await Promise.all([
           inject("/static/vendor/cm/codemirror.min.css"),
           inject("/static/vendor/cm/theme/material-darker.min.css"),
+          inject("/static/vendor/cm/codemirror.min.js"),
         ]);
-        await inject("/static/vendor/cm/codemirror.min.js");
         if (!window.CodeMirror) throw new Error("CodeMirror core loaded but global missing");
+        await inject("/static/vendor/cm/addon/mode/simple.min.js");
         await Promise.all([
-          inject("/static/vendor/cm/addon/mode/simple.min.js"),
           inject("/static/vendor/cm/addon/edit/closebrackets.min.js"),
           inject("/static/vendor/cm/addon/edit/matchbrackets.min.js"),
           inject("/static/vendor/cm/mode/meta.min.js"),
@@ -30141,7 +31158,6 @@ function portal() {
           inject("/static/vendor/cm/mode/shell/shell.min.js"),
           inject("/static/vendor/cm/mode/go/go.min.js"),
           inject("/static/vendor/cm/mode/rust/rust.min.js"),
-          cssP,
         ]);
       })().catch(e => {
         this._cmLoadPromise = null;   // allow retry next call
@@ -30491,7 +31507,7 @@ function portal() {
       if (workspace) headers["X-Muselab-Workspace"] = encodeURIComponent(workspace);
       let node;
       try {
-        const response = await fetch("/api/files/stat?path=" + encodeURIComponent(path), { headers });
+        const response = await fetch(this._fileReadUrl("stat", path), { headers });
         if (!response.ok) return null;
         node = await response.json();
       } catch (_) { return null; }
@@ -31134,7 +32150,7 @@ function portal() {
       // directory without changing anything).
       if (srcParent === targetDir) return;
       // Dropping a directory onto itself or anywhere in its own subtree
-      // would create a cycle. Backend would 422 on rename but we'd
+      // would create a cycle. Backend rejects the rename but we'd
       // rather not even attempt it — feedback is faster client-side.
       if (srcPath === targetDir
           || (targetDir + "/").startsWith(srcPath + "/")) {
@@ -31433,7 +32449,7 @@ function portal() {
 
     // ===== edit =====
     isEditable(path) {
-      if (!path) return false;
+      if (!path || this._isExternalFilePath(path)) return false;
       const name = path.split("/").pop().toLowerCase();
       const ext = name.includes(".") ? name.split(".").pop() : name;
       return EDITABLE_EXT.has(ext);
@@ -31636,11 +32652,11 @@ function portal() {
       // rAF-throttled so a continuous drag stays smooth (one refresh/frame).
       let _cmRefreshPending = false;
       const refreshCmSoon = () => {
-        if (!this.editing || !this._cm || _cmRefreshPending) return;
+        if (!this.editing || !this._getCM() || _cmRefreshPending) return;
         _cmRefreshPending = true;
         requestAnimationFrame(() => {
           _cmRefreshPending = false;
-          try { this._cm.refresh(); } catch (e) {}
+          try { this._getCM().refresh(); } catch (e) {}
         });
       };
       const onMove = (e) => {
@@ -31678,8 +32694,8 @@ function portal() {
         document.removeEventListener("mouseup", onUp);
         // Final settle: the layout is fully applied now, so one last refresh
         // clears any stale measurement left from the in-flight drag frames.
-        if (this.editing && this._cm) {
-          this.$nextTick(() => { try { this._cm.refresh(); } catch (e) {} });
+        if (this.editing && this._getCM()) {
+          this.$nextTick(() => { try { this._getCM().refresh(); } catch (e) {} });
         }
         this.savePrefs();
       };
@@ -31694,6 +32710,7 @@ function portal() {
     // editText against the last-saved rawText. Either signal means dirty.
     _editorDirty() {
       if (!this.editing) return false;
+      if (this._getCM()) return !!this.cmStatus.dirty;
       if (this.cmStatus && this.cmStatus.dirty) return true;
       return String(this.editText || "") !== String(this.rawText || "");
     },
@@ -31729,6 +32746,7 @@ function portal() {
       }
     },
     async toggleEdit() {
+      if (this._isExternalFilePath(this.selected)) return;
       if (this.editing) {
         if (!this._confirmLoseEdits()) return;
         const reloadPath = this._previewNeedsReload === this.selected
@@ -31752,7 +32770,11 @@ function portal() {
       // cannot replace rawText after the editable buffer has been seeded.
       if (this._previewAbort) this._previewAbort.abort();
       this._previewAbort = null;
-      ++this._previewLoadSeq;
+      const loadSeq = ++this._previewLoadSeq;
+      // A path can become selected again after navigation. Only the exact read
+      // generation that entered editing may seed the buffer or show an error.
+      const isOwner = () => loadSeq === this._previewLoadSeq
+        && this._workspaceIsCurrent(ownerWorkspace) && this.selected === targetPath;
       if (this._csvAbort) this._csvAbort.abort();
       this._csvAbort = null;
       ++this._csvLoadSeq;
@@ -31767,148 +32789,83 @@ function portal() {
           r = await fetch("/api/files/read?path=" + encodeURIComponent(targetPath),
                           { headers: this.fileHdr() });
         } catch (e) {
-          if (this._workspaceIsCurrent(ownerWorkspace)
-              && this.selected === targetPath) {
+          if (isOwner()) {
             this.errToast("read", String((e && e.message) || e));
           }
           return;
         }
-        if (!this._workspaceIsCurrent(ownerWorkspace)
-            || this.selected !== targetPath) return;
+        if (!isOwner()) return;
         if (!r.ok) {
           const detail = await r.text();
-          if (!this._workspaceIsCurrent(ownerWorkspace)
-              || this.selected !== targetPath) return;
+          if (!isOwner()) return;
           this.errToast("read", this.lang === "zh"
                                   ? "可能是二进制或太大 — " + detail
                                   : "binary or too large — " + detail);
           return;
         }
         const body = await r.text();
-        if (!this._workspaceIsCurrent(ownerWorkspace)
-            || this.selected !== targetPath) return;
+        if (!isOwner()) return;
         this.rawText = body;
       }
-      if (!this._workspaceIsCurrent(ownerWorkspace)
-          || this.selected !== targetPath) return;
+      if (!isOwner()) return;
       this.editText = this.rawText;
-      // Live-preview setup: markdown files get the split pane; others edit
-      // full-width (editorView forced to "edit" so the template hides the
-      // preview + view-switch toolbar). For md, restore the persisted layout
-      // choice and seed the preview HTML so it's there on first paint.
       this.editorIsMd = this._isMdPath(targetPath);
       // Mobile forces full-width edit: the split pane is too narrow on a
       // phone, and the live mdRender (marked + DOMPurify + KaTeX on every
-      // keystroke) is the main heat/jank source. Desktop keeps the persisted
-      // split/edit/preview layout and seeds live-preview for first paint;
-      // mobile (and all non-md files) fall through to plain full-width edit.
-      if (this.editorIsMd && !this._isMobileLayout()) {
-        const saved = localStorage.getItem("muselab_editor_view");
-        this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
-          ? saved : "split";
-        this.livePreviewHtml = this.editorView !== "edit"
-          ? this._renderPreviewMd(this.editText) : "";
-        if (this.editorView !== "edit") {
-          this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
-        }
-      } else {
-        this.editorView = "edit";
-        this.livePreviewHtml = "";
-      }
+      // keystroke) is the main heat/jank source. Mobile (and all non-md
+      // files) fall through to plain full-width edit; desktop follows the
+      // upstream default and starts each markdown session in split view.
+      this.editorView = this.editorIsMd && !this._isMobileLayout() ? "split" : "edit";
+      this.editorSaveState = "";
+      this.editorPreviewError = "";
+      this.cmStatus = { ...this.cmStatus, dirty: false };
       this.editing = true;
       // Editing is a deliberate commitment to the file — pin its tab so it
       // doesn't get recycled out from under the editor by the next preview.
       this.pinTab(targetPath);
     },
-    async saveEdit() {
-      // Ctrl/Cmd+S can enter from two places when CodeMirror has focus:
-      // CodeMirror.extraKeys and the document-level keydown handler. Guard at
-      // the save primitive so one physical shortcut cannot emit two writes and
-      // two identical "saved" toasts.
-      if (this._saveEditInFlight) return;
+    async saveEdit({ exitAfterSave = false } = {}) {
+      if (this._saveEditInFlight || !this.selected || !this.editing || this.editorLoading) return;
       this._saveEditInFlight = true;
+      this.editorSaveState = "saving";
+      const savePath = this.selected, workspace = this.fileWorkspacePath();
+      const state = museEditor, mountVersion = this._cmMountVersion;
+      const sameOwner = () => this._workspaceIsCurrent(workspace) && this.selected === savePath
+        && this.editing && this._cmMountVersion === mountVersion && museEditor === state;
+      const saveText = this._editorText();
+      // A generation captured BEFORE the request marks exactly the saved
+      // version, even if typing/undo continues while the write is in flight.
+      const savedGen = state?.cm.changeGeneration(true);
       try {
-        // Pull the current buffer once, here, instead of mirroring it into the
-        // reactive editText on every keystroke. CM is the source of truth when
-        // active; the textarea fallback (this._cm === null) keeps editText synced
-        // via its input listener. Everything below (write body, post-save
-        // rawText sync) reads this.editText, so refresh it first.
-        if (!this.selected) return;
-        const savePath = this.selected;
-        const ownerWorkspace = this.fileWorkspacePath();
-        const saveMode = this.previewMode;
-        const saveLang = this.previewLang;
-        const saveText = this._cm ? this._cm.getValue() : this.editText;
-        this.editText = saveText;
-        let r;
-        try {
-          r = await fetch("/api/files/write", {
-            method: "PUT",
-            headers: { ...this.fileHdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ path: savePath, content: saveText }),
-          });
-        } catch (e) {
-          // Keep editing=true so the unsaved buffer is preserved for retry.
-          if (this._workspaceIsCurrent(ownerWorkspace)
-              && this.selected === savePath) {
-            this.errToast("save", String((e && e.message) || e));
-          }
-          return;
-        }
-        if (r.ok) {
-          // The user can keep typing while the request is in flight. Compare
-          // the live buffer with the exact payload that reached disk before
-          // deciding whether it is safe to close the editor.
-          const sameOwner = this._workspaceIsCurrent(ownerWorkspace)
-            && this.selected === savePath;
-          const liveText = sameOwner && this.editing
-            ? (this._cm ? this._cm.getValue() : this.editText)
-            : saveText;
-          const hasNewerEdits = sameOwner && liveText !== saveText;
-          if (!sameOwner) return;
-          this._previewCacheDel(savePath);
-          if (this._previewNeedsReload === savePath) this._previewNeedsReload = "";
-          this.rawText = saveText;
-          // Keep the preview cache in step with the just-saved body. For md/text
-          // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
-          // the stale entry so the next switch-back re-fetches.
-          if (saveMode === "md") {
-            this.renderedMd = this._renderPreviewMd(this.rawText);
-            if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-              this._previewCacheSet(savePath, {
-                mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
-              });
-            }
-            this.$nextTick(() => this.highlightCode(".markdown"));
-          } else if (saveMode === "text"
-                     && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-            this._previewCacheSet(savePath, {
-              mode: "text", rawText: this.rawText, previewLang: saveLang,
-            });
-          }
-          // Bump previewVersion so HTML / PDF / image iframes pick up the new
-          // file content. Without this, iframes keep showing the stale render
-          // (browser disk cache + same URL) until the user hard-refreshes —
-          // the issue was visible when editing a html report styled in dark
-          // mode to light mode: editor saved, preview iframe still showed dark.
-          this.previewVersion = Date.now();
-          if (hasNewerEdits) {
-            this.editText = liveText;
-            this.cmStatus = { ...this.cmStatus, dirty: true };
-          } else {
-            this.editText = saveText;
-            this.editing = false;
-          }
-          // Saving moved the file's mtime — refresh the header strip.
-          this.loadSelectedMeta(savePath);
-          this.toast(hasNewerEdits
-            ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存"
-                                  : "Saved; newer edits are still unsaved")
-            : this.t("toast.saved"), "success", hasNewerEdits ? 3000 : 2000);
-        } else {
-          const detail = await r.text();
-          if (this._workspaceIsCurrent(ownerWorkspace)
-              && this.selected === savePath) this.errToast("save", detail);
+        const response = await fetch("/api/files/write", {
+          method: "PUT", headers: { ...this.fileHdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: savePath, content: saveText }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        // The disk write succeeded even if navigation replaced this editor.
+        // Invalidate its workspace cache before checking the visible owner.
+        this._previewCacheDel(savePath, workspace);
+        if (!sameOwner()) return;
+        // Shortcut saves retain cursor/history; the Save button explicitly
+        // requests preview after the acknowledged generation is clean.
+        this._previewNeedsReload = savePath;
+        this.rawText = saveText;
+        this.editText = this._editorText();
+        if (state) {
+          state.cleanGen = savedGen;
+          state.refreshStatus();
+        } else this.cmStatus = { ...this.cmStatus, dirty: this.editText !== saveText };
+        this.previewVersion = Date.now();
+        this.editorSaveState = "saved";
+        this.loadSelectedMeta(savePath);
+        this.toast(this.cmStatus.dirty
+          ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存" : "Saved; newer edits are still unsaved")
+          : this.t("toast.saved"), "success", 2000);
+        if (exitAfterSave && !this._editorDirty()) await this.toggleEdit();
+      } catch (e) {
+        if (sameOwner()) {
+          this.editorSaveState = "error";
+          this.errToast("save", String(e.message || e));
         }
       } finally {
         this._saveEditInFlight = false;
@@ -31956,6 +32913,7 @@ function portal() {
       } else {
         ta.style.height = Math.min(sh, max) + "px";
       }
+      this.syncComposerQuoteMirror();
     },
 
     // Ctrl/Cmd+X with NO active selection = cut the whole current line
@@ -32175,7 +33133,7 @@ function portal() {
       if (!draft) return false;
       return !!((draft.pendingImages && draft.pendingImages.length)
         || (draft.pendingDocs && draft.pendingDocs.length)
-        || (draft.pendingQuotes && draft.pendingQuotes.length));
+        || this._sendableQuotes(draft.pendingQuotes, draft.input).length);
     },
 
     async _dispatchSlash(rawCommand, rawArg, opts = {}) {
@@ -32925,6 +33883,7 @@ function portal() {
       this._resetChatInputHistory();
       this._captureComposerState(this.currentId, { persist: false });
       this._schedulePersistChatDraft(this.currentId, this.input || "");
+      this.updateComposerQuoteFocus(ev);
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
 
@@ -33133,6 +34092,14 @@ function portal() {
       // profiling). The settle sets `atBottom` itself, so this recompute is
       // redundant during that window — skip it.
       if (this._autoScrolling || (st && st._autoScrolling)) return;
+      // A reader scrolling down a jumped history window continues into the
+      // following records. Only a downward user gesture owns this; layout
+      // scrolls and programmatic jumps never extend the window by themselves.
+      if (st && movedTowardLatest && st._scrollTowardLatestAt
+          && st._scrollTowardLatestAt === st._userScrollAt
+          && this._messageRangeHasLater(st) && this._chatNearLaterEdge(el)) {
+        void this._revealLaterHistory(this.currentId);
+      }
       // Strict "at bottom": 2px tolerance only — just enough to absorb
       // sub-pixel geometry (browser zoom / high-DPI displays can report
       // distance as 0.4–1.x even when visually at bottom; pure ==0 would
@@ -33184,7 +34151,13 @@ function portal() {
         st._scrollTowardLatestAt = st._userScrollAt;
         // At the physical bottom another wheel/touch gesture need not produce
         // a scroll event. It must still be able to reveal pending local messages.
-        this._resumePausedChatTail(st, this._chatBodyElement());
+        const body = this._chatBodyElement();
+        if (this._resumePausedChatTail(st, body)) return;
+        // The same holds for a jumped window shorter than, or already
+        // scrolled to the end of, the viewport.
+        if (this._messageRangeHasLater(st) && this._chatNearLaterEdge(body)) {
+          void this._revealLaterHistory(this.currentId);
+        }
         return;
       }
       st._scrollTowardLatestAt = 0;
@@ -33623,6 +34596,7 @@ function portal() {
       const composerInput = hasDetachedText ? opts.detachedText : (sendDraft.input || "");
       const composerImages = hasDetachedText ? [] : sendDraft.pendingImages.slice();
       const composerDocs = hasDetachedText ? [] : sendDraft.pendingDocs.slice();
+      if (!hasDetachedText) this._pruneUnplacedQuotes(sendDraft);
       const composerQuotes = hasDetachedText ? [] : sendDraft.pendingQuotes.slice();
       const composerText = hasDetachedText
         ? composerInput : this._composerPromptText(composerInput, composerQuotes);
@@ -33780,10 +34754,8 @@ function portal() {
         ? String(sendState.activeTurnId || "") : "";
       const busyStreamOwnerToken = !isReconnect
         ? String(sendState._streamOwnerToken || "") : "";
-      const busyHasAttachments = !isReconnect
-        && !!(composerImages.length || composerDocs.length);
       const busyDelivery = this._busySendDelivery(
-        sendSid, busyActiveTurnId, busyHasAttachments,
+        sendSid, busyActiveTurnId,
       );
       // Resume only when this pane still owns the exact same immutable turn.
       // A cold reload or ABA turn change has no trustworthy checkpoint and uses
@@ -33797,10 +34769,9 @@ function portal() {
         sendState.lastEventSeq = 0;
       }
       if (expectedTurnId) sendState.activeTurnId = expectedTurnId;
-      if (!isReconnect) {
-        sendState.activeTurnId = "";
-        sendState.parentTurnId = "";
-      }
+      // Keep the current turn identity while a busy send is being admitted.
+      // Other composer input can arrive during those awaits and must still
+      // target this same turn. Clear it only on the new direct-turn path below.
       // Resumed mode: _drainPendingQueue popped a previously-enqueued
       // message and asked us to send it. Pull text + attachments from
       // the item (NOT from this.input / this.pendingImages — those may
@@ -33847,8 +34818,20 @@ function portal() {
         // current global composer while waiting for uploads.
         const ownedImages = resumed ? (resumed.pendingImages || []) : composerImages;
         const ownedDocs = resumed ? (resumed.pendingDocs || []) : composerDocs;
-        const stillUploading = () => ownedImages.some(im => im.uploading)
-          || ownedDocs.some(d => d.uploading);
+        const pruneRemovedAttachments = () => {
+          if (resumed) return; // Queued items keep their detached snapshot.
+          for (const [snapshot, live] of [
+            [ownedImages, sendDraft.pendingImages], [ownedDocs, sendDraft.pendingDocs],
+          ]) {
+            for (let i = snapshot.length - 1; i >= 0; i--) {
+              if (!live.includes(snapshot[i])) snapshot.splice(i, 1);
+            }
+          }
+        };
+        const stillUploading = () => {
+          pruneRemovedAttachments();
+          return ownedImages.some(im => im.uploading) || ownedDocs.some(d => d.uploading);
+        };
         if (stillUploading()) {
           this._setComposerClaimPhase(sendState, composerSubmitToken, "upload");
           sendDraft._sendWaitingForUpload = true;
@@ -33866,6 +34849,8 @@ function portal() {
           if (!ownsSendDraft()) return false;
           this._setComposerClaimPhase(sendState, composerSubmitToken, "submitting");
         }
+        pruneRemovedAttachments();
+        if (!text && !ownedImages.length && !ownedDocs.length) return false;
         // An attachment is part of the user's send intent. If any upload failed,
         // keep every chip/draft in place and refuse the send instead of silently
         // degrading the turn to text-only (or a partial attachment set).
@@ -34133,6 +35118,8 @@ function portal() {
       const streamWorkspace = (streamSession && streamSession.cwd) || primaryWorkspace;
 
       if (!isReconnect) {
+        streamState.activeTurnId = "";
+        streamState.parentTurnId = "";
         streamState._serverActiveObserved = false;
         // A real new local turn supersedes any just-finished list expectation.
         streamState._sessionActivityExpected = null;
@@ -34527,7 +35514,7 @@ function portal() {
           "subagent_delta", "subagent_block", "hook_trace", "compact_progress",
           "task_started", "task_progress", "task_notification", "scheduled_tasks", "rate_limit",
           "queue_steering",
-          "ask_user_question", "permission_request", "permission_request_resolved",
+          "ask_user_question", "ask_user_question_resolved", "permission_request", "permission_request_resolved",
           "permission_mode_changed", "permission_mode_change_failed",
         ].includes(ev.type)) {
           streamState.streamPhase = "running";
@@ -34536,7 +35523,7 @@ function portal() {
       ["startup", "text", "thinking", "tool_use", "tool_result",
        "subagent_delta", "subagent_block", "hook_trace", "compact_progress", "task_started",
        "task_progress", "task_notification", "scheduled_tasks", "rate_limit", "queue_steering",
-       "ask_user_question", "permission_request", "permission_request_resolved",
+       "ask_user_question", "ask_user_question_resolved", "permission_request", "permission_request_resolved",
        "permission_mode_changed",
        "permission_mode_change_failed", "ping",
        "done", "error", "cancelled", "resync"].forEach(
@@ -35167,11 +36154,30 @@ function portal() {
           questions: d.questions,
           pendingAnswers,
           submitted: false,
+          _answerAcknowledged: false,
           askOtherOpen: false,
           askOtherText: "",
         });
 
         _scrollIfActive();
+      });
+      es.addEventListener("ask_user_question_resolved", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        if (!d.id) return;
+        const messages = streamState.messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg.role !== "ask_user_question" || msg.id !== d.id) continue;
+          msg._answerAcknowledged = true;
+          msg.submitted = true;
+          msg.askOtherOpen = false;
+          if (d.answers && typeof d.answers === "object"
+              && !Array.isArray(d.answers)) {
+            msg.pendingAnswers = {...d.answers};
+          }
+          break;
+        }
       });
       es.addEventListener("permission_request", ev => {
         let d;
@@ -35911,7 +36917,7 @@ function portal() {
             || busyActiveTurnId || "",
           );
           const handoffDelivery = this._busySendDelivery(
-            streamSid, handoffTurnId, busyHasAttachments,
+            streamSid, handoffTurnId,
           );
           if (handoffDelivery === "queue") {
             if (sentUserBubble) {
@@ -36518,11 +37524,12 @@ function portal() {
             body: JSON.stringify({ answers }),
           },
         );
-        if (!r.ok) {
+        if (!r.ok && !msg._answerAcknowledged) {
           msg.submitted = false;
           this.toast(this.t("ask.submit_failed"), "error", 3000);
         }
       } catch (e) {
+        if (msg._answerAcknowledged) return;
         msg.submitted = false;
         this.toast(this.t("ask.submit_failed"), "error", 3000);
       }
@@ -36543,11 +37550,12 @@ function portal() {
             body: JSON.stringify({ answers: msg.pendingAnswers }),
           },
         );
-        if (!r.ok) {
+        if (!r.ok && !msg._answerAcknowledged) {
           msg.submitted = false;
           this.toast(this.t("ask.submit_failed"), "error", 3000);
         }
       } catch (e) {
+        if (msg._answerAcknowledged) return;
         msg.submitted = false;
         this.toast(this.t("ask.submit_failed"), "error", 3000);
       }
@@ -36737,6 +37745,14 @@ function portal() {
       const st = this.tabState[this.currentId];
       if (!this._truncatePaneMessagesFrom(st, m)) return;
       this._setChatInput(newText);
+      // Inline quote markers in the edited text must still resolve to their
+      // quote content when the edit is resent.
+      const quotes = this.userSelectionQuotes(m).filter(q => this.quoteIsPlaced(q, newText));
+      if (quotes.length) {
+        this.pendingQuotes.splice(
+          0, this.pendingQuotes.length, ...quotes.map(q => ({ ...q, id: this._uuid() })),
+        );
+      }
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) this.autoGrow(ta);
@@ -36809,7 +37825,7 @@ function portal() {
 
     // ===== command palette =====
     openPalette() {
-      this._cancelPaletteMessageSearch();
+      this._cancelPaletteSearch();
       this.palette.query = "";
       this.palette.activeIndex = 0;
       this.palette.fileResults = [];
@@ -36822,16 +37838,49 @@ function portal() {
         if (el) el.focus();
       });
     },
+    onPaletteInput() {
+      this.palette.activeIndex = 0;
+      if (this._paletteSearchTimer !== null) clearTimeout(this._paletteSearchTimer);
+      this._paletteSearchTimer = null;
+      if (!this.palette.show) return;
+      const generation = this._paletteSearchGeneration;
+      const query = this.palette.query.trim();
+      const timer = setTimeout(() => {
+        if (this._paletteSearchTimer !== timer) return;
+        this._paletteSearchTimer = null;
+        if (!this.palette.show || generation !== this._paletteSearchGeneration
+            || this.palette.query.trim() !== query) return;
+        this._fetchPaletteFiles();
+        this._fetchPaletteMessages();
+      }, 300);
+      this._paletteSearchTimer = timer;
+    },
+    _cancelPaletteSearch() {
+      ++this._paletteSearchGeneration;
+      if (this._paletteSearchTimer !== null) clearTimeout(this._paletteSearchTimer);
+      this._paletteSearchTimer = null;
+      this._cancelPaletteFileSearch();
+      this._cancelPaletteMessageSearch();
+    },
+    _cancelPaletteFileSearch() {
+      ++this._paletteFileSeq;
+      const controller = this._paletteFileAbort;
+      this._paletteFileAbort = null;
+      this.palette.fileLoading = false;
+      if (controller) controller.abort();
+    },
     _cancelPaletteMessageSearch() {
       if (this._paletteMessageAbort) this._paletteMessageAbort.abort();
       this._paletteMessageAbort = null;
       this.palette.messageLoading = false;
     },
     closePalette() {
-      this._cancelPaletteMessageSearch();
+      this._cancelPaletteSearch();
       this.palette.show = false;
     },
     async _fetchPaletteMessages() {
+      if (!this.palette.show) return;
+      const generation = this._paletteSearchGeneration;
       const q = this.palette.query.trim();
       if (q === this.palette.messageQuery && q.length >= 2) return;
       this._cancelPaletteMessageSearch();
@@ -36842,6 +37891,7 @@ function portal() {
       this._paletteMessageAbort = controller;
       this.palette.messageLoading = true;
       const owns = () => this._paletteMessageAbort === controller
+        && this.palette.show && generation === this._paletteSearchGeneration
         && this.palette.query.trim() === q;
       try {
         const r = await fetch(
@@ -36890,29 +37940,36 @@ function portal() {
       }
     },
     // Fetch files matching the current palette query against the whole
-    // workspace (not just loaded tree rows). Called from the palette input's
-    // debounced @input. Idempotent — skips if the query hasn't changed.
+    // workspace (not just loaded tree rows). Called by the palette's scheduled
+    // input search. Idempotent — skips if the query hasn't changed.
     async _fetchPaletteFiles() {
+      if (!this.palette.show) return;
+      const generation = this._paletteSearchGeneration;
       const q = this.palette.query.trim();
       if (q.length < 2) {
-        ++this._paletteFileSeq;
+        this._cancelPaletteFileSearch();
         this.palette.fileResults = [];
         this.palette.fileQuery = "";
         this.palette.fileLoading = false;
         return;
       }
       if (q === this.palette.fileQuery) return;
+      this._cancelPaletteFileSearch();
+      const controller = new AbortController();
+      this._paletteFileAbort = controller;
       const requestSeq = ++this._paletteFileSeq;
       this.palette.fileQuery = q;
       this.palette.fileLoading = true;
       const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => requestSeq === this._paletteFileSeq
+        && this._paletteFileAbort === controller
+        && this.palette.show && generation === this._paletteSearchGeneration
         && this._workspaceIsCurrent(ownerWorkspace)
         && this.palette.query.trim() === q;
       try {
         const r = await fetch(
           "/api/files/search?q=" + encodeURIComponent(q) + "&limit=30",
-          { headers: this.fileHdr() });
+          { headers: this.fileHdr(), signal: controller.signal });
         if (!isOwner()) return;
         if (!r.ok) { this.palette.fileResults = []; return; }
         const data = await r.json();
@@ -36925,7 +37982,8 @@ function portal() {
         if (isOwner()) this.palette.fileResults = [];
       } finally {
         if (requestSeq === this._paletteFileSeq
-            && this._workspaceIsCurrent(ownerWorkspace)) {
+            && this._paletteFileAbort === controller) {
+          this._paletteFileAbort = null;
           this.palette.fileLoading = false;
         }
       }
@@ -37468,6 +38526,12 @@ function portal() {
     activityRequiresAction(item) {
       return !!item && ["waiting_approval", "paused"].includes(item.state);
     },
+    // Native cron / background tasks are live work the ledger state doesn't
+    // reflect; the task center shows them with the same yellow dot as tabs.
+    activityHasBackgroundWork(item) {
+      const sid = item && (item.session_id || item.thread_id);
+      return !!sid && (this.isTabScheduledActive(sid) || this.isTabBackgroundActive(sid));
+    },
     activityGroupUnread(group) {
       if (group?.custom || this.activitySearchQuery()) {
         return this.activityAllEvents(group)
@@ -37651,6 +38715,9 @@ function portal() {
       draft.saving = true;
       const owner = draft.owner;
       const editing = !!draft.id;
+      const submitted = {
+        name: draft.name, color: draft.color, workspaceId: draft.workspaceId,
+      };
       const payload = { name, color: draft.color || "blue" };
       const workspaceId = String(draft.workspaceId || "");
       if (!editing || draft.workspaceDirty) {
@@ -37670,6 +38737,9 @@ function portal() {
           throw new Error(error || "activity group save failed");
         }
         if (this.activity.groupEditor.owner !== owner) return false;
+        const unchanged = draft.name === submitted.name
+          && draft.color === submitted.color
+          && draft.workspaceId === submitted.workspaceId;
         const responseRevision = Number(data.revision) || 0;
         if (!responseRevision || responseRevision >= this._activityRevision) {
           this.applyActivityGroupPayload(data);
@@ -37677,7 +38747,14 @@ function portal() {
           this.fetchActivity().catch(() => {});
         }
         this._activityRevision = Math.max(this._activityRevision, responseRevision);
-        this.cancelActivityGroupEditor(true);
+        if (unchanged) {
+          this.cancelActivityGroupEditor(true);
+        } else {
+          draft.id = data.group.id;
+          draft.originalWorkspaceId = String(data.group.workspace_id || "");
+          draft.workspaceDirty = draft.workspaceId !== draft.originalWorkspaceId;
+          draft.saving = false;
+        }
       } catch (error) {
         if (this.activity.groupEditor.owner !== owner) return false;
         draft.saving = false;
@@ -38155,8 +39232,22 @@ function portal() {
         summaryOnly: !this.activity.show && this.activity.events.length > 0,
       });
     },
+    _bindTodoVisibility() {
+      if (this._todoLiveVisibilityBound
+          || typeof document === "undefined") return;
+      this._todoLiveVisibilityBound = true;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") {
+          this._stopTodoEvents();
+        } else {
+          this._startTodoEvents();
+        }
+      });
+      window.addEventListener("pagehide", () => this._stopTodoEvents());
+    },
     async _startTodoEvents() {
       if (!this.token || typeof EventSource === "undefined") return;
+      this._bindTodoVisibility();
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") {
         this._stopTodoEvents();
@@ -38165,21 +39256,30 @@ function portal() {
       if (this._todoLiveSource) return;
       this._stopTodoEvents();
       const seq = ++this._todoLiveSeq;
+      const controller = new AbortController();
+      this._todoLiveController = controller;
+      const ownsTicket = () => seq === this._todoLiveSeq
+        && this._todoLiveController === controller;
       let ticket = "";
       try {
-        const r = await fetch("/api/todos/events-ticket", {
-          method: "POST",
-          headers: this.hdr(),
-        });
-        if (!r.ok) throw new Error("todos ticket failed");
-        ticket = String((await r.json()).ticket || "");
+        await this._fetchWithDeadline(
+          "/api/todos/events-ticket",
+          { method: "POST", headers: this.hdr(), signal: controller.signal },
+          this.REQUEST_DEADLINE_MS,
+          async response => {
+            if (!response.ok) throw new Error("todos ticket failed");
+            ticket = String((await response.json()).ticket || "");
+          },
+        );
       } catch (_) {
-        if (seq === this._todoLiveSeq) {
+        if (ownsTicket()) {
           this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
         }
         return;
+      } finally {
+        if (this._todoLiveController === controller) this._todoLiveController = null;
       }
-      if (seq !== this._todoLiveSeq || !ticket) return;
+      if (seq !== this._todoLiveSeq || controller.signal.aborted || !ticket) return;
       const es = new EventSource(
         `/api/todos/events?ticket=${encodeURIComponent(ticket)}`,
       );
@@ -38201,20 +39301,13 @@ function portal() {
         this._todoLiveSource = null;
         this._todoLiveTimer = setTimeout(() => this._startTodoEvents(), 1500);
       };
-      if (!this._todoLiveVisibilityBound) {
-        this._todoLiveVisibilityBound = true;
-        document.addEventListener("visibilitychange", () => {
-          if (document.visibilityState !== "visible") {
-            this._stopTodoEvents();
-          } else {
-            this._startTodoEvents();
-          }
-        });
-        window.addEventListener("pagehide", () => this._stopTodoEvents());
-      }
     },
     _stopTodoEvents() {
       ++this._todoLiveSeq;
+      if (this._todoLiveController) {
+        try { this._todoLiveController.abort(); } catch (_) {}
+      }
+      this._todoLiveController = null;
       if (this._todoLiveSource) {
         try { this._todoLiveSource.close(); } catch (_) {}
       }
@@ -38343,18 +39436,23 @@ function portal() {
       const seq = ++this._activityLiveSeq;
       const controller = new AbortController();
       this._activityLiveController = controller;
+      const ownsTicket = () => seq === this._activityLiveSeq
+        && this._activityLiveController === controller;
       let ticket = "";
       try {
-        const r = await this._fetchWithDeadline(
+        await this._fetchWithDeadline(
           "/api/activity/events-ticket",
           {
             method: "POST", headers: this.hdr(), signal: controller.signal,
           },
+          this.REQUEST_DEADLINE_MS,
+          async response => {
+            if (!response.ok) throw new Error("activity ticket failed");
+            ticket = String((await response.json()).ticket || "");
+          },
         );
-        if (!r.ok) throw new Error("activity ticket failed");
-        ticket = String((await r.json()).ticket || "");
       } catch (_) {
-        if (seq === this._activityLiveSeq) {
+        if (ownsTicket()) {
           this._activityLiveTimer = setTimeout(
             () => this._startActivityEvents(),
             this._activityReconnectDelay(),
@@ -38366,7 +39464,7 @@ function portal() {
           this._activityLiveController = null;
         }
       }
-      if (seq !== this._activityLiveSeq || !ticket) return;
+      if (seq !== this._activityLiveSeq || controller.signal.aborted || !ticket) return;
       const es = new EventSource(
         `/api/activity/events?ticket=${encodeURIComponent(ticket)}`,
       );
@@ -38537,11 +39635,13 @@ function portal() {
         const payload = await response.json();
         if (seq !== this.scheduler.nativeLoadSeq) return false;
         const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-        this.scheduler.nativeTasks = tasks;
+        this.scheduler.nativeTasks = tasks.filter(task =>
+          !["finished", "expired", "missing"].includes(task.runtime_state || "active"));
         this._setScheduledTaskState(sid,
           payload.scheduled_active ?? tasks.some(task =>
             ["active", "recovering", "unconfirmed"].includes(task.runtime_state || "active")),
-          tasks.length);
+          payload.scheduled_count ?? tasks.filter(task =>
+            !["finished", "expired", "missing", "paused"].includes(task.runtime_state || "active")).length);
         return true;
       } catch (_) {
         if (seq !== this.scheduler.nativeLoadSeq) return false;
@@ -38606,13 +39706,58 @@ function portal() {
       }
       return this.openScheduler({ sessionId, native: true });
     },
+    openBackgroundTasks(sessionId, event = null) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return this.openScheduler({ sessionId, tab: "background" });
+    },
+    currentSessionBackgroundCount() {
+      return this.backgroundTaskLiveCount(this.currentId);
+    },
+    // Background tasks are task cards in the session transcript, so the tab
+    // lists them from there instead of needing a second server projection.
+    backgroundTaskRows(sid = this.scheduler.nativeSessionId || this.currentId) {
+      const messages = (this.tabState[sid] && this.tabState[sid].messages) || [];
+      const rows = [];
+      for (const m of messages) {
+        if (!m || m.role !== "tool_use" || !m.task_status) continue;
+        // Cards cloned into a rollover successor keep owner_session_id of the
+        // predecessor that runs them; they are this session's tasks too.
+        const status = m.task_status;
+        rows.push({
+          key: String(status.task_id || status.tool_use_id || m.id || rows.length),
+          status,
+          message: m,
+          running: status.state === "running",
+        });
+      }
+      return rows.sort((a, b) => Number(b.running) - Number(a.running));
+    },
+    backgroundTaskTitle(row) {
+      const status = (row && row.status) || {};
+      const input = (row && row.message && row.message.input) || {};
+      const text = status.summary || status.description || input.description
+        || input.command || input.prompt || "";
+      return String(text).slice(0, 200);
+    },
+    backgroundTaskLiveCount(sid = this.scheduler.nativeSessionId || this.currentId) {
+      const running = this.backgroundTaskRows(sid).filter(row => row.running).length;
+      if (running) return running;
+      return this.isTabBackgroundActive(sid) ? this._backgroundTaskCount(this.tabState[sid]) : 0;
+    },
     async openScheduler(options = {}) {
+      this._invalidateSchedDraftSave();
       const nativeSessionId = String(
         (options && typeof options === "object" && options.sessionId)
         || this.currentId
         || "",
       );
       const opener = document.activeElement;
+      this.scheduler.tab = ["native", "scheduled", "background"].includes(options && options.tab)
+        ? options.tab
+        : (options && options.native ? "native" : "scheduled");
       this.scheduler.show = true;
       this._openFocusSurface(
         "scheduler", ".sched-modal", ".sched-input-name",
@@ -38634,11 +39779,17 @@ function portal() {
       }
     },
     closeScheduler() {
+      this._invalidateSchedDraftSave();
       const wasOpen = this.scheduler.show;
       this.scheduler.show = false;
       if (wasOpen) this._closeFocusSurface("scheduler");
     },
+    _invalidateSchedDraftSave() {
+      this.scheduler.draftSeq += 1;
+      this.scheduler.saving = false;
+    },
     _resetSchedDraft() {
+      this._invalidateSchedDraftSave();
       this.scheduler.draft = {
         editingId: null,
         name: "", prompt: "", model: this.model || "",
@@ -38694,6 +39845,7 @@ function portal() {
     // button switches to PATCH and a Cancel button appears.
     editSchedTask(t) {
       if (!t) return;
+      this._invalidateSchedDraftSave();
       const s = t.schedule || {};
       // Hydrate `times`: prefer the multi-slot list when present (saved by
       // newer tasks); otherwise synthesize a single-slot list from the
@@ -38738,17 +39890,22 @@ function portal() {
       });
     },
     cancelEditSched() { this._resetSchedDraft(); },
+    // true: applied; false: failed; null: a newer request owns the list.
     async loadSchedulerTasks() {
+      const seq = ++this.scheduler.tasksSeq;
       this.scheduler.loading = true;
       try {
         const r = await fetch("/api/scheduler/tasks", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.scheduler.tasks = d.tasks || [];
-          this.scheduler.unreadCount = d.unread_count || 0;
-        }
+        if (!r.ok) return seq === this.scheduler.tasksSeq ? false : null;
+        const d = await r.json();
+        if (seq !== this.scheduler.tasksSeq) return null;
+        this.scheduler.tasks = d.tasks || [];
+        this.scheduler.unreadCount = d.unread_count || 0;
+        return true;
+      } catch (_) {
+        return seq === this.scheduler.tasksSeq ? false : null;
       } finally {
-        this.scheduler.loading = false;
+        if (seq === this.scheduler.tasksSeq) this.scheduler.loading = false;
       }
     },
     async loadSchedulerHistory() {
@@ -38799,6 +39956,7 @@ function portal() {
       }
     },
     async createSchedTask() {
+      if (this.scheduler.saving) return;
       const d = this.scheduler.draft;
       if (!d.name.trim() || !d.prompt.trim()) {
         this.toast(this.lang === "zh"
@@ -38870,40 +40028,55 @@ function portal() {
       const url = isEdit
         ? "/api/scheduler/tasks/" + encodeURIComponent(d.editingId)
         : "/api/scheduler/tasks";
-      let r;
+      const payload = {
+        name: d.name.trim(),
+        prompt: d.prompt.trim(),
+        schedule: sched,
+        model: d.model || "",
+        session_mode: d.session_mode || "fresh",
+      };
+      const draftSeq = this.scheduler.draftSeq;
+      const snapshot = JSON.stringify(d);
+      const saveSeq = ++this.scheduler.saveSeq;
+      const owns = () => draftSeq === this.scheduler.draftSeq
+        && saveSeq === this.scheduler.saveSeq;
+      this.scheduler.saving = true;
       try {
-        r = await fetch(url, {
+        const r = await fetch(url, {
           method: isEdit ? "PATCH" : "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: d.name.trim(),
-            prompt: d.prompt.trim(),
-            schedule: sched,
-            model: d.model || "",
-            session_mode: d.session_mode || "fresh",
-          }),
+          body: JSON.stringify(payload),
         });
-      } catch (e) {
-        // Network-level failure (offline / flaky mobile) — without this the
-        // throw becomes an unhandledrejection and the user gets no feedback.
-        this.errToast(isEdit ? "save" : "create", String((e && e.message) || e));
-        return;
-      }
-      if (!r.ok) {
-        const err = await r.text();
-        const verb = isEdit
-          ? (this.lang === "zh" ? "保存失败：" : "Save failed: ")
-          : (this.lang === "zh" ? "创建失败：" : "Create failed: ");
-        this.toast(verb + err, "error", 4000);
-        return;
-      }
-      this._resetSchedDraft();
-      await this.loadSchedulerTasks();
-      this.toast(
-        isEdit
+        if (!r.ok) {
+          const err = await r.text();
+          const verb = isEdit
+            ? (this.lang === "zh" ? "保存失败：" : "Save failed: ")
+            : (this.lang === "zh" ? "创建失败：" : "Create failed: ");
+          this.toast(verb + err, "error", 4000);
+          return;
+        }
+        // Confirmation invalidates lists captured before this write. Keep
+        // the confirmed edit visible even if the following refresh fails.
+        this.scheduler.tasksSeq += 1;
+        if (isEdit) {
+          this.scheduler.tasks = this.scheduler.tasks.map(task =>
+            task.id === d.editingId ? { ...task, ...payload } : task);
+        }
+        if (owns() && JSON.stringify(this.scheduler.draft) === snapshot) {
+          this._resetSchedDraft();
+        }
+        const refreshed = await this.loadSchedulerTasks();
+        const message = isEdit
           ? (this.lang === "zh" ? "已保存" : "Saved")
-          : (this.lang === "zh" ? "任务已创建" : "Task created"),
-        "success", 2000);
+          : (this.lang === "zh" ? "任务已创建" : "Task created");
+        this.toast(refreshed !== false ? message : message + (this.lang === "zh"
+          ? "，但任务列表刷新失败" : ", but the task list could not refresh"),
+        refreshed !== false ? "success" : "warn", refreshed !== false ? 2000 : 4000);
+      } catch (e) {
+        this.errToast(isEdit ? "save" : "create", String((e && e.message) || e));
+      } finally {
+        if (owns()) this.scheduler.saving = false;
+      }
     },
     toggleDraftWeekday(w) {
       const wds = this.scheduler.draft.weekdays;
@@ -38998,9 +40171,15 @@ function portal() {
                      "error", 5000);
           return;
         }
+        this.scheduler.tasksSeq += 1;
+        this.scheduler.tasks = this.scheduler.tasks.filter(task => task.id !== t.id);
+        delete this.scheduler.taskRuns[t.id];
         if (this.scheduler.draft.editingId === t.id) this._resetSchedDraft();
-        await this.loadSchedulerTasks();
-        this.toast(zh ? "任务已删除" : "Task deleted", "success", 2000);
+        const refreshed = await this.loadSchedulerTasks();
+        this.toast(refreshed !== false
+          ? (zh ? "任务已删除" : "Task deleted")
+          : (zh ? "任务已删除，但任务列表刷新失败" : "Task deleted, but the task list could not refresh"),
+        refreshed !== false ? "success" : "warn", refreshed !== false ? 2000 : 4000);
       } catch (e) {
         // Network-level failure — typically iOS Safari losing the request
         // mid-flight on flaky 4G. Show the user what happened.

@@ -364,10 +364,16 @@ def _normalize_cleanup_intents(raw: Any, tasks: dict[str, Any]) -> dict[str, dic
 
 def _load_state() -> None:
     global _state, _STATE_ERROR
-    if not _STATE_FILE or not _STATE_FILE.exists():
+    if not _STATE_FILE:
         _STATE_ERROR = ""
         return
     try:
+        try:
+            # exists() can hide I/O errors as False; stat() preserves them.
+            _STATE_FILE.stat()
+        except FileNotFoundError:
+            _STATE_ERROR = ""
+            return
         loaded = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("scheduler state root must be an object")
@@ -675,6 +681,9 @@ def update_task(tid: str, **changes: Any) -> dict | None:
             t = _state["tasks"].get(tid)
             if not t:
                 return None
+            # Validation may reject a later field in this same edit. Build a
+            # candidate so rejected edits never mutate the live task partially.
+            t = copy.deepcopy(t)
         # Capture the old name BEFORE applying the change — used to detect a
         # rename so we can keep the bound session's name in sync. Without
         # this the history picker kept showing the old `[定时] xxx` label
@@ -741,6 +750,7 @@ def update_task(tid: str, **changes: Any) -> dict | None:
             if (sid and new_name and new_name != old_name
                     and _effective_session_mode(t) == "reuse"):
                 rename_after_commit = (sid, str(new_name))
+            _state["tasks"][tid] = t
             try:
                 _save_state()
             except Exception:
@@ -1494,6 +1504,14 @@ async def _execute_task(task: dict) -> None:
                         if not is_revoked:
                             # "most recent run" pointer
                             task["session_id"] = sid
+                            # Editing replaces the task dict while this run
+                            # retains its admitted snapshot. Publish only the
+                            # runtime pointer into the current fresh-mode row;
+                            # a newly selected reuse binding belongs to the edit.
+                            current = _state["tasks"].get(tid)
+                            if (current is not None
+                                    and _effective_session_mode(current) == "fresh"):
+                                current["session_id"] = sid
                             try:
                                 _save_state()
                             except Exception:
@@ -1651,7 +1669,12 @@ async def _execute_task(task: dict) -> None:
                     if is_revoked:
                         return True
                     snapshot = copy.deepcopy(_state)
-                    task["last_run"] = now
+                    # The admitted task snapshot may have been replaced by
+                    # an edit. Merge the result timestamp into the current row
+                    # without restoring its old prompt, schedule, or binding.
+                    current = _state["tasks"].get(tid)
+                    if current is not None:
+                        current["last_run"] = now
                     _state["history"].append(entry)
                     # Successful runs and errors both bump unread so the result
                     # remains visible in the bell drawer.
@@ -1910,16 +1933,14 @@ async def _start_scheduler() -> None:
     # generous enough to cover overnight outages while filtering
     # actually-stale entries.
     _CATCHUP_MAX_AGE_S = 24 * 3600
-    startup_snapshot: dict | None = None
+    startup_advances: list[tuple[str, dict, dict]] = []
 
     def _load_and_advance_startup() -> list[dict]:
-        nonlocal startup_snapshot
         startup_missed: list[dict] = []
         with _STATE_LOCK:
             _load_state()
             state_snapshot = copy.deepcopy(_state)
-            startup_snapshot = state_snapshot
-            for task in _state["tasks"].values():
+            for tid, task in _state["tasks"].items():
                 sched = task.get("schedule")
                 if not sched:
                     continue
@@ -1934,9 +1955,15 @@ async def _start_scheduler() -> None:
                         f"[scheduler] skipping stale catch-up for task "
                         f"{task.get('id','?')} ({task.get('name','?')}): "
                         f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
+                fields = ("next_run", "enabled", "schedule")
+                before = {key: copy.deepcopy(task[key]) for key in fields
+                          if key in task}
                 task["next_run"] = _compute_next_run(sched)
                 if sched.get("kind") == "once" and task["next_run"] is None:
                     task["enabled"] = False
+                after = {key: copy.deepcopy(task[key]) for key in fields
+                         if key in task}
+                startup_advances.append((tid, before, after))
             try:
                 _save_state()
             except Exception:
@@ -1949,14 +1976,32 @@ async def _start_scheduler() -> None:
             "scheduler.startup_state", "scheduler", _load_and_advance_startup,
             owned=True,
         )
+        # Resolve crash-interrupted deletions before starting scheduled work.
+        # This await is still before the catch-up admission boundary: stopping
+        # here must preserve the trigger just as stopping during its fsync does.
+        await _resume_pending_task_cleanups()
     except asyncio.CancelledError:
-        # Startup did not reach its catch-up launch boundary. Restore the exact
-        # pre-advance schedule so the next process can recover the missed window.
-        if startup_snapshot is not None:
+        if startup_advances:
             def _rollback_startup_advance() -> None:
                 with _STATE_LOCK:
-                    _restore_state(startup_snapshot)
-                    _save_state()
+                    snapshot = copy.deepcopy(_state)
+                    for tid, before, after in startup_advances:
+                        current = _state["tasks"].get(tid)
+                        if current is None or {
+                            key: current[key] for key in
+                            ("next_run", "enabled", "schedule") if key in current
+                        } != after:
+                            continue  # preserve a newer edit or deletion
+                        for key in ("next_run", "enabled"):
+                            if key in before:
+                                current[key] = before[key]
+                            else:
+                                current.pop(key, None)
+                    try:
+                        _save_state()
+                    except Exception:
+                        _restore_state(snapshot)
+                        raise
 
             await obs.to_thread_io(
                 "scheduler.startup_rollback",
@@ -1965,10 +2010,6 @@ async def _start_scheduler() -> None:
                 owned=True,
             )
         raise
-    # Resolve crash-interrupted deletions before starting new scheduled work.
-    # Failures are logged and retain their exact durable intent, so scheduler
-    # availability does not depend on one damaged external session tree.
-    await _resume_pending_task_cleanups()
 
     # Kick off catch-up runs — staggered so an overnight outage with many
     # daily tasks doesn't spawn every CLI subprocess at once (thundering

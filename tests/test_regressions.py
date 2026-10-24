@@ -817,6 +817,24 @@ def test_render_tool_use_caps_oversized_string_input():
     assert "[truncated" in c, f"expected truncation marker, got tail: {c[-80:]!r}"
 
 
+def test_reloaded_bash_summary_matches_live_full_command():
+    # History reload must not re-truncate what the live stream showed in full
+    # (8c51aeb removed the 200-char cut; the 2a86eda extraction restored it
+    # only on the reload path).
+    from backend.chat import _render_tool_use, _summarize_tool_input
+
+    command = "python3 - <<'EOF'\n" + "x = 1\n" * 120 + "EOF"
+    assert len(command) > 200
+
+    class _Block:
+        id = "tu_test_003"
+        name = "Bash"
+        input = {"command": command}
+
+    assert _render_tool_use(_Block())["summary"] == command
+    assert _summarize_tool_input("Bash", {"command": command}) == command
+
+
 # ============================================================================
 # tool_result Bash parsing — when the result body carries CLI's pseudo-XML
 # wrapped output, _render_tool_result populates a `bash` field with
@@ -983,3 +1001,104 @@ def test_cost_dashboard_includes_vendor_rollup_and_label(client, auth):
         assert "vendor" in row
         assert "cost_reported" in row
         assert isinstance(row["cost_reported"], bool)
+
+
+def test_rebuilt_meter_uses_the_session_model_not_the_cli_transcript_name(
+        client, auth, monkeypatch, tmp_path):
+    """A cold cache rebuilt the denominator from the transcript's CLI model.
+
+    The transcript says `deepseek-v4-1-flash-261017` / `Opus 5.5`, which is not
+    a MuseLab route id: DUCC detection failed, the generic 128K fallback won,
+    and a 234K/1M session painted a full red ring at 182% (2026-10-23).
+    """
+    import json
+
+    from backend import chat as chat_mod
+    from backend import sessions as sess_mod
+
+    sid = client.post(
+        "/api/chat/sessions", headers={**auth, "Content-Type": "application/json"},
+        json={"name": "ctx rebuild", "model": "ducc:deepseek-v4-1-flash"},
+    ).json()["id"]
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-10-23T12:00:00Z",
+        "message": {"model": "deepseek-v4-1-flash-261017",
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 234_000}},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: transcript)
+    monkeypatch.setattr(chat_mod, "_session_usage", {})
+
+    # The API cannot resolve a DUCC model in a sandbox without the CLI, so lock
+    # the model the way a real first turn does.
+    sess_mod.update_model(sid, "ducc:deepseek-v4-1-flash")
+    rebuilt = chat_mod._session_usage_from_jsonl(sid)
+    assert rebuilt["context_limit"] == chat_mod.DUCC_DEFAULT_CONTEXT_LIMIT
+    assert rebuilt["context_used_pct"] == round(234_010 / 200_000 * 100, 1)
+
+    # A measured window still wins over any table value.
+    sess_mod.set_session_ctx_window(sid, 1_000_000)
+    rebuilt = chat_mod._session_usage_from_jsonl(sid)
+    assert rebuilt["context_limit"] == 1_000_000
+    assert rebuilt["context_used_pct"] == round(234_010 / 1_000_000 * 100, 1)
+
+
+def test_usage_endpoint_promotes_a_measured_window_for_cold_rebuilds(
+        client, auth, monkeypatch):
+    """The live snapshot knows the window even when the post-turn probe skipped
+    persisting it; /usage must promote it so a cold rebuild is not guessing."""
+    from backend import chat as chat_mod
+    from backend import sessions as sess_mod
+
+    sid = client.post(
+        "/api/chat/sessions", headers={**auth, "Content-Type": "application/json"},
+        json={"name": "ctx promote", "model": "claude-opus-4-8"},
+    ).json()["id"]
+    assert sess_mod.get_session_ctx_window(sid) is None
+    chat_mod._session_usage[sid] = {
+        "input_tokens": 1_000, "output_tokens": 5,
+        "cache_read_tokens": 20_000, "cache_creation_tokens": 0,
+        "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "context_used": 21_000, "context_used_pct": 10.5,
+        "context_limit": 200_000, "sdk_context_max_tokens": 1_000_000,
+    }
+    body = client.get(
+        f"/api/chat/usage/{sid}?model=claude-opus-4-8", headers=auth).json()
+    assert body["context_limit"] == 1_000_000
+    assert sess_mod.get_session_ctx_window(sid) == 1_000_000
+    chat_mod._session_usage.pop(sid, None)
+
+
+def test_fallback_window_never_round_trips_as_measured(client, auth):
+    """A cached estimate must not come back as an SDK-measured window.
+
+    /usage hands `context_limit` back as `stored` with its provenance; before
+    this guard a 200K DUCC fallback returned as `session_sdk`, so the ring
+    treated a guessed 147% as real and turned red.
+    """
+    from backend import chat as chat_mod
+
+    details = chat_mod._context_limit_details(
+        "ducc:deepseek-v4-1-flash", stored=200_000,
+        stored_source="model_fallback")
+    assert details["context_limit_source"] == "model_fallback"
+    assert details["context_limit_is_estimate"] is True
+    assert details["context_limit"] == chat_mod.DUCC_DEFAULT_CONTEXT_LIMIT
+
+    sid = client.post(
+        "/api/chat/sessions", headers={**auth, "Content-Type": "application/json"},
+        json={"name": "ctx estimate", "model": "claude-opus-4-8"},
+    ).json()["id"]
+    chat_mod._session_usage[sid] = {
+        "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0,
+        "cache_creation_tokens": 0, "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "context_used": 295_517, "context_used_pct": 147.8,
+        "context_limit": 200_000, "context_limit_source": "model_fallback",
+        "context_limit_is_estimate": True,
+    }
+    body = client.get(
+        f"/api/chat/usage/{sid}?model=claude-opus-4-8", headers=auth).json()
+    assert body["context_limit_source"] == "model_fallback"
+    assert body["context_limit_is_estimate"] is True
+    chat_mod._session_usage.pop(sid, None)

@@ -13,9 +13,12 @@ fake, keeping queue permission and rollback semantics hermetic.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
+import re
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -885,6 +888,7 @@ def test_queue_endpoint_preserves_bounded_selection_quote_presentation(
         "path": "README.md",
         "text": "selected context",
         "truncated": False,
+        "label": "[引用1]",
     }
     response = client.post(
         f"/api/chat/sessions/{sid}/queue",
@@ -1522,7 +1526,7 @@ async def test_clear_queue_preserves_adjustment_accepted_after_snapshot(
         clear_task = asyncio.create_task(chat.clear_queue_api(sid))
         await asyncio.wait_for(cancel_started.wait(), timeout=1)
 
-        second = await chat.enqueue_api(
+        second = await asyncio.wait_for(chat.enqueue_api(
             sid,
             chat.QueueEnqueueReq(
                 text="accepted after clear snapshot",
@@ -1530,7 +1534,7 @@ async def test_clear_queue_preserves_adjustment_accepted_after_snapshot(
                 active_turn_id=broadcast.turn_id,
             ),
             chat.BackgroundTasks(),
-        )
+        ), timeout=2)
         second_item = next(
             item for item in second["queue"]["items"]
             if item["text"] == "accepted after clear snapshot"
@@ -1816,15 +1820,20 @@ async def test_cancelled_scheduled_drain_restores_accepted_message(
     entered = asyncio.Event()
 
     async def stalled_start(*_args, **_kwargs):
+        claim = sess.get_queue(sid)["inflight"]
+        assert claim["item"]["text"] == "survive restart"
+        assert not claim.get("turn_id")
         entered.set()
+        # Cancel at the dispatch boundary, after real reads and the claim.
+        # Executor admission is a precondition, not a one-second SLA here.
+        asyncio.get_running_loop().call_soon(task.cancel)
         await asyncio.Event().wait()
 
     monkeypatch.setattr(chat, "_start_turn", stalled_start)
     task = asyncio.create_task(chat._maybe_drain_queue(sid))
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert entered.is_set()
 
     queue = sess.get_queue(sid)
     assert [item["text"] for item in queue["items"]] == ["survive restart"]
@@ -1885,18 +1894,21 @@ async def test_cancelled_bound_drain_does_not_duplicate_live_owner(
         sess.bind_queue_turn(
             session_id, kwargs["queue_item_id"], broadcast.turn_id)
         entered.set()
+        # Cancel only after the real reads, claim, and live-owner binding.
+        # Executor admission is a precondition, not a one-second SLA here.
+        asyncio.get_running_loop().call_soon(task.cancel)
         await asyncio.Event().wait()
 
     monkeypatch.setattr(chat, "_start_turn", bound_then_stall)
     task = asyncio.create_task(chat._maybe_drain_queue(sid))
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert entered.is_set()
 
     queue = sess.get_queue(sid)
     assert queue["items"] == []
     assert queue["inflight"]["item"]["id"] == queued["id"]
+    assert queue["inflight"]["turn_id"] == chat._active_turns[sid].turn_id
     chat._active_turns.pop(sid, None)
 
 
@@ -2306,3 +2318,124 @@ async def test_steering_recall_precedes_sdk_write_and_falls_back_if_owner_finish
     finally:
         chat._active_turns.pop(sid, None)
         chat.mem0.clear_prepared_recall(sid, broadcast.turn_id)
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_with_attachments_steers_text_with_disk_paths(
+    app_module, monkeypatch,
+):
+    """Steering is text-only: attachments are written to disk and referenced."""
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(
+            self, prompt, *, session_id, command_uuid,
+        ):
+            writes.append(prompt)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    monkeypatch.setattr(broadcast, "publish", lambda event: None)
+    chat._active_turns[sid] = broadcast
+    doc_id, img_id = "steer-doc-1", "steer-img-1"
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n-fixture").decode("ascii")
+    with chat._image_store_lock:
+        chat._image_store[doc_id] = {
+            "kind": "text", "mime": "text/plain", "name": "notes.txt",
+            "raw": b"hello", "text": "hello", "ts": chat.time.time(),
+        }
+        chat._image_store[img_id] = {
+            "kind": "image", "mime": "image/png", "b64": png,
+            "ts": chat.time.time(),
+        }
+    try:
+        response = await chat.enqueue_api(
+            sid,
+            chat.QueueEnqueueReq(
+                text="look at these", delivery="adjust",
+                image_ids=f"{doc_id},{img_id}",
+                active_turn_id=broadcast.turn_id,
+            ),
+            chat.BackgroundTasks(),
+        )
+
+        assert response["effective_delivery"] == "adjust"
+        item = response["queue"]["items"][0]
+        assert item["image_ids"] == ""
+        assert item["display_text"] == "look at these"
+        assert len(writes) == 1
+        prompt = writes[0]
+        assert prompt.startswith("look at these\n\n--- Files attached")
+        paths = re.findall(r'path=("[^"]+")', prompt)
+        assert len(paths) == 2
+        for raw in paths:
+            assert Path(json.loads(raw)).is_file()
+        assert 'filename="notes.txt"' in prompt
+        # Blobs are consumed once the steering item owns the paths.
+        assert doc_id not in chat._image_store
+        assert img_id not in chat._image_store
+        assert not chat._staged_attachment_claims
+    finally:
+        chat._active_turns.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_busy_adjust_with_missing_attachment_falls_back_to_fifo(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    writes = []
+
+    class SteeringClient:
+        async def query_steering(self, prompt, *, session_id, command_uuid):
+            writes.append(prompt)
+
+    monkeypatch.setattr(chat, "MuseLabSDKClient", SteeringClient)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast.query_committed = True
+    broadcast.runtime_client = SteeringClient()
+    monkeypatch.setattr(broadcast, "publish", lambda event: None)
+    chat._active_turns[sid] = broadcast
+    try:
+        with pytest.raises(chat.HTTPException) as exc:
+            await chat.enqueue_api(
+                sid,
+                chat.QueueEnqueueReq(
+                    text="x", delivery="adjust", image_ids="steer-gone-1",
+                    active_turn_id=broadcast.turn_id,
+                ),
+                chat.BackgroundTasks(),
+            )
+        assert exc.value.status_code == 409
+        assert writes == []
+    finally:
+        chat._active_turns.pop(sid, None)
+
+
+def test_queue_keeps_every_selection_quote(app_module):
+    """Quotes are unlimited; only each item's fields stay bounded."""
+    from backend import chat
+
+    quotes = [{
+        "id": f"quote-{n}", "source": "preview", "role": "",
+        "sessionId": "sid", "messageId": "", "path": f"/f{n}.md",
+        "text": f"selected text {n}", "truncated": False, "label": f"[引用{n}]",
+        "unexpected": "dropped",
+    } for n in range(1, 9)]
+    quotes.append({"id": "empty", "text": "   "})
+    quotes.append("not-a-dict")
+
+    normalized = chat._normalize_queue_selection_quotes(quotes)
+
+    assert [item["id"] for item in normalized] == [f"quote-{n}" for n in range(1, 9)]
+    assert all("unexpected" not in item for item in normalized)
+    assert normalized[-1]["label"] == "[引用8]"

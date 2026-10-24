@@ -13,6 +13,7 @@ import os
 import re
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -184,14 +185,27 @@ class QdrantVectorStore(VectorStore):
                 raise ValueError(
                     f"Qdrant collection dimension mismatch: "
                     f"{existing_size} != {dimensions}")
-            return
+            payload_schema = result.get("payload_schema") or {}
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 raise
-        await self._request("PUT", path, json={
-            "vectors": {"size": dimensions, "distance": "Cosine"},
-            "on_disk_payload": True,
-        })
+            await self._request("PUT", path, json={
+                "vectors": {"size": dimensions, "distance": "Cosine"},
+                "on_disk_payload": True,
+            })
+            payload_schema = {}
+
+        # Existing collections need these too: every query filters both fields.
+        # Validate before mutation; never replace an incompatible user index.
+        fields = ("owner_id", "status")
+        for field in fields:
+            if field in payload_schema and payload_schema[field].get("data_type") != "keyword":
+                raise ValueError(f"Qdrant {field} payload index must be keyword")
+        for field in fields:
+            if field not in payload_schema:
+                await self._request("PUT", f"{path}/index?wait=true", json={
+                    "field_name": field, "field_schema": "keyword",
+                })
 
     async def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
         await self.upsert_many([(item_id, vector, payload)])
@@ -568,7 +582,7 @@ class GenerationError(RuntimeError):
         self.reason = reason if reason in {
             "unknown", "timeout", "transport_error", "http_error", "sdk_exception",
             "sdk_result_error", "missing_terminal", "empty_output", "invalid_json",
-            "non_object_json", "configuration", "exception",
+            "non_object_json", "invalid_schema", "configuration", "exception",
         } else "unknown"
 
 
@@ -629,7 +643,7 @@ class GenerationProvider:
                 route = self._route()
                 if route is None:
                     route_kind = "ducc" if configured_model.startswith("ducc:") else "sdk"
-                    phases["phase"] = "awaiting_sdk_event"
+                    phases["phase"] = "sdk_setup"
                     result = await self._complete_with_sdk(system, prompt, max_tokens)
                     response_chars, outcome = len(result), "done"
                     return result
@@ -716,8 +730,13 @@ class GenerationProvider:
                 "TimeoutError", "ConnectTimeout", "ReadTimeout", "WriteTimeout",
                 "PoolTimeout", "ConnectError", "ReadError", "WriteError",
                 "RemoteProtocolError", "HTTPStatusError",
+                "TypeError", "ValueError", "AttributeError", "ImportError",
+                "ModuleNotFoundError", "OSError", "PermissionError",
+                "FileNotFoundError", "NotADirectoryError", "IsADirectoryError",
                 *_SDK_RETRYABLE_ERROR_NAMES, *_SDK_TERMINAL_ERROR_NAMES,
             } else "OtherError"
+            if isinstance(exc, OSError) and isinstance(exc.errno, int):
+                phases["os_error_code"] = exc.errno
             retryable = is_retryable_generation_error(exc)
             raise GenerationError(
                 retryable=retryable,
@@ -752,6 +771,18 @@ class GenerationProvider:
 
         from . import endpoints
         model = self.config.generation_model
+        phases = _generation_phases.get()
+        if phases is not None:
+            phases["phase"] = "sdk_workspace"
+
+        def prepare_workspace():
+            workdir = memory_dir() / "generator"
+            workdir.mkdir(parents=True, exist_ok=True)
+            return workdir.resolve()
+
+        workdir = await asyncio.to_thread(prepare_workspace)
+        if phases is not None:
+            phases["phase"] = "sdk_routing"
         options_kwargs: dict[str, Any] = {}
         if endpoints.is_ducc_model(model):
             # Reuse the same DUCC CLI routing as chat so memory generation can
@@ -769,14 +800,20 @@ class GenerationProvider:
                     retryable=False, provider="ducc", model=model,
                     category="invalid_configuration")
             options_kwargs["cli_path"] = wrapper
-            options_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
+            options_kwargs["env"] = _ducc_subprocess_env(ducc_executable, workdir)
             model = endpoints.ducc_cli_model(model)
 
         # Apply the same output budget as the HTTP provider through the native
         # CLI setting. Extraction is a bounded text transform, not an agent task.
         options_kwargs.setdefault("env", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_tokens)
-        workdir = memory_dir() / "generator"
-        await asyncio.to_thread(workdir.mkdir, parents=True, exist_ok=True)
+        # CLI stderr may echo the extraction prompt; keep only one
+        # content-free category line instead of letting it reach the process stderr.
+        from .chat import _privacy_safe_cli_stderr_logger
+        options_kwargs["stderr"] = _privacy_safe_cli_stderr_logger(
+            "DUCC" if endpoints.is_ducc_model(self.config.generation_model) else "SDK-CLI",
+            generation_job_ref.get())
+        if phases is not None:
+            phases["phase"] = "sdk_options"
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=system,
@@ -795,7 +832,8 @@ class GenerationProvider:
             include_partial_messages=False,
             **options_kwargs,
         )
-        phases = _generation_phases.get()
+        if phases is not None:
+            phases["phase"] = "awaiting_sdk_event"
         sdk_started = time.perf_counter()
         result_at = None
         parts: list[str] = []
@@ -878,9 +916,14 @@ class GenerationProvider:
             raise ValueError("ambiguous_json")
         return value
 
-    async def complete_json(self, system: str, prompt: str) -> dict:
-        # A syntactically valid array/string is still the wrong schema. Make
-        # one bounded format-repair attempt instead of losing the job at once.
+    async def complete_json(self, system: str, prompt: str, *,
+                            validator: Callable[[dict], dict] | None = None) -> dict:
+        """Parse and optionally normalize/validate within two total calls.
+
+        Validators return the accepted object or raise ValueError. Their error
+        text and rejected payloads are never logged or included in repair prompts.
+        Other exceptions propagate rather than disguising programming failures.
+        """
         instruction = "\nReturn exactly one JSON object. No arrays, quoted JSON, Markdown or prose."
         for attempt in range(2):
             text = (await self.complete(system + instruction, prompt)).strip()
@@ -889,8 +932,14 @@ class GenerationProvider:
             try:
                 value = self._json_value(text)
                 if isinstance(value, dict):
-                    return value
-                reason = "non_object_json"
+                    if validator is None:
+                        return value
+                    reason = "invalid_schema"
+                    value = validator(value)
+                    if isinstance(value, dict):
+                        return value
+                else:
+                    reason = "non_object_json"
             except json.JSONDecodeError as exc:
                 error_offset = exc.pos
             except ValueError:

@@ -40,6 +40,7 @@
      transient reading aid, not a subtle surface state; keep it solid enough
      that selected text remains obvious over chat bubbles, markdown and forms. */
   --c-selection-bg: #2f66d0;
+  --c-editor-selection: #294775;
   --c-selection-fg: #ffffff;
   --c-caret: #ffffff;
   /* Primary-CTA tokens. Kept separate from --c-accent so accent can
@@ -232,6 +233,7 @@ html[data-theme="light"] {
   --c-accent-soft: rgba(58, 120, 240, 0.10);
   --c-accent-fg: #1d4dcc;
   --c-selection-bg: var(--c-accent-fg);
+  --c-editor-selection: #bdd5ff;
   --c-selection-fg: #ffffff;
   --c-caret: var(--c-accent-fg);
   /* Light theme: white text on a darker bg keeps the conventional
@@ -312,6 +314,7 @@ html[data-theme="eyecare"] {
   --c-accent-soft: rgba(90, 143, 106, 0.10);
   --c-accent-fg: #3a5a30;
   --c-selection-bg: #b8d4ad;
+  --c-editor-selection: #b8d4ad;
   --c-selection-fg: #1d2418;
   --c-caret: var(--c-accent-fg);
   /* Eyecare: sage accent + white was only 3.77; deepen to #3f6b4c
@@ -2504,6 +2507,14 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      same on .editor-live-preview. */
   overscroll-behavior: none;
 }
+.markdown-outline { flex: 0 0 auto; min-height: 0; background: var(--c-bg-1); border-bottom: 1px solid var(--c-border); }
+.markdown-outline-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 12px; font-size: var(--fs-sm); }
+.markdown-outline-items { max-height: min(22vh, 180px); overflow: auto; overscroll-behavior: contain; }
+.markdown-outline-items button { display: block; width: 100%; border: 0; text-align: left; padding: 5px 12px; background: transparent; color: var(--c-fg-0); font: inherit; font-size: var(--fs-sm); overflow-wrap: anywhere; cursor: pointer; }
+.markdown-outline-items button:hover, .markdown-outline-items button:focus-visible { background: var(--c-bg-3); }
+.markdown-outline-items button:disabled { color: var(--c-fg-2); cursor: wait; }
+.markdown-outline-items p { margin: 8px 12px; color: var(--c-fg-2); font-size: var(--fs-sm); }
+.markdown-outline-toggle[aria-expanded="true"] { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .preview-body.drag-hover { outline: 2px dashed var(--c-accent); outline-offset: -8px; }
 
 /* Find-in-preview widget — floats top-right over the scrolling content,
@@ -3167,10 +3178,10 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .editor-view-switch button:first-child { border-left: 0; }
 .editor-view-switch button:hover { color: var(--c-fg-0); background: var(--c-bg-2); }
-.editor-view-switch button.active { background: var(--c-accent); color: var(--c-accent-fg, #fff); }
+.editor-view-switch button.active { background: var(--c-btn-primary-bg); color: var(--c-on-accent); }
 .editor-cm .CodeMirror {
   height: 100%; font-family: var(--font-mono);
-  font-size: var(--fs-base); line-height: 1.6;
+  font-size: var(--editor-font-size, 16px); line-height: 1.7;
 }
 .editor-status {
   display: flex; align-items: center; gap: var(--sp-3);
@@ -3182,13 +3193,45 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 .editor-status .seg b { color: var(--c-fg-0); font-weight: var(--fw-medium); }
 .editor-status .spacer { flex: 1; }
 .editor-status .seg.dirty { color: var(--c-warn); }
-.editor-cm .CodeMirror-gutters {
+.editor-wrap .editor-cm .CodeMirror-gutters {
   border-right: 1px solid var(--c-border);
   background: var(--c-bg-1);
 }
-/* Override CM5 default light theme to match our bg in light mode */
-html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
-html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
+/* Theme selectors outrank CM's lazily injected vendor theme in every mode. */
+.editor-wrap .editor-cm .CodeMirror { background: var(--c-bg-0); color: var(--c-fg-0); }
+.editor-wrap .editor-cm .CodeMirror-linenumber { color: var(--c-fg-2); }
+.editor-wrap .editor-cm .CodeMirror-cursor { border-left-color: var(--c-fg-0); }
+/* CM draws selections behind syntax text, so use a visible tint that keeps
+   the theme's foreground readable, including when toolbar clicks blur it. */
+.editor-wrap .editor-cm .CodeMirror-selected { background: var(--c-editor-selection); }
+.editor-wrap .editor-cm .CodeMirror-focused .CodeMirror-selected { background: var(--c-editor-selection); }
+.editor-wrap .CodeMirror-lines { padding: 12px 0; }
+.editor-wrap .CodeMirror pre.CodeMirror-line { padding: 0 12px; }
+.editor-wrap .cm-comment { color: var(--c-fg-2); }
+.editor-wrap .cm-header, .editor-wrap .cm-link { color: var(--c-accent-fg); }
+.editor-wrap .cm-quote { color: var(--c-fg-2); }
+.editor-font-controls { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; white-space: nowrap; }
+.editor-font-controls button, .editor-notice button {
+  background: var(--c-bg-0); color: var(--c-fg-0); border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm); padding: 3px 7px; cursor: pointer;
+}
+.editor-font-controls button:disabled { opacity: .45; cursor: default; }
+.editor-font-controls span, .editor-preview-state { font-size: var(--fs-xs); color: var(--c-fg-2); }
+.editor-toolbar { flex-wrap: wrap; }
+.editor-notice { padding: 6px 12px; color: var(--c-fg-1); background: var(--c-bg-1); font-size: var(--fs-sm); }
+.editor-fallback { width: 100%; height: 100%; box-sizing: border-box; padding: 12px;
+  background: var(--c-bg-0); color: var(--c-fg-0); border: 0; resize: none;
+  font: var(--editor-font-size, 16px)/1.7 var(--font-mono); }
+.editor-live-preview .markdown { padding: 16px 20px; overflow-anchor: none; }
+.editor-preview-block { display: flow-root; content-visibility: auto; contain-intrinsic-size: auto 300px; }
+.editor-status { min-height: 28px; height: auto; flex-wrap: wrap; padding-top: 6px; padding-bottom: 6px; }
+@media (max-width: 700px) {
+  .editor-view-split .editor-main { flex-direction: column; }
+  .editor-view-split .editor-live-preview { border-left: 0; border-top: 1px solid var(--c-border); }
+  .editor-toolbar { padding: 6px 8px; gap: 6px; }
+  .editor-view-switch button { padding: 5px 10px; }
+  .editor-status { gap: 8px; font-size: 11px; }
+}
 
 .markdown {
   padding: var(--sp-6) var(--sp-8);
@@ -4322,6 +4365,7 @@ pre.text {
 .activity-row.waiting_approval .activity-state-dot,.activity-row.paused .activity-state-dot { visibility:visible; background:var(--c-warn); }
 .activity-row.completed.is-unread .activity-state-dot { visibility:visible; background:var(--c-success); }
 .activity-row.failed.is-unread .activity-state-dot { visibility:visible; background:var(--c-danger); }
+.activity-row.has-bg-work:not(.running):not(.waiting_approval):not(.paused) .activity-state-dot { visibility:visible; background:var(--c-warn); box-shadow:0 0 5px color-mix(in srgb, var(--c-warn) 55%, transparent); }
 .activity-row.failed .activity-row-side > span { color:var(--c-danger); }
 .activity-row-main { min-width:0; flex:1; display:flex; flex-direction:column; gap:3px; }
 .activity-session-name { overflow:hidden; color:var(--c-fg-0); font-size:var(--fs-sm); font-weight:var(--fw-medium); line-height:1.35; text-overflow:ellipsis; white-space:nowrap; }
@@ -6552,6 +6596,29 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .user-msg-quote strong { font-size: var(--fs-xs); font-weight: var(--fw-semibold); }
 .user-msg-quote span { margin-top: 1px; opacity: 0.78; font-size: var(--fs-xs); }
+/* Inline quote pill inside the user bubble text, at the marker's position. */
+.user-msg-inline-quote {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  max-width: 100%;
+  margin: 0 2px;
+  padding: 0 6px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.12);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  vertical-align: baseline;
+}
+.user-msg-inline-quote-label { flex: 0 0 auto; font-weight: var(--fw-semibold); }
+.user-msg-inline-quote-text {
+  min-width: 0;
+  overflow: hidden;
+  opacity: 0.78;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .user-msg-imgs {
   display: flex; flex-wrap: wrap; gap: 6px;
   margin-bottom: 6px;
@@ -6644,6 +6711,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-bottom: 10px;
 }
 .ctx-breakdown-stack-seg { height: 100%; transition: width var(--t-fast); }
+/* Autocompact buffer: reserved headroom, not occupancy — hatched, not filled. */
+.ctx-breakdown-stack-seg.reserved,
+.ctx-breakdown-swatch.reserved {
+  background: repeating-linear-gradient(
+    45deg, var(--c-fg-4) 0 2px, transparent 2px 5px);
+}
+.ctx-breakdown-row.reserved .ctx-breakdown-name,
+.ctx-breakdown-row.reserved .ctx-breakdown-tokens { color: var(--c-fg-3); }
 /* Rows carry no rule of their own. The dashed border used to run under every
    row, which at 6 rows read as a table grid and fought the stacked bar for
    attention. Proportion is the stacked bar's job; these rows are a figure
@@ -7339,6 +7414,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .tool-task-stop:hover { text-decoration: underline; }
 
+/* The detail dialog is also opened from the scheduler modal's background
+   section. Both backdrops are z-index 900, so DOM order put the scheduler
+   on top; sit above it but below the confirm dialog (1300). */
+.modal-backdrop.task-detail-backdrop { z-index: 1280; }
+
 /* SDK background-task detail dialog. It stays deliberately read-only: lifecycle
    metadata plus a bounded text preview from /api/chat/task-output. */
 .modal.task-detail-modal {
@@ -7796,6 +7876,51 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   line-height: 1.5;
 }
 .chat-input-textarea::placeholder { color: var(--c-fg-3); }
+/* Inline quote highlight mirror (see index.html). Only box-shadow and
+   background are styled on marks: anything that changes glyph advance
+   (padding, border, weight) would desynchronise the wrap from the textarea. */
+.chat-input-field { position: relative; }
+.chat-input-field > .chat-input-textarea { position: relative; z-index: 1; }
+.chat-input-mirror {
+  position: absolute;
+  top: 0; left: 0;
+  box-sizing: border-box;
+  margin: 0; border: 0;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+.chat-input-quote-mark {
+  color: transparent;
+  background: var(--c-accent-soft);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--c-accent) 45%, transparent);
+}
+.composer-quote-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 6px;
+  padding: 4px 10px;
+  border-radius: var(--r-md);
+  background: var(--c-accent-soft);
+  color: var(--c-fg-1);
+  font-size: var(--fs-xs);
+}
+.composer-quote-hint svg { width: 13px; height: 13px; flex: 0 0 auto; color: var(--c-accent); }
+.composer-quote-hint strong { flex: 0 0 auto; font-weight: var(--fw-semibold); }
+.composer-quote-hint span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--c-fg-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .chat-input-textarea:focus::placeholder { opacity: 0.35; transition: opacity var(--t-fast); }
 
 /* Toolbar — hairline separator above, very tight spacing, ALL controls
@@ -10062,6 +10187,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   .sched-modal { width: 640px; max-width: calc(100vw - 32px); }
 }
 .sched-body { max-height: 70vh; overflow-y: auto; padding: 12px 16px; }
+.sched-panel { display: contents; }
+.sched-bg-card .subagent-task { margin: 0; }
 .sched-native-section {
   padding: 14px;
   margin-bottom: 16px;

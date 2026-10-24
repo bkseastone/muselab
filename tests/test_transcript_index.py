@@ -7,6 +7,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from backend import transcript_index as ti
 
 
@@ -1183,6 +1185,44 @@ def test_reload_footer_exposes_four_fields_for_active_canonical_tail(
         active.close()
 
 
+def test_reload_footer_keeps_live_continuation_tail_running(
+    client, auth, app_module, tmp_path,
+):
+    """Native-cron / SDK continuation turns render through the watcher's
+    standalone renderer.  A history reload while that turn is still live (the
+    frontend does one after a mid-run auto-compaction) must keep its tail
+    Running instead of stamping it Completed (V7训练, 2026-10-19)."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    from backend import chat as chat_mod
+
+    entries = [
+        _entry("u-summary", "user", "This session is being continued",
+               timestamp="2026-10-19T07:35:15Z"),
+        _entry("a-live", "assistant", "still working", "u-summary",
+               timestamp="2026-10-19T07:35:50Z"),
+    ]
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    active = chat_mod.TurnBroadcast(sid, model="ducc:deepseek-v4-1-flash")
+    active.is_continuation = True
+    state = {"tool_use_names": {}, "streamed": [], "assistant_uuid": ""}
+    list(chat_mod._render_continuation_message(
+        AssistantMessage(content=[TextBlock(text="still working")],
+                         model="deepseek", uuid="a-live"),
+        state, broadcast=active))
+    assert active.last_assistant_uuid == "a-live"
+    chat_mod._active_turns[sid] = active
+    try:
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+        assert response.status_code == 200, response.text
+        tail = response.json()["messages"][-1]
+        assert tail["uuid"] == "a-live"
+        assert tail["turn_status"] == "running"
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        active.close()
+
+
 def test_around_uuid_limit_is_in_bubbles_and_keeps_target(
     client, auth, app_module, tmp_path,
 ):
@@ -1357,3 +1397,151 @@ def test_incremental_orders_match_rebuild_after_progress_fork_and_duplicate(tmp_
         ti._rebuild_derived(oracle)
         for name in ('orders', 'bubble_prefix', 'tool_use_names', 'task_status'):
             assert actual[name] == oracle[name]
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("leading_meta", [False, True])
+def test_turn_uuid_resolution_crosses_meta_image_hints(
+    client, auth, app_module, tmp_path, warm, leading_meta,
+):
+    """Internal user records keep their parent links without owning a turn."""
+    from backend import chat as chat_mod
+
+    initial = [
+        _entry("old-user", "user", "earlier question"),
+        _entry("old-assistant", "assistant", "earlier answer", "old-user"),
+    ] if warm else []
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, initial)
+    _, boundary = chat_mod._turn_transcript_boundary(sid, "claude-sonnet-4-6")
+    parent = "old-assistant" if warm else None
+    if leading_meta:
+        _append(transcript, _entry(
+            "leading-hint", "user", "internal context", parent,
+            isMeta=True, timestamp="2024-01-01T00:00:01Z"))
+        parent = "leading-hint"
+    _append(
+        transcript,
+        _entry("image-user", "user", [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "YQ==",
+            }},
+            {"type": "text", "text": "describe the image"},
+        ], parent, timestamp="2024-01-01T00:00:01.100Z"),
+        _entry("image-hint", "user", "internal image dimensions", "image-user",
+               isMeta=True, timestamp="2024-01-01T00:00:01.100Z"),
+        _entry("second-hint", "user", "internal reminder", "image-hint",
+               isMeta=True, timestamp="2024-01-01T00:00:01.200Z"),
+        _entry("image-assistant", "assistant", "the complete answer", "second-hint",
+               timestamp="2024-01-01T00:00:02Z"),
+        _entry("later-user", "user", "next question", "image-assistant",
+               timestamp="2024-01-01T00:00:04Z"),
+        _entry("later-assistant", "assistant", "next answer", "later-user",
+               timestamp="2024-01-01T00:00:05Z"),
+    )
+    indexed = chat_mod._ensure_transcript_index(sid)
+    assert indexed is not None
+    path, index = indexed
+    hint = next(r for r in index["records"] if r["uuid"] == "image-hint")
+    # Existing indexes classify these hints as real prompts. The resolver must
+    # honor the persisted is_meta bit without requiring an index rebuild.
+    assert hint["is_meta"] is True and hint["real_user_prompt"] is True
+    probe = {
+        "transcript_boundary": boundary,
+        "started_at_ms": 1_704_067_201_000,
+        "interrupted_at_ms": 1_704_067_203_000,
+        "canonical_terminal_published": True,
+    }
+    span, assistant = chat_mod._cancelled_snapshot_canonical_span(path, index, probe)
+    assert span == ["image-user", "image-hint", "second-hint", "image-assistant"]
+    assert assistant == "image-assistant"
+    assert chat_mod._turn_uuids_from_boundary(
+        sid, boundary,
+        started_at_ms=1_704_067_201_000,
+        terminal_at_ms=1_704_067_203_000,
+    ) == ("image-assistant", "image-user", True)
+
+
+def test_turn_uuid_resolution_crosses_mid_turn_auto_compaction(
+    client, auth, app_module, tmp_path,
+):
+    """A compact boundary roots a new chain; the turn must still own its tail."""
+    from backend import chat as chat_mod
+
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path,
+        [_entry("old-user", "user", "earlier question"),
+         _entry("old-assistant", "assistant", "earlier answer", "old-user")])
+    _, boundary = chat_mod._turn_transcript_boundary(sid, "claude-sonnet-4-6")
+    _append(
+        transcript,
+        _entry("user", "user", "long task", "old-assistant",
+               timestamp="2024-01-01T00:00:01Z"),
+        _entry("early-assistant", "assistant", "working", "user",
+               timestamp="2024-01-01T00:00:02Z"),
+        _entry("boundary", "system", "", None, subtype="compact_boundary",
+               logicalParentUuid="early-assistant",
+               timestamp="2024-01-01T00:00:03Z"),
+        _entry("summary", "user", "conversation summary", "boundary",
+               isCompactSummary=True, timestamp="2024-01-01T00:00:03Z"),
+        _entry("final-assistant", "assistant", "the complete answer", "summary",
+               timestamp="2024-01-01T00:00:04Z"),
+    )
+    assert chat_mod._turn_uuids_from_boundary(
+        sid, boundary,
+        started_at_ms=1_704_067_201_000,
+        terminal_at_ms=1_704_067_205_000,
+    ) == ("final-assistant", "user", True)
+
+
+def test_turn_uuid_resolution_rejects_meta_only_turn(
+    client, auth, app_module, tmp_path,
+):
+    """Internal records alone cannot satisfy the durable user-row check."""
+    from backend import chat as chat_mod
+
+    sid, transcript = _make_endpoint_session(client, auth, chat_mod, tmp_path, [])
+    _, boundary = chat_mod._turn_transcript_boundary(sid, "claude-sonnet-4-6")
+    _append(
+        transcript,
+        _entry("hint", "user", "internal context", isMeta=True,
+               timestamp="2024-01-01T00:00:01Z"),
+        _entry("answer", "assistant", "internal answer", "hint",
+               timestamp="2024-01-01T00:00:02Z"),
+    )
+    assert chat_mod._turn_uuids_from_boundary(
+        sid, boundary,
+        started_at_ms=1_704_067_201_000,
+        terminal_at_ms=1_704_067_203_000,
+    ) == (None, None, True)
+
+
+def test_turn_uuid_resolution_meta_hint_does_not_borrow_retry_answer(
+    client, auth, app_module, tmp_path,
+):
+    """A missing image reply stays missing when a later retry succeeds."""
+    from backend import chat as chat_mod
+
+    initial = [
+        _entry("old-user", "user", "earlier question"),
+        _entry("old-assistant", "assistant", "earlier answer", "old-user"),
+    ]
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, initial)
+    _, boundary = chat_mod._turn_transcript_boundary(sid, "claude-sonnet-4-6")
+    _append(
+        transcript,
+        _entry("user", "user", "describe the image", "old-assistant",
+               timestamp="2024-01-01T00:00:01Z"),
+        _entry("hint", "user", "internal image context", "user", isMeta=True,
+               timestamp="2024-01-01T00:00:01Z"),
+        _entry("retry-user", "user", "describe the image", "hint",
+               timestamp="2024-01-01T00:00:03.100Z"),
+        _entry("retry-assistant", "assistant", "retry succeeded", "retry-user",
+               timestamp="2024-01-01T00:00:04Z"),
+    )
+    assert chat_mod._turn_uuids_from_boundary(
+        sid, boundary,
+        started_at_ms=1_704_067_201_000,
+        terminal_at_ms=1_704_067_203_000,
+    ) == (None, "user", True)

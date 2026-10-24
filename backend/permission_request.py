@@ -66,6 +66,8 @@ _DANGEROUS_BASH_BINS = frozenset({
     "rsync", "chmod", "chown", "sudo", "kill", "pkill", "killall",
     "bash", "sh", "zsh", "eval", "python", "python3", "node", "npm",
     "npx", "pip", "pip3", "uv", "docker", "systemctl", "mkfs",
+    # These wrappers select another executable through their arguments.
+    "env", "command", "exec", "nohup", "timeout", "stdbuf", "nice", "setsid", "xargs",
 })
 
 
@@ -289,6 +291,10 @@ def _input_key(tool_name: str, tool_input: dict[str, Any]) -> str:
         if not cmd:
             return ""
         bin0 = cmd.split()[0]
+        # Quoting, escapes, assignments, and expansion can disguise the real
+        # executable. An unparsed shell word must not grant all its arguments.
+        if any(c in bin0 for c in ("'", '"', "\\", "$", "=")):
+            return cmd
         # Strip a leading path so /usr/bin/git is matched as "git".
         bin_name = bin0.rsplit("/", 1)[-1]
         # Dangerous binaries: key by the FULL command so always-allow can't
@@ -296,7 +302,7 @@ def _input_key(tool_name: str, tool_input: dict[str, Any]) -> str:
         # full command whenever the line contains shell metacharacters that
         # could chain a second command past the first word.
         if bin_name in _DANGEROUS_BASH_BINS or any(
-                c in cmd for c in (";", "&&", "||", "|", "`", "$(", ">", "<")):
+                c in cmd for c in (";", "&", "||", "|", "`", "$(", ">", "<", '\n')):
             return cmd
         # Safe binaries: first word — so "ls -la X" and "ls Y" share a grant.
         return bin0

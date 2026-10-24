@@ -5,8 +5,10 @@ refreshes os.environ so the changes take effect without restarting the server.
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal
+from weakref import WeakValueDictionary
 
 from fastapi import APIRouter, Depends, HTTPException
 from claude_agent_sdk.types import PermissionMode
@@ -22,6 +25,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
 from . import context_limits
+from . import observability as obs
 from .config_paths import ENV_PATH, MCP_CONFIG_PATH
 from .hook_settings import router as hook_settings_router
 # _locate_executable used to live in this module but is now also needed
@@ -31,6 +35,9 @@ from .hook_settings import router as hook_settings_router
 from .settings import locate_executable as _locate_executable
 
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
+# Serialize the whole read/modify/write transaction across request threads.
+_MCP_CONFIG_LOCK = threading.RLock()
+_MCP_TOGGLE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 router.include_router(hook_settings_router)
@@ -105,6 +112,8 @@ class SettingsIn(BaseModel):
     default_model: str | None = None
     default_permission: PermissionMode | None = None
     busy_send_mode: Literal["adjust", "queue"] | None = None
+    # Model for Agent-tool subagents; "" inherits the session's model.
+    subagent_model: str | None = Field(default=None, max_length=256)
     # (Removed 2026-05-28) notify_scheduled / notify_normal —
     # The 4-toggle notification panel collapsed to a single client-side
     # "notify me" switch. Subscription state IS the on/off; no per-class
@@ -124,7 +133,14 @@ class SettingsIn(BaseModel):
 _ENV_WRITE_LOCK = threading.RLock()
 
 
-def _write_env(updates: dict[str, str]) -> None:
+
+def _dotenv_value(value: str) -> str:
+    """Quote dotenv syntax without changing the value loaded at startup."""
+    if not re.search(r"""[\s'"]""", value):
+        return value
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+def _write_env(updates: dict[str, str | None], *, publish: bool = True) -> None:
     """Atomically merge updates into .env. Keys with empty-string value get
     written as `KEY=` (allowed); to actually remove a key, pass None and we
     drop the line.
@@ -142,9 +158,10 @@ def _write_env(updates: dict[str, str]) -> None:
     }
     with _ENV_WRITE_LOCK:
         ENV_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lines: list[str] = []
-        if ENV_PATH.exists():
+        try:
             lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
 
         out: list[str] = []
         written: set[str] = set()
@@ -154,12 +171,17 @@ def _write_env(updates: dict[str, str]) -> None:
                 out.append(line)
                 continue
             key = stripped.split("=", 1)[0].strip()
+            # dotenv accepts export prefixes and quoted keys; edits and deletion
+            # must target the variable name instead of leaving a stale entry.
+            key = re.sub(r"^export\s+", "", key)
+            if key.startswith("'") and key.endswith("'"):
+                key = key[1:-1]
             if key in updates:
                 new_v = updates[key]
                 if new_v is None:
                     # drop line entirely
                     continue
-                out.append(f"{key}={new_v}")
+                out.append(f"{key}={_dotenv_value(new_v)}")
                 written.add(key)
             else:
                 out.append(line)
@@ -168,7 +190,7 @@ def _write_env(updates: dict[str, str]) -> None:
         for k, v in updates.items():
             if v is None or k in written:
                 continue
-            out.append(f"{k}={v}")
+            out.append(f"{k}={_dotenv_value(v)}")
 
         # Atomic write via temp + rename.
         fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(ENV_PATH.parent))
@@ -183,12 +205,39 @@ def _write_env(updates: dict[str, str]) -> None:
                 pass
             raise
 
-        # Refresh in-process env so the change takes effect immediately.
-        for k, v in updates.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        if publish:
+            _publish_env_updates(updates)
+
+
+def _publish_env_updates(updates: dict[str, str | None]) -> None:
+    for key, value in updates.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _backup_provider_env() -> Path | None:
+    """Stage original bytes before the provider transaction mutates .env."""
+    try:
+        original = ENV_PATH.read_bytes()
+    except FileNotFoundError:
+        return None
+    fd, name = tempfile.mkstemp(prefix=".env.provider-rollback.", dir=ENV_PATH.parent)
+    backup = Path(name)
+    stream = None
+    try:
+        stream = os.fdopen(fd, "wb")
+        with stream:
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        if stream is None:
+            os.close(fd)
+        backup.unlink(missing_ok=True)
+        raise
+    return backup
 
 
 # Single source of truth for setting defaults — keys = env var name, values
@@ -204,6 +253,7 @@ _SETTING_DEFAULTS: dict[str, str] = {
     "MUSELAB_DEFAULT_MODEL":        "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_PERMISSION":   "bypassPermissions",
     "MUSELAB_BUSY_SEND_MODE":       "adjust",
+    "MUSELAB_SUBAGENT_MODEL":       "",
 }
 
 
@@ -281,6 +331,7 @@ def get_settings() -> dict:
                 os.environ.get("MUSELAB_MODEL", _SETTING_DEFAULTS["MUSELAB_MODEL"])),
             "permission": _current("MUSELAB_DEFAULT_PERMISSION"),
             "busy_send_mode": _current("MUSELAB_BUSY_SEND_MODE"),
+            "subagent_model": _current("MUSELAB_SUBAGENT_MODEL"),
         },
         # `params` retained as an empty dict for FE backwards-compat — old
         # builds spread `d.params` into draftParams and would TypeError on
@@ -306,7 +357,8 @@ def put_settings(req: SettingsIn) -> dict:
     }
     for field, env_name in legacy_key_map.items():
         v = getattr(req, field)
-        if v is None or v == "":   # skip unchanged
+        # Legacy fields must ignore the same display masks as provider_keys.
+        if v is None or v == "" or "•" in v:
             continue
         if v == "_delete_":
             updates[env_name] = None  # type: ignore[assignment]  # signals removal
@@ -361,51 +413,71 @@ def put_settings(req: SettingsIn) -> dict:
     def _changed(env_key: str, new_val: str) -> bool:
         return _current(env_key) != new_val
 
-    if req.default_model is not None:
-        # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
-        # and the settings GET endpoint (reads `MUSELAB_DEFAULT_MODEL`) agree.
-        # Without this, the user changed "default model" in Settings and saw it
-        # echoed back, but new sessions still used the .env's `MUSELAB_MODEL`.
-        # Count as ONE updated field (both keys flip together — they're an
-        # implementation detail, not two separate settings).
-        if (_changed("MUSELAB_DEFAULT_MODEL", req.default_model)
-                or _changed("MUSELAB_MODEL", req.default_model)):
-            updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
-            updates["MUSELAB_MODEL"] = req.default_model
-    if req.default_permission is not None and _changed(
-            "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
-        updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
-    if req.busy_send_mode is not None and _changed(
-            "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
-        updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
-    if req.provider_disabled is not None:
-        raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
-        disabled_models = set(raw.split(",")) if raw else set()
-        changed = False
-        for model_id, disable in req.provider_disabled.items():
-            if disable:
-                if model_id not in disabled_models:
+    with _ENV_WRITE_LOCK:
+        # Compare after any earlier writer commits, so a queued explicit value
+        # cannot be dropped as unchanged against a stale environment snapshot.
+        if req.default_model is not None:
+            # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
+            # and the settings GET endpoint (reads `MUSELAB_DEFAULT_MODEL`) agree.
+            # Without this, the user changed "default model" in Settings and saw it
+            # echoed back, but new sessions still used the .env's `MUSELAB_MODEL`.
+            # Count as ONE updated field (both keys flip together — they're an
+            # implementation detail, not two separate settings).
+            if (_changed("MUSELAB_DEFAULT_MODEL", req.default_model)
+                    or _changed("MUSELAB_MODEL", req.default_model)):
+                updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
+                updates["MUSELAB_MODEL"] = req.default_model
+        if req.default_permission is not None and _changed(
+                "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
+            updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
+        if req.busy_send_mode is not None and _changed(
+                "MUSELAB_BUSY_SEND_MODE", req.busy_send_mode):
+            updates["MUSELAB_BUSY_SEND_MODE"] = req.busy_send_mode
+        if req.subagent_model is not None:
+            subagent_model = req.subagent_model.strip()
+            if subagent_model and subagent_model not in {
+                model for group in context_limits.provider_groups()
+                for model in group["models"]
+            }:
+                raise HTTPException(422, "unknown subagent model")
+            if _changed("MUSELAB_SUBAGENT_MODEL", subagent_model):
+                updates["MUSELAB_SUBAGENT_MODEL"] = subagent_model or None  # type: ignore[assignment]
+        # Visibility is a partial set edit, so its read and write must share
+        # the same lock as other environment updates.
+        if req.provider_disabled is not None:
+            from . import endpoints as _ep
+            aliases: dict[str, set[str]] = {}
+            for provider in _ep.provider_meta():
+                names = {provider["id"], provider["probe_model"]} - {""}
+                for name in names:
+                    aliases[name] = names
+            raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
+            disabled_models = set(raw.split(",")) if raw else set()
+            original_disabled = disabled_models.copy()
+            for model_id, disable in req.provider_disabled.items():
+                if disable:
                     disabled_models.add(model_id)
-                    changed = True
-            else:
-                if model_id in disabled_models:
-                    disabled_models.discard(model_id)
-                    changed = True
-        if changed:
-            if disabled_models:
-                updates["MUSELAB_DISABLED_PROVIDERS"] = ",".join(sorted(disabled_models))
-            else:
-                updates["MUSELAB_DISABLED_PROVIDERS"] = None  # type: ignore[assignment]  # remove key
+                else:
+                    # GET honours both stable provider IDs and legacy first
+                    # model IDs; enabling must clear either stored form.
+                    disabled_models.difference_update(
+                        aliases.get(model_id, {model_id}),
+                    )
+            if disabled_models != original_disabled:
+                updates["MUSELAB_DISABLED_PROVIDERS"] = (
+                    ",".join(sorted(disabled_models)) if disabled_models else None
+                )
 
-    _write_env(updates)
-    # The `chat.py` module captured `MODEL` at import time; if we just touched
-    # `MUSELAB_MODEL` here, existing imports won't see the new value. Push it
-    # back so subsequent stream() calls pick up the new default.
-    if "MUSELAB_MODEL" in updates:
-        from . import settings as _settings
-        _settings.MODEL = updates["MUSELAB_MODEL"]
-        from . import chat as _chat
-        _chat.MODEL = updates["MUSELAB_MODEL"]
+        _write_env(updates)
+        # The `chat.py` module captured `MODEL` at import time; if we just touched
+        # `MUSELAB_MODEL` here, existing imports won't see the new value. Push it
+        # back so subsequent stream() calls pick up the new default.
+        # Publish under the writer lock so a newer save cannot be overtaken.
+        if "MUSELAB_MODEL" in updates:
+            from . import settings as _settings
+            _settings.MODEL = updates["MUSELAB_MODEL"]
+            from . import chat as _chat
+            _chat.MODEL = updates["MUSELAB_MODEL"]
     # `updated_count` is the user-facing tally for the "Saved N settings" toast.
     # Differs from len(updated) in one case: model changes write two env keys
     # (MUSELAB_MODEL + MUSELAB_DEFAULT_MODEL — they're an implementation detail
@@ -482,28 +554,89 @@ class ProviderIdIn(BaseModel):
 
 @router.post("/providers", dependencies=[Depends(require_token)])
 def upsert_provider(req: ProviderIn) -> dict:
-    """Create or edit a provider override. Returns the saved provider's stable
-    id + env_key so the FE can immediately PUT the api-key (or read it back).
-    Validation errors (bad URL, dup prefix, model not prefixed) → 422."""
+    """Save provider metadata and its optional credential together on failure.
+
+    This protects normal exceptions, not a process crash between two renames.
+    Validation errors (bad URL, dup prefix, model not prefixed) → 422.
+    """
     from . import endpoints as _ep
-    try:
-        p = _ep.upsert_provider(
-            pid=req.id,
-            base_url=req.base_url,
-            prefix=req.prefix,
-            display=req.display or req.prefix,
-            env_key=req.env_key or "",
-            models=req.models,
-        )
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    # Optional api-key write in the same call. Reuse the same mask-guard as
-    # put_settings so a leaked mask string can't overwrite a real key.
-    if req.api_key is not None:
-        if req.api_key == "_delete_":
-            _write_env({p.env_key: None})  # type: ignore[dict-item]
-        elif req.api_key and "•" not in req.api_key:
-            _write_env({p.env_key: req.api_key})
+    write_key = req.api_key == "_delete_" or bool(req.api_key and "•" not in req.api_key)
+    # os.environ rejects NUL after persistence. Reject it before either file
+    # changes, without echoing the credential in a validation error.
+    if write_key and req.api_key is not None and "\x00" in req.api_key:
+        raise HTTPException(422, "API key contains an invalid character")
+    env_error: ValueError | None = None
+
+    def save(before_save=None):
+        try:
+            return _ep.upsert_provider(
+                pid=req.id,
+                base_url=req.base_url,
+                prefix=req.prefix,
+                display=req.display or req.prefix,
+                env_key=req.env_key or "",
+                models=req.models,
+                before_save=before_save,
+            )
+        except ValueError as exc:
+            # UnicodeDecodeError from the credential file is an I/O failure,
+            # not invalid provider metadata. Preserve the existing 500 policy.
+            if exc is env_error:
+                raise
+            raise HTTPException(422, str(exc)) from exc
+
+    if not write_key:
+        p = save()
+    else:
+        backup: Path | None = None
+        env_written = False
+        retain_backup = False
+        updates: dict[str, str | None] = {}
+
+        def save_key(_pid: str, env_key: str) -> None:
+            nonlocal backup, env_written, env_error
+            value = None if req.api_key == "_delete_" else req.api_key
+            updates[env_key] = None if value is None else value.replace("\r", "").replace("\n", "")
+            try:
+                backup = _backup_provider_env()
+                _write_env(updates, publish=False)
+            except ValueError as exc:
+                env_error = exc
+                raise
+            env_written = True
+
+        # Keep the established env → provider lock order through recovery.
+        # The callback only needs validated identity fields; constructing the
+        # effective Provider still happens after its override is committed.
+        with _ENV_WRITE_LOCK, _ep._OVERRIDES_WRITE_LOCK:
+            try:
+                p = save(save_key)
+                _publish_env_updates(updates)
+            except Exception:
+                if env_written:
+                    try:
+                        if backup is None:
+                            ENV_PATH.unlink(missing_ok=True)
+                        else:
+                            os.replace(backup, ENV_PATH)
+                    except OSError as exc:
+                        # The original bytes are the recovery copy. Do not
+                        # discard them if the rollback rename itself fails.
+                        retain_backup = True
+                        logging.getLogger(__name__).error(
+                            "provider credential rollback failed (%s); recovery required%s",
+                            type(exc).__name__, "; recovery copy retained" if backup is not None else "",
+                        )
+                        raise HTTPException(500, "Provider save failed; credential rollback needs recovery") from exc
+                raise
+            finally:
+                if backup is not None and not retain_backup:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logging.getLogger(__name__).warning(
+                            "provider credential backup cleanup failed (%s)", type(exc).__name__,
+                        )
     return {"ok": True, "id": p.id, "env_key": p.env_key,
             "configured": bool(os.environ.get(p.env_key))}
 
@@ -601,16 +734,26 @@ class MCPServerSpec(BaseModel):
         return self
 
 
-def _load_mcp() -> dict:
-    if not MCP_CONFIG_PATH.exists():
-        return {"mcpServers": {}}
+def _load_mcp(*, for_write: bool = False) -> dict:
+    """Keep read-only discovery tolerant, but never edit from a failed read."""
     try:
         d = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+        if for_write and (
+            not isinstance(d, dict) or not isinstance(d.get("mcpServers", {}), dict)
+        ):
+            raise HTTPException(503, "Invalid MCP configuration; existing file preserved")
         if not isinstance(d, dict):
             return {"mcpServers": {}}
         d.setdefault("mcpServers", {})
         return d
-    except (json.JSONDecodeError, OSError):
+    except FileNotFoundError:
+        # Only an actual missing file permits creating a new configuration.
+        return {"mcpServers": {}}
+    except (json.JSONDecodeError, OSError) as error:
+        if for_write:
+            raise HTTPException(
+                503, "Cannot read MCP configuration; existing file preserved",
+            ) from error
         return {"mcpServers": {}}
 
 
@@ -732,7 +875,7 @@ def has_claude_ai_connectors() -> bool:
     return isinstance(ever, list) and len(ever) > 0
 
 
-def _load_mcp_merged() -> dict[str, dict]:
+def _load_mcp_merged(*, for_write: bool = False) -> dict[str, dict]:
     """Final {name: spec} mapping after merging muselab's own mcp.json with
     every Claude Code MCP source. muselab's entries override external ones
     on name conflict — that's the override channel for "I configured this
@@ -749,7 +892,7 @@ def _load_mcp_merged() -> dict[str, dict]:
       "claude_user_project" / "archive_project".
     """
     external = _load_external_mcp_sources()
-    own = _load_mcp().get("mcpServers") or {}
+    own = _load_mcp(for_write=for_write).get("mcpServers") or {}
     merged: dict[str, dict] = dict(external)
     for name, spec in own.items():
         if not isinstance(spec, dict):
@@ -869,43 +1012,44 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
             422,
             f"body name {spec.name!r} does not match URL name {name!r}",
         )
-    cfg = _load_mcp()
+    with _MCP_CONFIG_LOCK:
+        cfg = _load_mcp(for_write=True)
 
-    # Defence (mirror of put_settings' "•" guard): GET /mcp masks secret values
-    # (env values, header values) via _mask() (U+2022 BULLET). A FE that PUTs an
-    # unchanged entry back would otherwise overwrite the real secret with bullets
-    # — unrecoverable. For any value that still looks masked, recover the real
-    # value from the current merged view (the same source the mask was derived
-    # from); if none exists, drop the key rather than persist bullets.
-    def _unmask(new_map: dict, field: str) -> dict:
-        out = dict(new_map or {})
-        if any(isinstance(v, str) and "•" in v for v in out.values()):
-            existing = (_load_mcp_merged().get(name) or {}).get(field) or {}
-            for k, v in list(out.items()):
-                if isinstance(v, str) and "•" in v:
-                    if k in existing:
-                        out[k] = existing[k]
-                    else:
-                        out.pop(k)
-        return out
+        # Defence (mirror of put_settings' "•" guard): GET /mcp masks secret values
+        # (env values, header values) via _mask() (U+2022 BULLET). A FE that PUTs an
+        # unchanged entry back would otherwise overwrite the real secret with bullets
+        # — unrecoverable. For any value that still looks masked, recover the real
+        # value from the current merged view (the same source the mask was derived
+        # from); if none exists, drop the key rather than persist bullets.
+        def _unmask(new_map: dict, field: str) -> dict:
+            out = dict(new_map or {})
+            if any(isinstance(v, str) and "•" in v for v in out.values()):
+                existing = (_load_mcp_merged(for_write=True).get(name) or {}).get(field) or {}
+                for k, v in list(out.items()):
+                    if isinstance(v, str) and "•" in v:
+                        if k in existing:
+                            out[k] = existing[k]
+                        else:
+                            out.pop(k)
+            return out
 
-    if spec.url:
-        # Remote connector (http/sse). No command/args/env on disk.
-        cfg["mcpServers"][name] = {
-            "type": spec.type or "http",
-            "url": spec.url.strip(),
-            "headers": _unmask(spec.headers, "headers"),
-            "disabled": spec.disabled,
-        }
-    else:
-        # Local stdio subprocess.
-        cfg["mcpServers"][name] = {
-            "command": spec.command,
-            "args": spec.args,
-            "env": _unmask(spec.env, "env"),
-            "disabled": spec.disabled,
-        }
-    _save_mcp(cfg)
+        if spec.url:
+            # Remote connector (http/sse). No command/args/env on disk.
+            cfg["mcpServers"][name] = {
+                "type": spec.type or "http",
+                "url": spec.url.strip(),
+                "headers": _unmask(spec.headers, "headers"),
+                "disabled": spec.disabled,
+            }
+        else:
+            # Local stdio subprocess.
+            cfg["mcpServers"][name] = {
+                "command": spec.command,
+                "args": spec.args,
+                "env": _unmask(spec.env, "env"),
+                "disabled": spec.disabled,
+            }
+        _save_mcp(cfg)
     return {"ok": True, "name": name}
 
 
@@ -916,16 +1060,35 @@ def delete_mcp_server(name: str) -> dict:
     entry will reappear in the merged list (no longer overridden). To
     "hide" an external MCP from muselab, use the toggle endpoint instead
     (it writes a stub override into muselab's mcp.json)."""
-    cfg = _load_mcp()
-    if name not in (cfg.get("mcpServers") or {}):
-        raise HTTPException(404, f"MCP server not found: {name}")
-    del cfg["mcpServers"][name]
-    _save_mcp(cfg)
+    with _MCP_CONFIG_LOCK:
+        cfg = _load_mcp(for_write=True)
+        if name not in (cfg.get("mcpServers") or {}):
+            raise HTTPException(404, f"MCP server not found: {name}")
+        del cfg["mcpServers"][name]
+        _save_mcp(cfg)
     return {"ok": True, "name": name}
 
 
 class MCPToggleReq(BaseModel):
     disabled: bool
+
+
+def _persist_mcp_toggle(name: str, disabled: bool) -> None:
+    with _MCP_CONFIG_LOCK:
+        cfg = _load_mcp(for_write=True)
+        own_servers = cfg.setdefault("mcpServers", {})
+        merged = _load_mcp_merged(for_write=True)
+        if name not in merged:
+            raise HTTPException(404, f"MCP server not found: {name}")
+
+        if name in own_servers:
+            own_servers[name]["disabled"] = disabled
+        else:
+            # External-only entry — write a stub override. _load_mcp_merged
+            # recognises {disabled: ...} without `command` and layers it
+            # onto the external spec.
+            own_servers[name] = {"disabled": disabled}
+        _save_mcp(cfg)
 
 
 @router.patch("/mcp/{name}/toggle", dependencies=[Depends(require_token)])
@@ -942,46 +1105,35 @@ async def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
          "just works" without re-entering command/args.
       c. Name doesn't exist anywhere → 404.
     """
-    # _load_mcp / _load_mcp_merged / _save_mcp are all synchronous disk I/O —
-    # and _load_mcp_merged pulls in ~/.claude.json (can be multi-MB of project
-    # history), parsing 3-4 files. Off-load each so toggling an MCP server from
-    # Settings can't stall the event loop (and every concurrent SSE stream) for
-    # tens-to-hundreds of ms. (perf: RED — api_settings.py toggle_mcp_server)
-    cfg = await asyncio.to_thread(_load_mcp)
-    own_servers = cfg.setdefault("mcpServers", {})
-    merged = await asyncio.to_thread(_load_mcp_merged)
-    if name not in merged:
-        raise HTTPException(404, f"MCP server not found: {name}")
-
-    if name in own_servers:
-        own_servers[name]["disabled"] = req.disabled
-    else:
-        # External-only entry — write a stub override. _load_mcp_merged
-        # recognises {disabled: ...} without `command` and layers it
-        # onto the external spec.
-        own_servers[name] = {"disabled": req.disabled}
-    await asyncio.to_thread(_save_mcp, cfg)
-    # Apply to every live SDK client too — otherwise the toggle would only
-    # take effect on the next client rebuild, leaving the user staring at a
-    # toggled-off server that still answers tool calls. SDK exposes
-    # client.toggle_mcp_server() for exactly this case.
-    from . import chat as _chat
-    enabled = not req.disabled
-    propagated: list[str] = []
-    errors: list[str] = []
-    async with _chat._lock:
-        live = list(_chat._clients.items())
-    for key, client in live:
-        try:
-            await client.toggle_mcp_server(name, enabled)
-            propagated.append(f"{key[0]}@{key[1]}")
-        except Exception as e:
-            errors.append(f"{key}: {type(e).__name__}: {e}")
-    return {
-        "ok": True, "name": name, "disabled": req.disabled,
-        "propagated": propagated,
-        "errors": errors,
-    }
+    # A later save must not apply to live clients ahead of an earlier toggle.
+    toggle_lock = _MCP_TOGGLE_LOCKS.setdefault(name, asyncio.Lock())
+    async with toggle_lock:
+        # Keep the lock and all disk I/O in one worker, without blocking SSE.
+        await obs.to_thread_io(
+            "settings.mcp_toggle", "", _persist_mcp_toggle, name, req.disabled,
+            owned=True,
+        )
+        # Apply to every live SDK client too — otherwise the toggle would only
+        # take effect on the next client rebuild, leaving the user staring at a
+        # toggled-off server that still answers tool calls. SDK exposes
+        # client.toggle_mcp_server() for exactly this case.
+        from . import chat as _chat
+        enabled = not req.disabled
+        propagated: list[str] = []
+        errors: list[str] = []
+        async with _chat._lock:
+            live = list(_chat._clients.items())
+        for key, client in live:
+            try:
+                await client.toggle_mcp_server(name, enabled)
+                propagated.append(f"{key[0]}@{key[1]}")
+            except Exception as e:
+                errors.append(f"{key}: {type(e).__name__}: {e}")
+        return {
+            "ok": True, "name": name, "disabled": req.disabled,
+            "propagated": propagated,
+            "errors": errors,
+        }
 
 
 @router.post("/mcp/{name}/reconnect", dependencies=[Depends(require_token)])
@@ -1414,6 +1566,51 @@ class UpgradeReq(BaseModel):
     """Which packages to upgrade. Default: both."""
 
 
+async def _run_upgrade_command(*args: str, cwd: str | None = None) -> tuple[int | None, bytes]:
+    owns_group = os.name == "posix"
+    # Shield process creation so cancellation cannot lose a newly spawned PID.
+    spawned = asyncio.create_task(asyncio.create_subprocess_exec(
+        *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        start_new_session=owns_group,
+    ))
+    try:
+        process = await asyncio.shield(spawned)
+        output, _ = await process.communicate()
+        return process.returncode, output or b""
+    except BaseException as failure:
+        async def reap():
+            try:
+                process = await spawned
+            except Exception:
+                return  # Creation failed; there is no accepted process to reap.
+            try:
+                if owns_group:
+                    # The new session belongs only to this command, including
+                    # install-script descendants that may keep its pipe open.
+                    os.killpg(process.pid, signal.SIGKILL)
+                elif process.returncode is None:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()  # Drain/close pipes and reap the child.
+
+        cleanup = asyncio.create_task(reap(), name="muselab-upgrade-reap")
+        pending_cancel = failure if isinstance(failure, asyncio.CancelledError) else None
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                if cleanup.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        if pending_cancel is not None:
+            raise pending_cancel
+        raise
+
+
 @router.post("/upgrade", dependencies=[Depends(require_token)])
 async def trigger_upgrade(req: UpgradeReq) -> dict:
     """Run the upgrade flow in-process. Returns step-by-step output for the
@@ -1462,26 +1659,21 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
                 })
             else:
                 try:
-                    p1 = await asyncio.create_subprocess_exec(
+                    rc1, out1 = await _run_upgrade_command(
                         uv_bin, "lock", "--upgrade-package", "claude-agent-sdk",
                         cwd=str(_REPO_ROOT),
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                     )
-                    out1, _ = await p1.communicate()
-                    steps.append({"step": "uv lock", "rc": p1.returncode,
-                                  "output": (out1 or b"").decode(errors="replace")[-2000:]})
-                    if p1.returncode != 0:
+                    steps.append({"step": "uv lock", "rc": rc1,
+                                  "output": out1.decode(errors="replace")[-2000:]})
+                    if rc1 != 0:
                         raise RuntimeError("uv lock failed")
 
-                    p2 = await asyncio.create_subprocess_exec(
-                        uv_bin, "sync", "--frozen",
-                        cwd=str(_REPO_ROOT),
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    rc2, out2 = await _run_upgrade_command(
+                        uv_bin, "sync", "--frozen", cwd=str(_REPO_ROOT),
                     )
-                    out2, _ = await p2.communicate()
-                    steps.append({"step": "uv sync", "rc": p2.returncode,
-                                  "output": (out2 or b"").decode(errors="replace")[-2000:]})
-                    if p2.returncode != 0:
+                    steps.append({"step": "uv sync", "rc": rc2,
+                                  "output": out2.decode(errors="replace")[-2000:]})
+                    if rc2 != 0:
                         raise RuntimeError("uv sync failed")
                 except Exception as e:
                     steps.append({"step": "sdk upgrade aborted", "rc": -1,
@@ -1494,13 +1686,11 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
             npm_bin = _locate_executable("npm")
             if npm_bin:
                 try:
-                    p3 = await asyncio.create_subprocess_exec(
+                    rc3, out3 = await _run_upgrade_command(
                         npm_bin, "install", "-g", "@anthropic-ai/claude-code@latest",
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                     )
-                    out3, _ = await p3.communicate()
-                    steps.append({"step": "npm install -g claude-code", "rc": p3.returncode,
-                                  "output": (out3 or b"").decode(errors="replace")[-2000:]})
+                    steps.append({"step": "npm install -g claude-code", "rc": rc3,
+                                  "output": out3.decode(errors="replace")[-2000:]})
                 except Exception as e:
                     steps.append({"step": "cli upgrade aborted", "rc": -1,
                                   "output": f"{type(e).__name__}: {e}"})

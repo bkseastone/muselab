@@ -2,6 +2,8 @@
 
 import inspect
 import json
+import errno
+import os
 import subprocess
 import uuid
 import sys
@@ -321,3 +323,65 @@ def test_stream_tokens_do_not_read_delivery_sidecar(evidence, monkeypatch):
             event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": "token"}},
         ),
     )
+
+
+def test_looping_tool_path_retains_failure_evidence(evidence):
+    delivery, _, root, sid, turn = evidence
+    target = root / 'loop'
+    target.symlink_to('loop')
+    payload = {'tool_name': 'Write', 'tool_input': {'file_path': str(target)}}
+    delivery.record_tool(sid, turn, root, 'PreToolUse', payload, 'loop_write')
+    delivery.record_tool(sid, turn, root, 'PostToolUseFailure', payload, 'loop_write')
+    record = delivery.load(sid)['turns'][-1]['tools'][-1]
+    assert record['id'] == 'loop_write'
+    assert record['status'] == 'tool_failed'
+    assert target.is_symlink()
+
+
+def test_looping_tool_path_disables_unsafe_checkpoint_restore(evidence):
+    _, checkpoints, root, sid, turn = evidence
+    cid = str(uuid.uuid4())
+    checkpoints.record_id(sid, turn, cid)
+    target = root / 'loop'
+    target.symlink_to('loop')
+    payload = {'tool_name': 'Write', 'tool_input': {'file_path': str(target)}}
+    checkpoints.observe(sid, turn, root, 'PreToolUse', payload, 'loop_write')
+    checkpoints.observe(sid, turn, root, 'PostToolUseFailure', payload, 'loop_write')
+    preview = checkpoints.preview(sid, cid, root, 'runtime')
+    assert not preview['can_restore']
+    assert 'unsafe_or_unobserved_path' in preview['issues']
+    assert target.is_symlink()
+
+
+def test_checkpoint_preview_closes_watch_when_workspace_disappears(evidence, monkeypatch):
+    _, checkpoints, root, sid, turn = evidence
+    cid = str(uuid.uuid4())
+    checkpoints.record_id(sid, turn, cid)
+    tracked_write(evidence)
+    monkeypatch.setattr(checkpoints, "_PREVIEWS", {})
+    original_watch = checkpoints._PreviewWatch
+    opened = []
+    moved = root.with_name("moved-workspace")
+
+    def move_after_watch(cwd, rows):
+        watch = original_watch(cwd, rows)
+        opened.append((watch, watch.fd))
+        cwd.rename(moved)
+        return watch
+
+    monkeypatch.setattr(checkpoints, "_PreviewWatch", move_after_watch)
+    try:
+        result = checkpoints.preview(sid, cid, root, "runtime-a")
+        assert result["can_restore"] is False
+        assert result["token"] is None
+        assert "file_change_observation_unavailable" in result["issues"]
+        assert not checkpoints._PREVIEWS
+        assert (moved / "result.txt").read_text() == "after"
+        assert len(opened) == 1
+        with pytest.raises(OSError) as error:
+            os.fstat(opened[0][1])
+        assert error.value.errno == errno.EBADF
+    finally:
+        # Baseline failures must also release only the watch this test created.
+        for watch, _fd in opened:
+            watch.close()

@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeVar
 
@@ -75,6 +75,60 @@ def _unwrap_schema_response(value: object, expected_key: str) -> dict:
     return value
 
 
+def _validate_dreamer_response(value: dict, evidence_ids: set[str]) -> dict:
+    """Validate the entire Dreamer batch before any business writes.
+
+    Optional metadata retains existing defaults when absent. Supplied fields
+    must match the prompt schema; source references must belong to this episode.
+    Verifier decisions and later persistence are separate from this shape gate.
+    """
+    result = _unwrap_schema_response(value, "memories")
+
+    def require(condition: bool) -> None:
+        if not condition:
+            raise ValueError("invalid_schema")
+
+    def text(value: object) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    def strings(value: object) -> bool:
+        return isinstance(value, list) and all(text(item) for item in value)
+
+    summary = result.get("episode")
+    require(isinstance(summary, dict))
+    require(text(summary.get("title")) and text(summary.get("summary")))
+    if "outcome" in summary:
+        require(isinstance(summary["outcome"], str) and summary["outcome"] in {
+            "success", "failure", "cancelled", "unknown"})
+    if "entities" in summary:
+        require(strings(summary["entities"]))
+    if "attributes" in summary:
+        require(isinstance(summary["attributes"], dict))
+    candidates = result.get("memories")
+    require(isinstance(candidates, list))
+    for candidate in candidates:
+        require(isinstance(candidate, dict))
+        require(isinstance(candidate.get("kind"), str) and candidate["kind"] in {
+            "fact", "preference", "decision", "state", "episode"})
+        require(text(candidate.get("content")))
+        sources = candidate.get("source_ids")
+        require(strings(sources) and bool(sources))
+        require(all(source in evidence_ids for source in sources))
+        for key in ("confidence", "future_use"):
+            number = candidate.get(key)
+            # Reject booleans, numeric strings, NaN/Infinity and huge integers
+            # without conversion exceptions or leaking model output.
+            require(type(number) in (int, float) and 0 <= number <= 1)
+        if "reuse_conditions" in candidate:
+            require(strings(candidate["reuse_conditions"]))
+        if "attributed_to" in candidate:
+            require(isinstance(candidate["attributed_to"], str)
+                    and candidate["attributed_to"] in {"user", "tool", "derived"})
+        if "episode_ids" in candidate:
+            require(strings(candidate["episode_ids"]))
+    return result
+
+
 def _model_float(value: object) -> float:
     """Parse a model-produced number without turning bad output into a retry."""
     try:
@@ -131,6 +185,54 @@ _KNOWN_JOB_KINDS = {
     "reindex_memories",
     "unindex_memory",
 }
+
+
+_TRANSCRIPT_TAIL_CAP = 32 * 1024 * 1024
+_TRANSCRIPT_TAIL_CHUNK = 1024 * 1024
+
+
+def _read_turn_records(
+    path: Path,
+    target_text: str,
+    *,
+    is_interrupt: Callable[[object], bool],
+    cap: int = _TRANSCRIPT_TAIL_CAP,
+    chunk: int = _TRANSCRIPT_TAIL_CHUNK,
+) -> list[dict]:
+    """``slice_turn_records`` over the transcript, reading only the tail needed.
+
+    Enormous historical transcripts are bounded to their last ``cap`` bytes,
+    where the just-completed turn lives.  ``slice_turn_records`` keys off the
+    last record matching the target and the first real user record after it,
+    so the result depends only on a suffix of the records.  Read a growing
+    window ending at EOF (``chunk``, doubling) until the slice finds the
+    target; without a match the window reaches the cap or file head, which is
+    exactly what a full read would have seen.  The first line of a window that
+    does not start at byte 0 may be cut, so it is skipped; it precedes every
+    record in the window and so can never be the last match.
+    """
+    size = path.stat().st_size
+    floor = max(0, size - cap)
+    window = max(1, chunk)
+    with path.open("rb") as stream:
+        while True:
+            start = max(floor, size - window)
+            stream.seek(start)
+            if start > 0:
+                stream.readline()
+            records: list[dict] = []
+            for raw in stream.readlines():
+                try:
+                    value = json.loads(raw)
+                    if isinstance(value, dict):
+                        records.append(value)
+                except Exception:
+                    continue
+            sliced = slice_turn_records(
+                records, target_text, is_interrupt=is_interrupt)
+            if sliced or start <= floor:
+                return sliced
+            window *= 2
 
 
 class UnknownMemoryJobError(ValueError):
@@ -229,9 +331,13 @@ class _MemoryStoreActor:
         self._executor: ThreadPoolExecutor | None = None
         self._state_lock = threading.Lock()
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     def reopen(self) -> None:
         with self._state_lock:
+            if self._close_task is not None and not self._close_task.done():
+                raise RuntimeError("memory store actor is closing")
+            self._close_task = None
             self._closed = False
 
     def _execute(self, operation: Callable[[MemoryStore], _T], trace=None) -> _T:
@@ -297,28 +403,46 @@ class _MemoryStoreActor:
                 job.cancel()  # A read that has not started is no longer useful.
             raise
 
+    @staticmethod
+    async def _join_shutdown(shutdown: asyncio.Future[None]) -> None:
+        pending_cancel: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(shutdown)
+                break
+            except asyncio.CancelledError as exc:
+                if shutdown.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        shutdown.result()
+        if pending_cancel is not None:
+            raise pending_cancel
+
+    async def _close_executor(self, executor: ThreadPoolExecutor, barrier: Future[None]) -> None:
+        try:
+            await self._join_shutdown(asyncio.wrap_future(barrier))
+        finally:
+            executor.shutdown(wait=True)
+
     async def close(self) -> None:
         with self._state_lock:
-            if self._closed:
-                return
-            self._closed = True
-            executor = self._executor
-            self._executor = None
-            if executor is None:
-                return
-            barrier = executor.submit(lambda: None)
-
-        wrapped = asyncio.wrap_future(barrier)
-        try:
-            await asyncio.shield(wrapped)
-        except asyncio.CancelledError:
-            # The caller may be cancelled during application shutdown. The
-            # actor still owns a live thread and accepted DB operations, so
-            # finish the barrier before propagating cancellation.
-            await wrapped
-            executor.shutdown(wait=True)
-            raise
-        executor.shutdown(wait=True)
+            shutdown = self._close_task
+            if shutdown is None:
+                self._closed = True
+                executor = self._executor
+                self._executor = None
+                if executor is None:
+                    return
+                barrier = executor.submit(lambda: None)
+                shutdown = asyncio.create_task(
+                    self._close_executor(executor, barrier),
+                    name="muselab-memory-db-close",
+                )
+                self._close_task = shutdown
+        # All callers join the same physical drain and thread shutdown. Repeated
+        # cancellation cannot detach that owner or make another close return early.
+        await self._join_shutdown(shutdown)
 
 
 class _RegistryNotInitialized(Exception):
@@ -333,6 +457,11 @@ class MemoryEngine:
         self._recall_store: MemoryStore | None = None
         self._recall_store_actor = _MemoryStoreActor(
             self._resolve_recall_store, cancel_pending=True)
+        # Lexical scans must not queue healthy dense hydration behind their SQL.
+        # A separate store also isolates read-budget/cancellation state.
+        self._lexical_store: MemoryStore | None = None
+        self._lexical_store_actor = _MemoryStoreActor(
+            self._resolve_lexical_store, cancel_pending=True)
         self._ui_store: MemoryStore | None = None
         self._ui_store_actor = _MemoryStoreActor(
             self._resolve_ui_store, cancel_pending=True)
@@ -368,6 +497,12 @@ class MemoryEngine:
         if self._recall_store is None or self._recall_store.path != path:
             self._recall_store = MemoryStore(path, read_only=True)
         return self._recall_store
+
+    def _resolve_lexical_store(self) -> MemoryStore:
+        path = self._store.path if self._store_pinned else database_path()
+        if self._lexical_store is None or self._lexical_store.path != path:
+            self._lexical_store = MemoryStore(path, read_only=True)
+        return self._lexical_store
 
     def _resolve_ui_store(self) -> MemoryStore:
         path = self._store.path if self._store_pinned else database_path()
@@ -453,8 +588,10 @@ class MemoryEngine:
                 cancelled.wait(.01)
                 trace["busy_retry_ms"] += (time.perf_counter() - attempt) * 1000
 
+        actor = (self._lexical_store_actor if stage == "lexical"
+                 else self._recall_store_actor)
         try:
-            return await self._recall_store_actor.call(read, trace=trace)
+            return await actor.call(read, trace=trace)
         except TimeoutError:
             status = "timeout"
             raise
@@ -526,6 +663,7 @@ class MemoryEngine:
         self._closing = False
         self._store_actor.reopen()
         self._recall_store_actor.reopen()
+        self._lexical_store_actor.reopen()
         self._ui_store_actor.reopen()
         if (os.environ.get("MUSELAB_MEMORY_WORKER_DISABLED") == "1"
                 or self._workers or not (config.enabled if config is not None else self.enabled())):
@@ -627,6 +765,7 @@ class MemoryEngine:
             await self._provider_http.close()
             await self._store_actor.close()
             await self._recall_store_actor.close()
+            await self._lexical_store_actor.close()
             await self._ui_store_actor.close()
 
     async def record_turn(self, session_id: str, model: str, user_text: str,
@@ -878,25 +1017,8 @@ class MemoryEngine:
             path = chat._find_session_jsonl(session_id)
             if path is None:
                 return []
-            # Background-only and bounded: enormous historical transcripts are
-            # read from the tail, where the just-completed turn lives.
-            size = path.stat().st_size
-            cap = 32 * 1024 * 1024
-            with path.open("rb") as stream:
-                if size > cap:
-                    stream.seek(size - cap)
-                    stream.readline()
-                raw_lines = stream.readlines()
-            records: list[dict] = []
-            for raw in raw_lines:
-                try:
-                    value = json.loads(raw)
-                    if isinstance(value, dict):
-                        records.append(value)
-                except Exception:
-                    continue
-            return slice_turn_records(
-                records,
+            return _read_turn_records(
+                path,
                 target["content"],
                 is_interrupt=chat._is_cli_interrupt_message,
             )
@@ -951,6 +1073,105 @@ class MemoryEngine:
 
         await self._store_call(persist_records)
 
+    async def _dream_episode(self, cfg: MemoryConfig, episode: dict) -> dict:
+        evidence = [{
+            "id": item["id"], "role": item["role"], "event_type": item["event_type"],
+            "content": _redact(item["content"], 8000),
+            "metadata": item.get("metadata", {}),
+        } for item in episode["evidence"]]
+        evidence_ids = {item["id"] for item in evidence}
+        async with self._generation_lock:
+            return await GenerationProvider(cfg).complete_json(
+                DREAMER_SYSTEM, dreamer_prompt(episode, evidence),
+                validator=lambda value: _validate_dreamer_response(value, evidence_ids))
+
+    @staticmethod
+    def _prepare_episode_summary(cfg: MemoryConfig, episode: dict, summary: dict) -> dict:
+        return dict(
+            title=summary["title"].strip(), summary=summary["summary"].strip(),
+            outcome=(summary.get("outcome") if summary.get("outcome") in
+                     {"success", "failure", "cancelled", "unknown"} else episode["outcome"]),
+            entities_json=summary.get("entities") if isinstance(
+                summary.get("entities"), list) else [],
+            attributes_json=summary.get("attributes") if isinstance(
+                summary.get("attributes"), dict) else {},
+            extractor_version=f"{DREAMER_PROMPT_VERSION}:model={cfg.generation_model}",
+        )
+
+    async def prepare_episode_repair(self, source: dict, *, mode: str,
+                                     job_ids: list[str]) -> dict:
+        """Generate a snapshot-bound preparation on an explicitly read-only store.
+
+        Rejections retain normal verifier semantics. Existing duplicates are not
+        inserted or modified; their missing provenance needs manual review.
+        No workers, indexing, jobs, receipts or business writes are started here.
+        """
+        from .memory_repair import RepairConflict, check_target, fingerprint, validate_result
+
+        if not self._store_pinned or not self.store._read_only:
+            raise RepairConflict("repair generation requires an explicit read-only store")
+        # Detach before the first await so callers cannot change model evidence.
+        source = json.loads(json.dumps(source, ensure_ascii=False, allow_nan=False))
+        source_hash = fingerprint(source)
+        check_target(source, mode, job_ids)
+        owner, episode_id = source["owner_id"], source["episode_id"]
+
+        async def check_snapshot():
+            current = await self._store_call(
+                lambda store: store.repair_snapshot(owner, episode_id))
+            if fingerprint(current) != source_hash:
+                raise RepairConflict("generation source snapshot changed")
+
+        await check_snapshot()
+        cfg = await self._config_async()
+        if cfg.owner_id != owner:
+            raise RepairConflict("generation config owner mismatch")
+        if not cfg.consolidation.dreamer_enabled:
+            raise RepairConflict("Dreamer disabled in current config")
+        episode = MemoryStore._row(source["episode"])
+        episode["evidence"] = [MemoryStore._row(row) for row in source["evidence"]]
+        memories, duplicates = [], []
+        with provider_transport_scope(self._provider_http):
+            dreamed = await self._dream_episode(cfg, episode)
+            fields = self._prepare_episode_summary(cfg, episode, dreamed["episode"])
+            if mode == "summary-only":
+                # Existing reviewed metadata and extraction history stay untouched.
+                fields = {"title": (episode["title"] if episode["title"].strip()
+                                    else fields["title"]),
+                          "summary": fields["summary"]}
+            elif episode.get("outcome") == "success":
+                for candidate in dreamed["memories"]:
+                    prepared = await self._prepare_verified_memory(
+                        candidate, episode_id, candidate["source_ids"],
+                        cfg=cfg, source_episode=episode)
+                    if prepared is None:
+                        continue
+                    if "existing" in prepared:
+                        duplicates.append({"memory_id": prepared["existing"]["id"],
+                                           "source_link_review_required": True})
+                        continue
+                    memory = prepared["create"]
+                    # Repair must not recreate reviewed/deleted memories either.
+                    matches = await self._store_call(lambda store: store.lexical_search(
+                        owner, memory["content"], limit=8, include_status=None))
+                    duplicate = next((row["memory"] for row in matches
+                        if difflib.SequenceMatcher(None, memory["content"].casefold(),
+                            row["memory"]["content"].casefold()).ratio() >= 0.92), None)
+                    if duplicate is not None:
+                        duplicates.append({"memory_id": duplicate["id"],
+                                           "source_link_review_required": True})
+                        continue
+                    if any(difflib.SequenceMatcher(
+                            None, memory["content"].casefold(), old["content"].casefold()
+                    ).ratio() >= 0.92 for old in memories):
+                        continue
+                    memories.append(memory)
+        result = {"episode": fields, "memories": memories}
+        validate_result(source, mode, result)
+        await check_snapshot()
+        return {"source_fingerprint": source_hash, "result": result,
+                "duplicates": duplicates}
+
     async def _consolidate_episode(self, episode_id: str) -> None:
         cfg = await self._config_async()
         if not cfg.consolidation.dreamer_enabled:
@@ -959,41 +1180,30 @@ class MemoryEngine:
             lambda store: store.episode(episode_id))
         if not episode or not episode.get("evidence"):
             return
-        evidence = [{
-            "id": item["id"], "role": item["role"], "event_type": item["event_type"],
-            "content": _redact(item["content"], 8000),
-            "metadata": item.get("metadata", {}),
-        } for item in episode["evidence"]]
-        prompt = dreamer_prompt(episode, evidence)
-        async with self._generation_lock:
-            result = await GenerationProvider(cfg).complete_json(
-                DREAMER_SYSTEM, prompt)
-        result = _unwrap_schema_response(result, "memories")
-        summary = result.get("episode") if isinstance(result.get("episode"), dict) else {}
-        await self._store_call(lambda store: store.update_episode(
-            episode_id,
-            title=str(summary.get("title", ""))[:240],
-            summary=str(summary.get("summary", ""))[:4000],
-            outcome=(summary.get("outcome") if summary.get("outcome") in
-                     {"success", "failure", "cancelled", "unknown"} else episode["outcome"]),
-            entities_json=summary.get("entities") if isinstance(
-                summary.get("entities"), list) else [],
-            attributes_json=summary.get("attributes") if isinstance(
-                summary.get("attributes"), dict) else {},
-            extractor_version=(
-                f"{DREAMER_PROMPT_VERSION}:model={cfg.generation_model}"),
-        ))
-        evidence_ids = {item["id"] for item in evidence}
-        candidates = (result.get("memories", []) if episode.get("outcome") == "success"
-                      and isinstance(result.get("memories"), list) else [])
+        result = await self._dream_episode(cfg, episode)
+        fields = self._prepare_episode_summary(cfg, episode, result["episode"])
+        candidates = result["memories"] if episode.get("outcome") == "success" else []
+        memories = []
         for candidate in candidates:
-            if not isinstance(candidate, dict):
+            prepared = await self._prepare_verified_memory(
+                candidate, episode_id, candidate["source_ids"],
+                cfg=cfg, source_episode=episode)
+            if prepared is None or "existing" in prepared:
                 continue
-            sources = [source for source in candidate.get("source_ids", [])
-                       if source in evidence_ids]
-            if not sources:
+            memory = prepared["create"]
+            # Prepared rows are not searchable yet. Apply the existing similarity
+            # cutoff within each kind too, including normalized exact duplicates.
+            if any(old["kind"] == memory["kind"] and difflib.SequenceMatcher(
+                    None, memory["content"].casefold(), old["content"].casefold()
+            ).ratio() >= 0.92 for old in memories):
                 continue
-            await self._verify_and_store(candidate, episode_id, sources)
+            memories.append(memory)
+
+        # No business writes until every verifier has completed successfully.
+        await self._store_call(lambda store: store.commit_consolidation(
+            cfg.owner_id, episode_id, fields, memories))
+        if any(memory["status"] == "active" for memory in memories):
+            self._wake.set()
 
         threshold = cfg.consolidation.min_reflection_episodes
 
@@ -1037,6 +1247,33 @@ class MemoryEngine:
                                 evidence_ids: list[str], *,
                                 kind_override: str | None = None) -> dict | None:
         cfg = await self._config_async()
+        prepared = await self._prepare_verified_memory(
+            candidate, episode_id, evidence_ids, kind_override=kind_override, cfg=cfg)
+        if prepared is None:
+            return None
+        if "existing" in prepared:
+            return prepared["existing"]
+        kwargs = prepared["create"]
+
+        def create_and_enqueue(store: MemoryStore) -> dict:
+            memory = store.create_memory(cfg.owner_id, **kwargs)
+            if kwargs["status"] == "active":
+                store.enqueue("reindex_memory", {"memory_id": memory["id"]},
+                              owner_id=cfg.owner_id)
+            return memory
+
+        memory = await self._store_call(create_and_enqueue)
+        if kwargs["status"] == "active":
+            self._wake.set()
+        return memory
+
+    async def _prepare_verified_memory(self, candidate: dict, episode_id: str,
+                                       evidence_ids: list[str], *,
+                                       kind_override: str | None = None,
+                                       cfg: MemoryConfig | None = None,
+                                       source_episode: dict | None = None) -> dict | None:
+        """Return create kwargs, an existing memory, or rejection; never write."""
+        cfg = cfg if cfg is not None else await self._config_async()
         content = " ".join(str(candidate.get("content", "")).split())[:3000]
         kind = kind_override or str(candidate.get("kind", "fact"))
         if not content or kind not in _MEMORY_KINDS:
@@ -1059,7 +1296,8 @@ class MemoryEngine:
         if cfg.consolidation.verifier_enabled:
             def load_source_rows(store: MemoryStore) -> list[dict]:
                 source_rows: list[dict] = []
-                episode = store.episode(episode_id) or {}
+                episode = (source_episode if source_episode is not None
+                           else store.episode(episode_id)) or {}
                 by_id = {
                     row["id"]: row for row in episode.get("evidence", [])}
                 for source_id in evidence_ids:
@@ -1071,13 +1309,13 @@ class MemoryEngine:
                 if not source_rows:
                     for source_episode_id in candidate.get(
                             "episode_ids", [episode_id]):
-                        source_episode = store.episode(
+                        related_episode = store.episode(
                             source_episode_id, with_evidence=False)
-                        if source_episode and source_episode.get("summary"):
+                        if related_episode and related_episode.get("summary"):
                             source_rows.append({
                                 "id": source_episode_id, "role": "episode",
                                 "content": _redact(
-                                    source_episode["summary"], 4000)})
+                                    related_episode["summary"], 4000)})
                 return source_rows
 
             source_rows = await self._store_call(load_source_rows)
@@ -1185,7 +1423,7 @@ class MemoryEngine:
             similarity = difflib.SequenceMatcher(
                 None, content.casefold(), old["content"].casefold()).ratio()
             if similarity >= 0.92:
-                return old
+                return {"existing": old}
         model_value = max(0.0, min(
             1.0, _model_float(verification.get("prediction_value", 0) or 0)))
         source_episode_count = max(
@@ -1227,34 +1465,21 @@ class MemoryEngine:
         confidence = max(0.0, min(
             1.0, _model_float(candidate.get("confidence", 0.5) or 0.5)))
 
-        def create_and_enqueue(store: MemoryStore) -> dict:
-            memory = store.create_memory(
-                cfg.owner_id, kind, content,
-                authority="inferred",
-                confidence=confidence,
-                status=status,
-                attributes={
-                    "attributed_to": candidate.get("attributed_to", "derived"),
-                    "reuse_conditions": candidate.get("reuse_conditions", []),
-                    "verification": verification,
-                    "dreamer_prompt_version": (
-                        CROSS_EPISODE_PROMPT_VERSION
-                        if kind == "reflection" else DREAMER_PROMPT_VERSION),
-                    "verifier_prompt_version": VERIFIER_PROMPT_VERSION,
-                    "extractor_model": cfg.generation_model,
-                },
-                sources=sources,
-            )
-            if status == "active":
-                store.enqueue(
-                    "reindex_memory", {"memory_id": memory["id"]},
-                    owner_id=cfg.owner_id)
-            return memory
-
-        memory = await self._store_call(create_and_enqueue)
-        if status == "active":
-            self._wake.set()
-        return memory
+        return {"create": dict(
+            kind=kind, content=content, authority="inferred",
+            confidence=confidence, status=status,
+            attributes={
+                "attributed_to": candidate.get("attributed_to", "derived"),
+                "reuse_conditions": candidate.get("reuse_conditions", []),
+                "verification": verification,
+                "dreamer_prompt_version": (
+                    CROSS_EPISODE_PROMPT_VERSION
+                    if kind == "reflection" else DREAMER_PROMPT_VERSION),
+                "verifier_prompt_version": VERIFIER_PROMPT_VERSION,
+                "extractor_model": cfg.generation_model,
+            },
+            sources=sources,
+        )}
 
     @staticmethod
     def _historical_query_fit(content: str, queries: list[str]) -> float:
@@ -1495,15 +1720,29 @@ class MemoryEngine:
                         (memory_id,))
             await self._store_call(mark_pending)
 
-    async def recall(self, query: str, session_id: str) -> list[dict]:
+    async def recall(self, query: str, session_id: str, *,
+                     limit: int | None = None, kind: str | None = None,
+                     origin: str = "hook", report: dict | None = None) -> list[dict]:
+        """Hybrid recall.
+
+        ``origin="hook"`` is the per-turn pre-recall that owns the session's
+        live receipt. ``origin="agent"`` is an explicit Agent search: it uses
+        only the Agent's query, honours its limit/kind filter, is logged as a
+        recall receipt, and never replaces the hook receipt of the turn.
+        ``report``, when given, receives the final ``status`` so a caller can
+        tell "nothing matched" from "a stage timed out or failed".
+        """
         started = time.perf_counter()
         cfg = await self._config_async()
         timeout_ms = cfg.retrieval.soft_timeout_ms
         deadline = started + timeout_ms / 1000 if timeout_ms else None
         query = str(query).strip()[:8000]
-        self._recall_trace.pop(session_id, None)
+        agent = origin == "agent"
+        if not agent:
+            self._recall_trace.pop(session_id, None)
         if cfg.mode != "active" or not query:
             return []
+        final_limit = max(1, min(int(limit or cfg.retrieval.final_limit), 20))
         recall_id = MemoryStore.new_recall_id()
         perf_event("memory.recall_start", recall_id=recall_id,
                    session=obs.short_id(session_id), timeout_ms=timeout_ms)
@@ -1545,12 +1784,15 @@ class MemoryEngine:
 
         try:
             with recall_request_budget(deadline), provider_transport_scope(self._provider_http):
-                recent = await stage("recent", lambda: self._recall_store_call(
+                # An Agent query is already self-contained; mixing in the
+                # previous turns would dilute a deliberately rewritten query.
+                recent = [] if agent else await stage("recent", lambda: self._recall_store_call(
                     lambda store: store.recent_evidence(
                         cfg.owner_id, session_id, role="user", limit=2), deadline=deadline,
                     recall_id=recall_id, stage="recent"))
                 result = await self._recall_candidates(
-                    cfg, query, recent, deadline, stages, stage, recall_id)
+                    cfg, query, recent, deadline, stages, stage, recall_id,
+                    final_limit=final_limit, kind=kind)
                 return result
         except asyncio.CancelledError:
             cancelled = True
@@ -1565,22 +1807,38 @@ class MemoryEngine:
                       "timeout" if "timeout" in stages.values() else
                       "error" if degraded else "ok")
             latency = (time.perf_counter() - started) * 1000
+            if report is not None:
+                report["status"] = status
             self._schedule_recall_telemetry(
                 recall_id=recall_id, owner_id=cfg.owner_id, session_id=session_id,
-                query=query, results=result, latency_ms=latency, status=status)
+                query=query, results=[
+                    {**item, "channels": [*item.get("channels", []), "agent"]}
+                    for item in result] if agent else result,
+                latency_ms=latency, status=status)
             fields = {f"{name}_status": value for name, value in stages.items()}
-            self._recall_trace[session_id] = {
-                "id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
-                "status": status, **fields,
-                "items": [{"id": item["id"], "kind": item["kind"],
-                           "content": item["content"], "score": round(item["score"], 5),
-                           "sources": item.get("sources", [])} for item in result]}
-            perf_event("memory.recall_finish", recall_id=recall_id,
-                       session=obs.short_id(session_id) or "none",
-                       duration_ms=round(latency, 1), count=len(result),
-                       status=status, timeout_ms=timeout_ms, **fields)
+            if agent:
+                perf_event("memory.agent_search_finish", recall_id=recall_id,
+                           session=obs.short_id(session_id) or "none",
+                           duration_ms=round(latency, 1), count=len(result),
+                           status=status)
+                for item in result:
+                    item["recall_id"] = recall_id
+            else:
+                self._recall_trace[session_id] = {
+                    "id": recall_id, "count": len(result), "latency_ms": round(latency, 1),
+                    "status": status, **fields,
+                    "items": [{"id": item["id"], "kind": item["kind"],
+                               "content": item["content"], "score": round(item["score"], 5),
+                               "sources": item.get("sources", [])} for item in result]}
+                perf_event("memory.recall_finish", recall_id=recall_id,
+                           session=obs.short_id(session_id) or "none",
+                           duration_ms=round(latency, 1), count=len(result),
+                           status=status, timeout_ms=timeout_ms, **fields)
 
-    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage, recall_id):
+    async def _recall_candidates(self, cfg, query, recent, deadline, stages, stage, recall_id,
+                                 *, final_limit: int | None = None,
+                                 kind: str | None = None):
+        final_limit = final_limit or cfg.retrieval.final_limit
         prior = [str(item.get("content", ""))[:1000] for item in recent
                  if item.get("content")]
         # Bound what goes to the embedder. Local CPU BGE-M3 latency scales
@@ -1688,12 +1946,14 @@ class MemoryEngine:
                 value["score"] += 1.0 / (60 + rank + 1)
                 value["channels"].append(row.get("channel", "unknown"))
         candidates = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
-        candidate_limit = max(cfg.retrieval.final_limit * 3, 12)
+        candidate_limit = max(final_limit * 3, 12)
         candidate_rows = candidates[:candidate_limit]
         hydrated: list[dict] = []
         for candidate in candidate_rows:
             memory = memory_by_id.get(candidate["id"])
             if not memory or memory.get("status") != "active":
+                continue
+            if kind and memory.get("kind") != kind:
                 continue
             authority_boost = {"confirmed": 1.3, "inferred": 1.0}.get(
                 memory.get("authority"), 0.8)
@@ -1715,7 +1975,7 @@ class MemoryEngine:
                     item["score"] = by_index.get(index, 0)
                     item["channels"].append("rerank")
                 hydrated.sort(key=lambda item: item["score"], reverse=True)
-        return hydrated[:cfg.retrieval.final_limit]
+        return hydrated[:final_limit]
 
     def peek_recall_trace(self, session_id: str) -> dict | None:
         """Share the live receipt with the hook without consuming the SSE receipt."""
@@ -1779,21 +2039,23 @@ class MemoryEngine:
         return memory
 
     async def correct_memory(self, memory_id: str, content: str,
-                             *, kind: str | None = None) -> dict:
+                             *, kind: str | None = None, **supersede) -> dict:
+        """Supersede a memory. ``supersede`` forwards authority/confidence/
+        extra_sources/attributes; the defaults keep user corrections confirmed."""
         async with self._vector_mutation_lock:
             return await self._join_vector_write(
-                self._correct_memory(memory_id, content, kind=kind))
+                self._correct_memory(memory_id, content, kind=kind, **supersede))
 
     async def forget_memory(self, memory_id: str) -> bool:
         async with self._vector_mutation_lock:
             return await self._join_vector_write(self._forget_memory(memory_id))
 
     async def _correct_memory(self, memory_id: str, content: str,
-                             *, kind: str | None = None) -> dict:
+                             *, kind: str | None = None, **supersede) -> dict:
         cfg = await self._config_async()
         memory = await self._store_call(
             lambda store: store.supersede_memory(
-                memory_id, cfg.owner_id, content, kind=kind))
+                memory_id, cfg.owner_id, content, kind=kind, **supersede))
         if cfg.enabled:
             queue_unindex = False
             try:

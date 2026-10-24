@@ -8,6 +8,7 @@
 - [Linux 安装](install-linux_zh.md)
 - [macOS 安装](install-macos_zh.md)
 - [升级](upgrade_zh.md) —— 升级 SDK + CLI 而不丢数据
+- [SSH 独立上传通道](ssh-upload-tunnel_zh.md) —— 隔离上传与聊天、SSE 的传输连接
 
 ## 使用
 
@@ -15,6 +16,7 @@
 - [配置工作区 CLAUDE.md](personalize-claude-md_zh.md) —— 多工作区、项目上下文与可选的长期工作说明
 - [Skills](skills_zh.md) —— 开箱即用的 skill 清单，以及如何添加自己的
 - [手机端 PWA](mobile_zh.md) —— 加到主屏、推送通知、HTTPS
+- [Apple Watch](apple-watch-console_zh.md) —— 快捷指令安装、语音输入、最近会话与连续对话
 - [终端](terminal_zh.md) —— 真实 PTY、终端列表、Profile 与移动操作
 - [定时任务](scheduler_zh.md) —— 按节奏运行保存的 prompt
 - [长期记忆](memory_zh.md) —— 做梦机制、混合召回、现场证据回溯与人工审核 Skill

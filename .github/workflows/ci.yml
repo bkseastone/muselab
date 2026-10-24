@@ -10,10 +10,18 @@ on:
 permissions:
   contents: read
 
+# Same workflow+ref share one group: a new push to a PR supersedes the stale
+# run, but pushes to main / tags are never cancelled mid-flight (the docker
+# publish job must run to completion).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -43,30 +51,28 @@ jobs:
           # Use a minimal env so backend.settings doesn't refuse to import.
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
           MUSELAB_ROOT: ${{ github.workspace }}/.ci-workspace
+          MUSELAB_TEST_COVERAGE: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' }}
         run: |
-          mkdir -p $MUSELAB_ROOT
-          uv run pytest tests/ -n auto --dist=worksteal -v
+          mkdir -p "$MUSELAB_ROOT"
+          test_args=(tests/ -n auto --dist=worksteal -v)
+          if [[ "$MUSELAB_TEST_COVERAGE" == "true" ]]; then
+            # Collect all workers' coverage during the blocking test run.
+            # Rendering below consumes that data without rerunning tests.
+            test_args+=(--cov=backend --cov-report=)
+          fi
+          uv run --frozen pytest "${test_args[@]}"
 
       - name: Coverage report (non-blocking, informational)
-        # Best-effort coverage. pytest-cov is pulled ephemerally via
-        # `uv run --with` so it does NOT touch the frozen lockfile (adding it
-        # to dev deps would require regenerating uv.lock). No fail-under gate —
-        # this surfaces coverage in the run log without turning a dip into a
-        # red build. Only run once (primary py on Linux) to avoid matrix noise.
+        # Reporting has no fail-under gate and remains best-effort. Test
+        # failures above still block this job; coverage never reruns the suite.
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         continue-on-error: true
-        env:
-          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-workspace
-        run: |
-          mkdir -p $MUSELAB_ROOT
-          uv run --with pytest-cov pytest tests/ -q \
-            -n auto --dist=worksteal \
-            --cov=backend --cov-report=term-missing
+        run: uv run --frozen coverage report --show-missing
 
   lint:
     name: ruff + muselab-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -95,6 +101,7 @@ jobs:
   frontend-lint:
     name: frontend syntax check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -114,6 +121,7 @@ jobs:
     # Keep the existing check name for branch-protection compatibility.
     name: pip-audit (dependency CVE scan)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -135,6 +143,7 @@ jobs:
   e2e-core:
     name: e2e core (playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -171,6 +180,7 @@ jobs:
   e2e:
     name: e2e (playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v3
@@ -190,12 +200,13 @@ jobs:
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --frozen --with pytest-rerunfailures \
-            pytest tests/e2e/ -v --reruns 2 --reruns-delay 1
+            pytest tests/e2e/ -v --reruns 2 --reruns-delay 1 --rerun-show-tracebacks
 
   # Build and boot the image on every event, independently of other checks.
   docker-smoke:
     name: docker build + runtime smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
@@ -222,6 +233,7 @@ jobs:
     needs: [test, lint, frontend-lint, security, e2e-core, e2e, docker-smoke]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write       # required for ghcr.io push

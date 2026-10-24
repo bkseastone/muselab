@@ -5,7 +5,9 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import io
 import heapq
+from io import TextIOWrapper
 import os
 import json
 import re
@@ -15,14 +17,19 @@ import stat
 import sys
 import threading
 import time
+from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
-from typing import Literal
+from xml.etree.ElementTree import ParseError
+from typing import BinaryIO, Literal
+import anyio
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
 )
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette._utils import create_collapsing_task_group
+from starlette.datastructures import MutableHeaders
 from . import observability as obs
 from .auth import require_token, require_token_query
 from .capability_tickets import tickets
@@ -2503,8 +2510,8 @@ MAX_TEXT_SIZE = 2 * 1024 * 1024  # 2 MB — bigger files refuse with 413
 SNIFF_BYTES = 4096                # how much we read to detect NUL bytes
 
 
-def _looks_binary(p: Path) -> bool:
-    """Heuristic: read up to 4 KB, presence of NUL byte → binary. Otherwise
+def _looks_binary(chunk: bytes) -> bool:
+    """Heuristic: a NUL byte in the sniff window → binary. Otherwise
     decode with `errors="replace"` and check how many bytes turned into the
     Unicode replacement character (U+FFFD). High ratio → binary / garbage.
 
@@ -2514,11 +2521,6 @@ def _looks_binary(p: Path) -> bool:
     UnicodeDecodeError purely because of the chunk boundary — wrongly tagged
     binary. `errors="replace"` decodes whatever can be decoded and only the
     truly invalid bytes become U+FFFD."""
-    try:
-        with p.open("rb") as f:
-            chunk = f.read(SNIFF_BYTES)
-    except OSError:
-        return True
     if b"\x00" in chunk:
         return True
     # decode with replacement; count how many chars are the replacement marker
@@ -2634,7 +2636,7 @@ def safe_resolve(
     # First-pass resolve (follows symlinks → catches symlink escape):
     try:
         target = (root / logical).resolve()
-    except (ValueError, OSError):
+    except (ValueError, OSError, RuntimeError):
         raise HTTPException(status_code=400, detail="invalid path") from None
     # The selected root itself might be a symlink target; compare real paths.
     root_real = root.resolve()
@@ -2651,6 +2653,44 @@ def safe_resolve(
     # can neither read nor write `.env` / private-key shaped paths.
     if not allow_sensitive and not target.is_dir() and _is_sensitive(target):
         raise HTTPException(status_code=403, detail="sensitive file blocked")
+    return target
+
+
+def safe_read_resolve(
+    path: str, root: Path | None = None, *, external: bool = False,
+) -> Path:
+    """Resolve an explicitly requested external file for authenticated reads.
+
+    Workspace mutation and directory APIs retain safe_resolve's containment.
+    External previews accept regular files only and retain credential/state
+    exclusions, including when a symlink hides the target's real location.
+    """
+    if not external:
+        return safe_resolve(path, root=root)
+    if not path or "\x00" in path:
+        raise HTTPException(status_code=400, detail="invalid file path")
+    try:
+        logical = Path(path).expanduser()
+        if not logical.is_absolute():
+            raise HTTPException(status_code=400, detail="external path must be absolute")
+        target = logical.resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not a file") from None
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="file cannot be read") from None
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(status_code=400, detail="invalid file path") from None
+    if any(_inside(target, Path(prefix)) for prefix in ("/proc", "/sys", "/dev")):
+        raise HTTPException(status_code=403, detail="system virtual files are not accessible")
+    if (INTERNAL_DIR_NAME in logical.parts or INTERNAL_DIR_NAME in target.parts
+            or _inside_internal_state(target)):
+        raise HTTPException(status_code=403, detail="muselab internal state is not accessible")
+    if _is_sensitive(logical) or _is_sensitive(target):
+        raise HTTPException(status_code=403, detail="sensitive file blocked")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    if not os.access(target, os.R_OK):
+        raise HTTPException(status_code=403, detail="file cannot be read")
     return target
 
 
@@ -2765,7 +2805,7 @@ XLSX_CELL_MAX_CHARS = 500   # one obnoxious cell shouldn't blow the page
 
 
 @router.get("/xlsx", dependencies=[Depends(require_token)])
-def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
+def xlsx_preview(path: str, root: Path = Depends(_workspace_root), external: bool = False) -> dict:
     """Read-only xlsx preview as structured JSON.
 
     Returns each sheet's first XLSX_MAX_ROWS×XLSX_MAX_COLS cells as
@@ -2774,7 +2814,7 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
     programmatically without ever being opened in Excel/LibreOffice,
     formula cells will be null and surface as empty strings.
     """
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
@@ -2784,57 +2824,69 @@ def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
     except ImportError:
         raise HTTPException(status_code=500,
                             detail="openpyxl not installed — run `uv sync`")
-    validate_xlsx_archive(target)
-    try:
-        wb = openpyxl.load_workbook(target, read_only=True, data_only=True)
-    except Exception:
-        raise HTTPException(status_code=422,
-                            detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
-    try:
-        sheets: list[dict] = []
-        sheet_names = wb.sheetnames
-        sheets_truncated = len(sheet_names) > XLSX_MAX_SHEETS
-        for sheet_name in sheet_names[:XLSX_MAX_SHEETS]:
-            ws = wb[sheet_name]
-            rows: list[list[str]] = []
-            rows_truncated = False
-            cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
-            for r_idx, row in enumerate(ws.iter_rows(
-                max_row=min(ws.max_row or XLSX_MAX_ROWS + 1, XLSX_MAX_ROWS + 1),
-                max_col=min(ws.max_column or XLSX_MAX_COLS, XLSX_MAX_COLS),
-                values_only=True,
-            )):
-                if r_idx >= XLSX_MAX_ROWS:
-                    rows_truncated = True
-                    break
-                cells: list[str] = []
-                for c_idx, val in enumerate(row):
-                    if c_idx >= XLSX_MAX_COLS:
-                        cols_truncated = True
+    stream, _ = _open_response_file(target)
+    # Retain one verified inode through archive validation and lazy row reads;
+    # an atomic replacement must not substitute an unvalidated workbook.
+    with stream:
+        validate_xlsx_archive(stream)
+        stream.seek(0)
+        try:
+            wb = openpyxl.load_workbook(stream, read_only=True, data_only=True)
+        except Exception:
+            raise HTTPException(status_code=422,
+                                detail="failed to parse spreadsheet (file may be corrupt or unsupported)") from None
+        try:
+            sheets: list[dict] = []
+            # Chartsheets have no cells and must not consume the worksheet budget.
+            worksheets = wb.worksheets
+            sheets_truncated = len(worksheets) > XLSX_MAX_SHEETS
+            for ws in worksheets[:XLSX_MAX_SHEETS]:
+                sheet_name = ws.title
+                rows: list[list[str]] = []
+                rows_truncated = False
+                cols_truncated = bool(ws.max_column and ws.max_column > XLSX_MAX_COLS)
+                for r_idx, row in enumerate(ws.iter_rows(
+                    max_row=min(ws.max_row or XLSX_MAX_ROWS + 1, XLSX_MAX_ROWS + 1),
+                    max_col=min(ws.max_column or XLSX_MAX_COLS, XLSX_MAX_COLS),
+                    values_only=True,
+                )):
+                    if r_idx >= XLSX_MAX_ROWS:
+                        rows_truncated = True
                         break
-                    if val is None:
-                        cells.append("")
-                    else:
-                        s = str(val)
-                        if len(s) > XLSX_CELL_MAX_CHARS:
-                            s = s[:XLSX_CELL_MAX_CHARS] + "…"
-                        cells.append(s)
-                rows.append(cells)
-            sheets.append({
-                "name": sheet_name,
-                "rows": rows,
-                "rows_truncated": rows_truncated,
-                "cols_truncated": cols_truncated,
-            })
-        return {
-            "path": path,
-            "sheets": sheets,
-            "sheets_truncated": sheets_truncated,
-            "limits": {"max_rows": XLSX_MAX_ROWS, "max_cols": XLSX_MAX_COLS,
-                       "max_sheets": XLSX_MAX_SHEETS},
-        }
-    finally:
-        wb.close()
+                    cells: list[str] = []
+                    for c_idx, val in enumerate(row):
+                        if c_idx >= XLSX_MAX_COLS:
+                            cols_truncated = True
+                            break
+                        if val is None:
+                            cells.append("")
+                        else:
+                            s = str(val)
+                            if len(s) > XLSX_CELL_MAX_CHARS:
+                                s = s[:XLSX_CELL_MAX_CHARS] + "…"
+                            cells.append(s)
+                    rows.append(cells)
+                sheets.append({
+                    "name": sheet_name,
+                    "rows": rows,
+                    "rows_truncated": rows_truncated,
+                    "cols_truncated": cols_truncated,
+                })
+            return {
+                "path": path,
+                "sheets": sheets,
+                "sheets_truncated": sheets_truncated,
+                "limits": {"max_rows": XLSX_MAX_ROWS, "max_cols": XLSX_MAX_COLS,
+                           "max_sheets": XLSX_MAX_SHEETS},
+            }
+        except ParseError:
+            # Read-only worksheets parse their XML lazily during iteration.
+            raise HTTPException(
+                status_code=422,
+                detail="failed to parse spreadsheet (file may be corrupt or unsupported)",
+            ) from None
+        finally:
+            wb.close()
 
 
 # CSV preview caps. Paginated by design — CSV files in the wild can be
@@ -2847,31 +2899,47 @@ CSV_MAX_COLS = 50             # per-row column cap
 CSV_CELL_MAX_CHARS = 500
 CSV_SNIFF_BYTES = 8192        # sample size for delimiter / header detection
 
-# Counting every row is necessarily O(file size), but the old endpoint paid
-# that cost on *every* page. Cache only the total (never cell content), keyed by
-# the file's stat signature; writes invalidate naturally via mtime/size. The
-# small LRU is protected because FastAPI sync handlers run in a thread pool.
+# The first preview counts complete CSV records once. Keep only the count and
+# sparse TextIO seek cookies at record boundaries, never cell content. Cookies
+# preserve decoder/newline state across handles, unlike guessed physical-line
+# offsets (quoted cells can contain newlines). Each file has a bounded index;
+# doubling the stride compacts it as arbitrarily large files are scanned.
 CSV_TOTAL_CACHE_MAX = 64
-_CSV_TOTAL_CACHE: OrderedDict[str, tuple[int, int, int]] = OrderedDict()
+CSV_SEEK_STRIDE = 1024
+CSV_SEEK_MAX_CHECKPOINTS = 1024
+_CSV_TOTAL_CACHE: OrderedDict[
+    str, tuple[tuple[int, ...], int, tuple[tuple[int, int], ...]]
+] = OrderedDict()
 _CSV_TOTAL_CACHE_LOCK = threading.Lock()
 
 
-def _csv_total_cache_get(target: Path, mtime_ns: int, size: int) -> int | None:
+def _csv_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+    )
+
+
+def _csv_total_cache_get(
+    target: Path, signature: tuple[int, ...],
+) -> tuple[int, tuple[tuple[int, int], ...]] | None:
     key = str(target)
     with _CSV_TOTAL_CACHE_LOCK:
         value = _CSV_TOTAL_CACHE.get(key)
-        if value is None or value[:2] != (mtime_ns, size):
+        if value is None or value[0] != signature:
             if value is not None:
                 _CSV_TOTAL_CACHE.pop(key, None)
             return None
         _CSV_TOTAL_CACHE.move_to_end(key)
-        return value[2]
+        return value[1], value[2]
 
 
-def _csv_total_cache_set(target: Path, mtime_ns: int, size: int, total: int) -> None:
+def _csv_total_cache_set(
+    target: Path, signature: tuple[int, ...], total: int,
+    checkpoints: list[tuple[int, int]],
+) -> None:
     key = str(target)
     with _CSV_TOTAL_CACHE_LOCK:
-        _CSV_TOTAL_CACHE[key] = (mtime_ns, size, total)
+        _CSV_TOTAL_CACHE[key] = (signature, total, tuple(checkpoints))
         _CSV_TOTAL_CACHE.move_to_end(key)
         while len(_CSV_TOTAL_CACHE) > CSV_TOTAL_CACHE_MAX:
             _CSV_TOTAL_CACHE.popitem(last=False)
@@ -2883,6 +2951,7 @@ def csv_preview(
     offset: int = 0,
     limit: int = CSV_DEFAULT_LIMIT,
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> dict:
     """Read-only paginated CSV / TSV preview as structured JSON.
 
@@ -2890,83 +2959,94 @@ def csv_preview(
     delimiter and a `total_rows` count so the UI can show pagination.
     Header row (if csv.Sniffer flags one) is returned separately.
 
-    Designed to never load more than a window into memory: the file is
-    iterated row-by-row, skipping rows below offset and breaking once
-    `limit` is filled. The trailing total-rows count is the only full
-    scan, and it just discards each row.
+    The first preview counts all records while retaining only the requested
+    window and a bounded sparse seek index. Later pages start at the nearest
+    cached record boundary and stop once the window is filled.
     """
     import csv as _csv  # local import — csv is stdlib, but keep import local
                        # so import overhead stays out of every other route.
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".csv", ".tsv"}:
         raise HTTPException(status_code=415, detail="not a csv/tsv file")
-    try:
-        stat = target.stat()
-    except OSError:
-        raise HTTPException(status_code=404, detail="not a file") from None
-    cached_total = _csv_total_cache_get(target, stat.st_mtime_ns, stat.st_size)
     if limit < 1:
         limit = CSV_DEFAULT_LIMIT
     if limit > CSV_MAX_LIMIT:
         limit = CSV_MAX_LIMIT
     if offset < 0:
         offset = 0
-    # Sniff delimiter + header from a small head sample. Defaults to
-    # excel-style comma if Sniffer can't tell (e.g. one-column file).
-    try:
-        with target.open("r", encoding="utf-8", errors="replace", newline="") as f:
-            sample = f.read(CSV_SNIFF_BYTES)
-        try:
-            dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
-            has_header = _csv.Sniffer().has_header(sample)
-        except _csv.Error:
-            dialect = _csv.excel
-            has_header = False
-        # Override sniff for explicit .tsv — Sniffer sometimes guesses comma
-        # on tab-separated files when the first row has no tabs.
-        if target.suffix.lower() == ".tsv":
-            dialect = _csv.excel_tab
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"failed to read: {e}")
-
     header: list[str] = []
     rows: list[list[str]] = []
     cols_truncated = False
-    total_rows = 0
     try:
-        with target.open("r", encoding="utf-8", errors="replace", newline="") as f:
-            reader = _csv.reader(f, dialect=dialect)
-            # Pull header before any data offset is applied. The user paging
-            # to offset=200 still wants column titles at the top of the page.
+        stream, _ = _open_response_file(target)
+        with stream, TextIOWrapper(stream, encoding="utf-8-sig", errors="replace", newline="") as f:
+            # Bind the cache to the opened inode, not an earlier path stat. A
+            # replacement between stat and open must never receive old cookies.
+            signature = _csv_signature(os.fstat(f.fileno()))
+            cached = _csv_total_cache_get(target, signature)
+            cached_total = cached[0] if cached is not None else None
+            # Sniff and parse the same handle so an atomic replacement cannot
+            # mix the old dialect/header with the new file's data.
+            sample = f.read(CSV_SNIFF_BYTES)
+            try:
+                dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
+                has_header = _csv.Sniffer().has_header(sample)
+            except _csv.Error:
+                dialect = _csv.excel
+                has_header = False
+            if target.suffix.lower() == ".tsv":
+                dialect = _csv.excel_tab
+            f.seek(0)
+            # readline iteration keeps TextIO.tell() available. Plain file
+            # iteration disables it after next(), even at record boundaries.
+            # Sniffer's doublequote regex can miss quoted multiline fields.
+            # Preserve the standard writer's doubled quotes independently of
+            # delimiter/header inference.
+            reader = _csv.reader(iter(f.readline, ""), dialect=dialect, doublequote=True)
             if has_header:
                 try:
                     header_row = next(reader)
                     header = [_clip_cell(c) for c in header_row[:CSV_MAX_COLS]]
-                    if len(header_row) > CSV_MAX_COLS:
-                        cols_truncated = True
+                    cols_truncated = len(header_row) > CSV_MAX_COLS
                 except StopIteration:
                     pass
             row_idx = 0
-            # A cached total means pagination only needs to walk through the
-            # requested window; it can stop immediately afterwards. Without a
-            # cached total (first request or changed file), continue to EOF once
-            # so future pages are cheap.
+            checkpoints = [(0, f.tell())] if cached is None else []
+            stride = CSV_SEEK_STRIDE
+            next_checkpoint = stride if cached is None else -1
+            if cached is not None and offset < cached_total:
+                point_idx = bisect_right(cached[1], offset, key=lambda point: point[0]) - 1
+                row_idx, cookie = cached[1][point_idx]
+                f.seek(cookie)
             if cached_total is None or offset < cached_total:
                 for raw in reader:
-                    if row_idx < offset:
-                        row_idx += 1
-                        continue
-                    if len(rows) < limit:
+                    if row_idx >= offset and len(rows) < limit:
                         cells = [_clip_cell(c) for c in raw[:CSV_MAX_COLS]]
                         if len(raw) > CSV_MAX_COLS:
                             cols_truncated = True
                         rows.append(cells)
                     row_idx += 1
+                    if row_idx == next_checkpoint:
+                        if len(checkpoints) >= CSV_SEEK_MAX_CHECKPOINTS:
+                            checkpoints = checkpoints[::2]
+                            stride *= 2
+                        if row_idx % stride == 0:
+                            checkpoints.append((row_idx, f.tell()))
+                        next_checkpoint = (row_idx // stride + 1) * stride
                     if cached_total is not None and len(rows) >= limit:
                         break
             total_rows = cached_total if cached_total is not None else row_idx
+            # Cache only an unchanged complete scan. Both inode and path checks
+            # exclude in-place rewrites and replacements during this request.
+            if cached is None and _csv_signature(os.fstat(f.fileno())) == signature:
+                try:
+                    end_stat = target.stat()
+                except OSError:
+                    end_stat = None
+                if end_stat is not None and _csv_signature(end_stat) == signature:
+                    _csv_total_cache_set(target, signature, total_rows, checkpoints)
     except _csv.Error:
         raise HTTPException(
             status_code=422,
@@ -2974,18 +3054,6 @@ def csv_preview(
         ) from None
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"failed to read: {e}")
-
-    if cached_total is None:
-        # Do not cache a count under an obsolete signature if an external
-        # writer changed the file during our scan.
-        try:
-            end_stat = target.stat()
-        except OSError:
-            end_stat = None
-        if (end_stat is not None
-                and (end_stat.st_mtime_ns, end_stat.st_size)
-                == (stat.st_mtime_ns, stat.st_size)):
-            _csv_total_cache_set(target, stat.st_mtime_ns, stat.st_size, total_rows)
 
     return {
         "path": path,
@@ -3013,34 +3081,33 @@ def _clip_cell(value: str) -> str:
 def read_file(
     path: str,
     root: Path = Depends(_workspace_root),
+    external: bool = False,
 ) -> PlainTextResponse:
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     suffix = target.suffix.lower()
     # Fast reject for known binary extensions.
     if suffix in BINARY_EXT:
         raise HTTPException(status_code=415, detail="binary file — not previewable as text")
-    # Single stat() reused for both the size gate and the empty-file check.
-    # The previous code called target.stat() twice; if the file vanished
-    # between the two calls (TOCTOU) the second stat raised
-    # FileNotFoundError → 500 instead of a clean 404.
+    stream, info = _open_response_file(target)
     try:
-        st_size = target.stat().st_size
-    except OSError:
+        with stream:
+            if info.st_size > MAX_TEXT_SIZE:
+                raise HTTPException(status_code=413, detail="file too large for preview")
+            # Sniff and read the same inode. Keep the prefix so the total disk
+            # read stays within the byte cap plus one overflow-detection byte,
+            # even if the file grows after the descriptor's size snapshot.
+            data = stream.read(min(SNIFF_BYTES, MAX_TEXT_SIZE + 1))
+            if _looks_binary(data):
+                raise HTTPException(status_code=415, detail="binary content — not previewable as text")
+            data += stream.read(MAX_TEXT_SIZE + 1 - len(data))
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
         raise HTTPException(status_code=404, detail="not a file") from None
-    if st_size > MAX_TEXT_SIZE:
+    if len(data) > MAX_TEXT_SIZE:
         raise HTTPException(status_code=413, detail="file too large for preview")
-    # Empty extension + not a known text name? Sniff content. Empty files OK.
-    # This is the path that picks up .tmpl, .conf.j2, .env.staging, etc.
-    if st_size > 0 and _looks_binary(target):
-        raise HTTPException(status_code=415, detail="binary content — not previewable as text")
-    content = target.read_text(encoding="utf-8", errors="replace")
-    if len(content) > MAX_TEXT_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large to read as text ({len(content)} bytes > {MAX_TEXT_SIZE})",
-        )
+    # Match read_text's UTF-8 replacement and universal-newline behavior.
+    content = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     return PlainTextResponse(
         content,
         headers={
@@ -3051,7 +3118,7 @@ def read_file(
 
 
 @router.get("/stat", dependencies=[Depends(require_token)])
-def stat_file(path: str, root: Path = Depends(_workspace_root)) -> dict:
+def stat_file(path: str, root: Path = Depends(_workspace_root), external: bool = False) -> dict:
     """Lightweight metadata for a single path — name, size, mtime, is_dir.
 
     Powers the preview header's "real path + last-modified" strip: the
@@ -3061,14 +3128,14 @@ def stat_file(path: str, root: Path = Depends(_workspace_root)) -> dict:
     re-reading the whole file. 404 when the path is gone — same contract
     as /read, so a stale/phantom tab surfaces honestly instead of showing
     a path that no longer exists."""
-    target = safe_resolve(path, root=root)
+    target = safe_read_resolve(path, root=root, external=external)
     try:
         st = target.stat()
     except OSError:
         raise HTTPException(status_code=404, detail="not found") from None
     is_dir = target.is_dir()
     return {
-        "path": _logical_relative_path(path).as_posix(),
+        "path": target.as_posix() if external else _logical_relative_path(path).as_posix(),
         "name": target.name,
         "is_dir": is_dir,
         "size": 0 if is_dir else st.st_size,
@@ -3149,6 +3216,7 @@ _preview_ticket_lock = threading.Lock()
 
 class PreviewTicketReq(BaseModel):
     path: str
+    external: bool = False
 
 
 def _prune_preview_tickets(now: float) -> None:
@@ -3159,21 +3227,23 @@ def _prune_preview_tickets(now: float) -> None:
         _preview_tickets.pop(digest, None)
 
 
-def _preview_ticket_ok(ticket: str, path: str, root: Path) -> bool:
+def _preview_ticket_target(ticket: str, path: str, root: Path, external: bool = False) -> Path | None:
     if not ticket.startswith("preview."):
-        return False
+        return None
     digest = hashlib.sha256(ticket[8:].encode("utf-8")).hexdigest()
     now = time.monotonic()
     try:
-        target = safe_resolve(path, root=root)
+        target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
-        return False
+        return None
     with _preview_ticket_lock:
         _prune_preview_tickets(now)
         row = _preview_tickets.get(digest)
         if row is None or row[2] < now:
-            return False
-    return row[0] == str(target) and row[1] == str(root.resolve())
+            return None
+    if row[0] == str(target) and row[1] == str(root.resolve()):
+        return target
+    return None
 
 
 @router.post("/preview-ticket", dependencies=[Depends(require_token)])
@@ -3181,9 +3251,13 @@ def mint_preview_ticket(
     req: PreviewTicketReq,
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    target = safe_resolve(req.path, root=root)
+    target = safe_read_resolve(req.path, root=root, external=req.external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
+    return _issue_preview_ticket(target, root)
+
+
+def _issue_preview_ticket(target: Path, root: Path) -> dict:
     raw = secrets.token_urlsafe(32)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     now = time.monotonic()
@@ -3209,7 +3283,7 @@ def mint_download_ticket(
     req: PreviewTicketReq,
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    target = safe_resolve(req.path, root=root)
+    target = safe_read_resolve(req.path, root=root, external=req.external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     ticket = tickets.mint(
@@ -3226,9 +3300,11 @@ async def _require_raw_access(
     ticket: str = Query(""),
     token: str | None = Query(default=None),
     root: Path = Depends(_workspace_root),
-) -> None:
-    if ticket and _preview_ticket_ok(ticket, path, root):
-        return
+    external: bool = False,
+) -> Path | None:
+    target = _preview_ticket_target(ticket, path, root, external=external)
+    if target is not None:
+        return target
     # Backward compatibility for old clients, copied download links and image
     # URLs.  The first-party HTML preview no longer uses this long-lived token.
     await require_token_query(token)
@@ -3237,9 +3313,18 @@ async def _require_raw_access(
 def _inject_preview_html_bridge(target: Path) -> str | None:
     """Return HTML with the preview bridge, or None for untouched streaming."""
     try:
-        if target.stat().st_size > _PREVIEW_INJECT_MAX_BYTES:
+        stream, info = _open_response_file(target)
+        with stream:
+            if info.st_size > _PREVIEW_INJECT_MAX_BYTES:
+                return None
+            # A file can grow after fstat. Bound the actual read as well as
+            # the size hint, then fall back to streaming without injection.
+            with io.BufferedReader(stream) as buffered:
+                payload = buffered.read(_PREVIEW_INJECT_MAX_BYTES + 1)
+        if len(payload) > _PREVIEW_INJECT_MAX_BYTES:
             return None
-        html = target.read_text(encoding="utf-8")
+        # Preserve read_text's universal-newline behavior.
+        html = payload.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, UnicodeDecodeError):
         return None
     lower = html.lower()
@@ -3251,27 +3336,32 @@ def _inject_preview_html_bridge(target: Path) -> str | None:
     return html[:idx] + _PREVIEW_HTML_BRIDGE + html[idx:]
 
 
-@router.get("/raw", dependencies=[Depends(_require_raw_access)])
+@router.get("/raw")
 def raw_file(
     path: str = Query(...),
     preview: bool = Query(False),
-    ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
+    external: bool = False,
+    target: Path | None = Depends(_require_raw_access),
 ):
     """Stream a raw file using a path-bound preview ticket or legacy token.
 
     Everything outside the whitelists is forced to download as octet-stream.
     """
-    target = safe_resolve(path, root=root)
+    legacy = target is None
+    if legacy:
+        target = safe_read_resolve(path, root=root, external=external)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     # A legacy token URL must never become the executing document's URL:
     # even an opaque sandbox can read location.search and issue HTTPS images.
     # Redirect all legacy resource requests to an exact-file short-lived ticket.
-    if not _preview_ticket_ok(ticket, path, root):
+    if legacy:
         from urllib.parse import urlencode
-        issued = mint_preview_ticket(PreviewTicketReq(path=path), root=root)
+        issued = _issue_preview_ticket(target, root)
         query = {"path": path, "workspace": str(root), "ticket": issued["ticket"]}
+        if external:
+            query["external"] = "1"
         if preview:
             query["preview"] = "1"
         return RedirectResponse(
@@ -3296,7 +3386,7 @@ def raw_file(
     disp_filename = f'filename="file{suffix}"; filename*=UTF-8\'\'{quote(target.name)}'
 
     if suffix in INLINE_OK_SUFFIX:
-        return FileResponse(target, headers={
+        return _opened_file_response(target, headers={
             **base_headers,
             "Content-Disposition": f"inline; {disp_filename}",
         })
@@ -3332,9 +3422,9 @@ def raw_file(
             injected = _inject_preview_html_bridge(target)
             if injected is not None:
                 return HTMLResponse(content=injected, headers=sandbox_headers)
-        return FileResponse(target, headers=sandbox_headers)
+        return _opened_file_response(target, headers=sandbox_headers)
     # FileResponse(filename=) sets Content-Disposition itself; use our safe one.
-    return FileResponse(target, media_type="application/octet-stream", headers={
+    return _opened_file_response(target, media_type="application/octet-stream", headers={
         **base_headers,
         "Content-Disposition": f"attachment; {disp_filename}",
     })
@@ -3344,9 +3434,10 @@ def _require_download_ticket(
     path: str = Query(...),
     ticket: str = Query(""),
     root: Path = Depends(_workspace_root),
-) -> None:
+    external: bool = False,
+) -> Path:
     try:
-        target = safe_resolve(path, root=root)
+        target = safe_read_resolve(path, root=root, external=external)
     except HTTPException:
         raise HTTPException(status_code=401, detail="invalid download ticket") from None
     if not tickets.validate(
@@ -3355,21 +3446,151 @@ def _require_download_ticket(
         (str(target), str(root.resolve())),
     ):
         raise HTTPException(status_code=401, detail="invalid or expired download ticket")
+    return target
 
 
-@router.get("/download", dependencies=[Depends(_require_download_ticket)])
+def _open_response_file(target: Path) -> tuple[BinaryIO, os.stat_result]:
+    """Open a resolved file through real directories, without FIFO blocking."""
+    try:
+        parent_fd = os.open(target.anchor, _directory_open_flags())
+        try:
+            for component in target.parts[1:-1]:
+                next_fd = os.open(
+                    component, _directory_open_flags(), dir_fd=parent_fd,
+                )
+                os.close(parent_fd)
+                parent_fd = next_fd
+            flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(target.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise HTTPException(status_code=404, detail="not a file")
+            return os.fdopen(fd, "rb", buffering=0), info
+        except BaseException:
+            os.close(fd)
+            raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="file cannot be read") from None
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENXIO}:
+            raise HTTPException(status_code=404, detail="not a file") from None
+        raise
+
+
+class _OpenedFileResponse(FileResponse):
+    """Retain FileResponse range semantics while sending one already-open FD."""
+
+    def __init__(self, target: Path, stream: BinaryIO, info: os.stat_result, **kwargs):
+        super().__init__(target, stat_result=info, **kwargs)
+        self._stream = stream
+        self._file = anyio.wrap_file(stream)
+
+    async def __call__(self, scope, receive, send) -> None:
+        response = super().__call__
+        try:
+            spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+            # Keep the sender in a child task so parent cancellation joins its
+            # shielded disk worker before closing the FD that worker still owns.
+            async with create_collapsing_task_group() as task_group:
+                async def stream_response() -> None:
+                    await response(scope, receive, send)
+                    task_group.cancel_scope.cancel()
+
+                task_group.start_soon(stream_response)
+                if scope["type"] == "http" and spec_version < (2, 4):
+                    # Older ASGI servers may silently discard sends after the
+                    # peer closes; receive is their disconnect notification.
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            task_group.cancel_scope.cancel()
+                            break
+                        await anyio.lowlevel.checkpoint()
+        finally:
+            self._stream.close()
+
+    async def _send_span(self, send, start: int, end: int, *, final: bool = True) -> None:
+        await self._file.seek(start)
+        if start == end:
+            await send({"type": "http.response.body", "body": b"", "more_body": not final})
+        while start < end:
+            chunk = await self._file.read(min(self.chunk_size, end - start))
+            if not chunk:
+                # Headers have been sent: abort rather than complete a short
+                # body or spin forever in a multipart range after truncation.
+                raise OSError(errno.EIO, "file changed during download")
+            start += len(chunk)
+            await send({
+                "type": "http.response.body", "body": chunk,
+                "more_body": start < end or not final,
+            })
+
+    async def _handle_simple(self, send, send_header_only: bool, send_pathsend: bool) -> None:
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            # Do not delegate to pathsend: the path may now name another inode.
+            await self._send_span(send, 0, self.stat_result.st_size)
+
+    async def _handle_single_range(
+        self, send, start: int, end: int, file_size: int, send_header_only: bool,
+    ) -> None:
+        headers = MutableHeaders(raw=list(self.raw_headers))
+        headers["content-range"] = f"bytes {start}-{end - 1}/{file_size}"
+        headers["content-length"] = str(end - start)
+        await send({"type": "http.response.start", "status": 206, "headers": headers.raw})
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            await self._send_span(send, start, end)
+
+    async def _handle_multiple_ranges(self, send, ranges, file_size: int, send_header_only: bool) -> None:
+        boundary = secrets.token_hex(13)
+        content_length, header_generator = self.generate_multipart(
+            ranges, boundary, file_size, self.headers["content-type"],
+        )
+        headers = MutableHeaders(raw=list(self.raw_headers))
+        headers["content-type"] = f"multipart/byteranges; boundary={boundary}"
+        headers["content-length"] = str(content_length)
+        await send({"type": "http.response.start", "status": 206, "headers": headers.raw})
+        if send_header_only:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            for start, end in ranges:
+                await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
+                await self._send_span(send, start, end, final=False)
+                await send({"type": "http.response.body", "body": b"\r\n", "more_body": True})
+            await send({"type": "http.response.body", "body": f"--{boundary}--".encode("ascii"), "more_body": False})
+
+
+@router.get("/download")
 def download_file(
-    path: str = Query(...),
-    root: Path = Depends(_workspace_root),
+    target: Path = Depends(_require_download_ticket),
 ) -> FileResponse:
-    target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     from urllib.parse import quote
     suffix = target.suffix.lower()
     disp = f'attachment; filename="file{suffix}"; filename*=UTF-8\'\'{quote(target.name)}'
-    return FileResponse(target, media_type="application/octet-stream",
-                        headers={"Content-Disposition": disp})
+    return _opened_file_response(
+        target, media_type="application/octet-stream",
+        headers={"Content-Disposition": disp},
+    )
+
+
+def _opened_file_response(target: Path, **kwargs) -> FileResponse:
+    """Share one safely opened descriptor across raw and download responses."""
+    stream, info = _open_response_file(target)
+    try:
+        return _OpenedFileResponse(target, stream, info, **kwargs)
+    except BaseException:
+        stream.close()
+        raise
 
 
 class WriteReq(BaseModel):
@@ -3409,7 +3630,12 @@ def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
                 detail=f"content exceeds {MAX_WRITE_BYTES // (1024 * 1024)} MB limit",
             )
     with _trash_transaction(root):
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise HTTPException(
+                status_code=409, detail="destination parent is not a directory",
+            ) from None
         atomic_write_text(target, req.content)
         return {"ok": True, "size": target.stat().st_size}
 
@@ -3589,7 +3815,9 @@ async def upload(
     # atomically rename to dest so a crash or size-exceeded abort never
     # leaves a partial file at the intended path.
     import uuid as _uuid
-    tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
+    # A valid destination can already use almost the whole filename limit.
+    # Bound only the temporary prefix, including for multibyte Unicode names.
+    tmp_path = dest.parent / f".~{dest.name[:32]}.{_uuid.uuid4().hex[:8]}.uploading"
     pending = None
     if upload_id:
         key = await obs.to_thread_io(
@@ -3667,15 +3895,34 @@ async def upload(
             return {"ok": True, "pending": True, "path": pending["path"], "size": written}
         trashed = await obs.to_thread_io(
             "files.upload_finalize", "", _finalize, owned=True)
-    except BaseException:
-        if pending:
-            async with _pending_upload_registry():
-                pending["cancelled"] = True
-                if _PENDING_UPLOADS.get(key) is pending:
-                    _PENDING_UPLOADS.pop(key)
-                    pending["expiry"].cancel()
-        await obs.to_thread_io(
-            "files.upload_cleanup", "", tmp_path.unlink, missing_ok=True, owned=True)
+    except BaseException as failure:
+        async def cleanup_failed_upload():
+            try:
+                if pending:
+                    async with _pending_upload_registry():
+                        pending["cancelled"] = True
+                        if _PENDING_UPLOADS.get(key) is pending:
+                            _PENDING_UPLOADS.pop(key)
+                            pending["expiry"].cancel()
+            finally:
+                await obs.to_thread_io(
+                    "files.upload_cleanup", "", tmp_path.unlink, missing_ok=True, owned=True)
+
+        # Cancellation during the registry wait must not skip the remaining
+        # cleanup. Keep one owner for both the record and its temporary file.
+        cleanup = asyncio.create_task(cleanup_failed_upload(), name="muselab-upload-cleanup")
+        pending_cancel = failure if isinstance(failure, asyncio.CancelledError) else None
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError as exc:
+                if cleanup.cancelled():
+                    raise
+                if pending_cancel is None:
+                    pending_cancel = exc
+        if pending_cancel is not None:
+            raise pending_cancel
         raise
     return {
         "ok": True,
@@ -4353,7 +4600,12 @@ def mkdir(req: MkdirReq, root: Path = Depends(_workspace_root)) -> dict:
     target = safe_resolve(req.path, root=root)
     _guard_not_trash(target, root)
     with _trash_transaction(root):
-        _mkdir_durable(target)
+        try:
+            _mkdir_durable(target)
+        except (FileExistsError, NotADirectoryError, UnsafePrivatePath):
+            raise HTTPException(
+                status_code=409, detail="directory path conflicts with an existing entry",
+            ) from None
     return {"ok": True, "path": _logical_relative_path(req.path).as_posix()}
 
 
@@ -4376,9 +4628,17 @@ def rename(req: RenameReq, root: Path = Depends(_workspace_root)) -> dict:
             raise HTTPException(status_code=404, detail="source not found")
         if dst.exists():
             raise HTTPException(status_code=409, detail="destination already exists")
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir() and dst.is_relative_to(src):
+            raise HTTPException(
+                status_code=409, detail="cannot move a directory into its own subtree",
+            )
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise HTTPException(
+                status_code=409, detail="destination parent is not a directory",
+            ) from None
         _rename_noreplace(src, dst)
-        _fsync_rename(src.parent, dst.parent)
     return {"ok": True, "path": _logical_relative_path(req.dst).as_posix()}
 
 
@@ -4407,13 +4667,15 @@ def _next_bak_name(parent: Path, original_name: str) -> str:
     to be clever about "already a backup".
     """
     base = f"{original_name}.bak"
-    if not (parent / base).exists():
+    # A dangling symlink still occupies its directory entry. Treating it as
+    # available makes the atomic link commit retry the same name forever.
+    if not _path_lexists(parent / base):
         return base
     # .bak exists → try .bak.2, .bak.3, … Cap at a sane upper bound so a
     # pathological directory full of .bak.N siblings can't hang the call.
     for i in range(2, 1000):
         cand = f"{original_name}.bak.{i}"
-        if not (parent / cand).exists():
+        if not _path_lexists(parent / cand):
             return cand
     raise HTTPException(status_code=409, detail="too many .bak siblings")
 
@@ -4445,7 +4707,7 @@ def copy_bak(req: CopyBakReq, root: Path = Depends(_workspace_root)) -> dict:
     # temporary lives beside the final file, so the later hard-link commit is
     # same-filesystem, atomic, and refuses to overwrite an external writer.
     while True:
-        tmp = parent / f".~{src.name}.{secrets.token_hex(8)}.copying"
+        tmp = parent / f".~{src.name[:32]}.{secrets.token_hex(8)}.copying"
         try:
             with tmp.open("xb"):
                 pass
@@ -4516,19 +4778,19 @@ MAX_GREP_TIME_SEC = 8            # soft time budget
 # request — for a 3000-file archive this is ~200-500 ms of pure
 # scandir + per-entry stat() overhead even before any file content is
 # touched. Most directories don't change between calls, so we cache
-# `{dir_path: (mtime, [(name, is_dir), ...])}` keyed by directory
-# mtime; a hit skips the scandir entirely. Filesystem mtime semantics
-# guarantee a directory's mtime updates iff its entry list changes
-# (add / remove / rename), which is exactly the cache invalidation
-# trigger we need. File CONTENT changes do NOT bump parent mtime on
-# ext4 / btrfs, but we deliberately don't cache file size / mtime —
+# `{dir_path: (signature, [(name, is_dir), ...])}` keyed by directory
+# identity and nanosecond mtime/ctime; a hit skips scandir entirely.
+# Sync/archive tools can restore an old mtime after replacing a directory
+# or changing its entries. Inode identity and ctime still invalidate those
+# changes, without an additional stat call. File CONTENT changes do NOT
+# bump parent mtime on ext4 / btrfs, but we don't cache file size / mtime —
 # callers that need those `stat()` per file independently (fast).
 #
 # Thread-safe because FastAPI runs sync route handlers in a thread
 # pool; two concurrent /api/files/search calls would race on the dict
 # without _DIR_CACHE_LOCK.
 # ============================================================
-_DIR_CACHE: dict[str, tuple[float, list[tuple[str, bool]]]] = {}
+_DIR_CACHE: dict[str, tuple[tuple[int, int, int, int], list[tuple[str, bool]]]] = {}
 _DIR_CACHE_LOCK = threading.Lock()
 # Bound the cache so a pathological archive (millions of dirs) can't
 # OOM the process. Typical local workspaces have 50-500 dirs total,
@@ -4538,7 +4800,7 @@ _DIR_CACHE_MAX = 5000
 
 def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
     """Generator that mimics `os.walk(root)` but caches each directory's
-    entry list by mtime, and applies the `ignore` / `show_hidden`
+    entry list by identity/mtime/ctime, and applies the `ignore` / `show_hidden`
     filters in one pass.
 
     Yields `(dirpath: Path, dirnames: list[str], filenames: list[str])`.
@@ -4551,14 +4813,15 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
     while stack:
         dp = stack.pop()
         try:
-            dir_mtime = dp.stat().st_mtime
+            info = dp.stat()
+            signature = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
         except OSError:
             continue
         key = str(dp)
         with _DIR_CACHE_LOCK:
             cached = _DIR_CACHE.get(key)
         entries: list[tuple[str, bool]]
-        if cached is not None and cached[0] == dir_mtime:
+        if cached is not None and cached[0] == signature:
             entries = cached[1]
         else:
             entries = []
@@ -4580,7 +4843,7 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
                         _DIR_CACHE.pop(next(iter(_DIR_CACHE)))
                     except StopIteration:
                         pass
-                _DIR_CACHE[key] = (dir_mtime, entries)
+                _DIR_CACHE[key] = (signature, entries)
         dirnames: list[str] = []
         filenames: list[str] = []
         for name, is_dir in entries:
@@ -4594,6 +4857,26 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
             else:
                 filenames.append(name)
         yield dp, dirnames, filenames
+
+
+@contextmanager
+def _open_grep_regular_file(target: Path):
+    """Do not block if a writer replaces a checked file with a FIFO.
+
+    Open the resolved target without following a replacement leaf symlink,
+    then check the opened inode. O_NONBLOCK has no effect on regular files.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_GREP_FILE_SIZE:
+            yield None
+            return
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
 
 
 # Concurrency gate: each grep can burn up to MAX_GREP_TIME_SEC of CPU while
@@ -4645,6 +4928,16 @@ def _grep_impl(
     # so the symlink-escape guard doesn't re-resolve ROOT once per candidate
     # file (was N stat-resolves per search).
     root_real = root.resolve()
+    # Directory-name filtering cannot protect a public file symlink into
+    # private state or the dustbin. Resolve protected roots once per search,
+    # including relocated private directories in registered workspaces.
+    private_roots: set[Path] = set()
+    for workspace in {root, *workspace_registry.paths()}:
+        for name in (INTERNAL_DIR_NAME, TRASH_DIR_NAME):
+            try:
+                private_roots.add((workspace / name).resolve())
+            except (OSError, RuntimeError):
+                continue
     for dirpath, _dirnames, filenames in _cached_walk(
             root, SEARCH_IGNORE, show_hidden):
         if time.monotonic() - started > MAX_GREP_TIME_SEC:
@@ -4664,18 +4957,25 @@ def _grep_impl(
                 # caught (name-only check misses that).
                 try:
                     resolved = full.resolve()
-                except (OSError, ValueError):
+                except (OSError, ValueError, RuntimeError):
                     continue
                 if root_real != resolved and root_real not in resolved.parents:
                     continue
                 if _is_sensitive(full) or _is_sensitive(resolved):
                     continue
+                if (INTERNAL_DIR_NAME in resolved.parts
+                        or TRASH_DIR_NAME in resolved.parts
+                        or any(_inside(resolved, private) for private in private_roots)):
+                    continue
                 # File-level stat IS NOT cached (file content changes
                 # don't bump parent dir mtime on ext4/btrfs, so a cached
-                # size would lie). One stat per candidate is sub-µs.
-                if full.stat().st_size > MAX_GREP_FILE_SIZE:
+                # size would lie). Recheck the opened inode below as well.
+                info = resolved.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_GREP_FILE_SIZE:
                     continue
-                with full.open("r", encoding="utf-8", errors="replace") as f:
+                with _open_grep_regular_file(resolved) as f:
+                    if f is None:
+                        continue
                     for i, line in enumerate(f, 1):
                         if q_lower in line.lower():
                             try:

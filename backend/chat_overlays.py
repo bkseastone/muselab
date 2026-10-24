@@ -897,9 +897,13 @@ def _cancelled_snapshot_canonical_span(
         if expected and current and expected != current:
             return [], ""
 
+    # SDK-internal user rows, including image hints, remain in the parent
+    # chain but cannot own a human turn. Consult the persisted is_meta bit so
+    # existing indexes with real_user_prompt=True for those rows still work.
     real_user_ids = [
         record_i for record_i in range(start, len(records))
-        if records[record_i].get("real_user_prompt")
+        if (records[record_i].get("real_user_prompt")
+            and not records[record_i].get("is_meta"))
     ]
     if not real_user_ids:
         return [], ""
@@ -973,10 +977,17 @@ def _cancelled_snapshot_canonical_span(
             # cancelling the launch turn must not relabel that later reaction.
             if current.get("task_notifications"):
                 break
-            if current.get("real_user_prompt"):
+            # A compact summary is a user row but not a prompt: auto-compaction
+            # mid-turn must not end the walk before it reaches the real one.
+            if (current.get("real_user_prompt")
+                    and not current.get("is_meta")
+                    and not current.get("compact")):
                 result = current_uuid
                 break
-            parent = str(current.get("parent") or "")
+            # compact_boundary roots a fresh chain (parentUuid null) and keeps
+            # the pre-compaction link in logicalParentUuid.
+            parent = str(current.get("parent")
+                         or current.get("logical_parent") or "")
             parent_i = by_uuid.get(parent) if parent else None
             if parent_i is None:
                 break

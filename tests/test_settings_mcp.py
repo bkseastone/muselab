@@ -3,7 +3,10 @@
 Uses the shared conftest fixtures (client / auth / app_module) so env / token /
 sessions dir setup matches the rest of the suite.
 """
+import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
@@ -258,3 +261,171 @@ def test_remote_header_mask_recovery(temp_mcp, client, auth):
     cfg = json.loads(temp_mcp.read_text())
     assert cfg["mcpServers"]["gmail"]["headers"]["Authorization"] \
         == "Bearer secret-token-xyz"
+
+
+@pytest.mark.parametrize("second_operation", ["upsert", "delete", "toggle"])
+def test_concurrent_mcp_mutations_preserve_each_successful_edit(
+    temp_mcp, client, auth, monkeypatch, second_operation,
+):
+    from backend import api_settings
+
+    initial = {
+        "futureField": {"keep": True},
+        "mcpServers": {
+            "alpha": {"command": "synthetic", "args": ["old"]},
+            "beta": {"command": "synthetic", "args": ["old"], "disabled": False},
+        },
+    }
+    temp_mcp.write_text(json.dumps(initial), encoding="utf-8")
+    first_saving = threading.Event()
+    second_read = threading.Event()
+    load = api_settings._load_mcp
+    save = api_settings._save_mcp
+
+    def observed_load(*args, **kwargs):
+        cfg = load(*args, **kwargs)
+        if first_saving.is_set():
+            second_read.set()
+        return cfg
+
+    def gated_save(cfg):
+        if not first_saving.is_set():
+            first_saving.set()
+            # Before the fix, the second request reads the old file while the
+            # first write is paused. A serialized transaction waits here, then
+            # reads after the first request commits.
+            second_read.wait(timeout=1)
+        save(cfg)
+
+    monkeypatch.setattr(api_settings, "_load_mcp", observed_load)
+    monkeypatch.setattr(api_settings, "_save_mcp", gated_save)
+
+    def edit_alpha():
+        return client.put(
+            "/api/settings/mcp/alpha", headers=auth,
+            json={"name": "alpha", "command": "synthetic", "args": ["new"]},
+        )
+
+    def edit_beta():
+        if second_operation == "delete":
+            return client.delete("/api/settings/mcp/beta", headers=auth)
+        if second_operation == "toggle":
+            return client.patch(
+                "/api/settings/mcp/beta/toggle", headers=auth,
+                json={"disabled": True},
+            )
+        return client.put(
+            "/api/settings/mcp/beta", headers=auth,
+            json={"name": "beta", "command": "synthetic", "args": ["new"]},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(edit_alpha)
+        assert first_saving.wait(timeout=5)
+        second = executor.submit(edit_beta)
+        assert first.result(timeout=10).status_code == 200
+        assert second.result(timeout=10).status_code == 200
+
+    saved = json.loads(temp_mcp.read_text(encoding="utf-8"))
+    assert saved["futureField"] == {"keep": True}
+    assert saved["mcpServers"]["alpha"]["args"] == ["new"]
+    if second_operation == "delete":
+        assert "beta" not in saved["mcpServers"]
+    elif second_operation == "toggle":
+        assert saved["mcpServers"]["beta"]["disabled"] is True
+    else:
+        assert saved["mcpServers"]["beta"]["args"] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_mcp_toggles_keep_live_client_at_latest_saved_state(
+    temp_mcp, monkeypatch,
+):
+    from backend import api_settings, chat
+
+    temp_mcp.write_text(json.dumps({
+        "mcpServers": {"sample": {"command": "synthetic", "disabled": False}},
+    }), encoding="utf-8")
+    first_saved = threading.Event()
+    second_applied = threading.Event()
+    persist = api_settings._persist_mcp_toggle
+
+    def delayed_persist(name, disabled):
+        persist(name, disabled)
+        if disabled:
+            first_saved.set()
+            # Delay delivery of the first worker's result until the second
+            # toggle applies. A serialized toggle must finish this one first.
+            second_applied.wait(timeout=1)
+
+    class LiveClient:
+        enabled = True
+
+        async def toggle_mcp_server(self, name, enabled):
+            assert name == "sample"
+            self.enabled = enabled
+            if enabled:
+                second_applied.set()
+
+    live = LiveClient()
+    monkeypatch.setattr(api_settings, "_persist_mcp_toggle", delayed_persist)
+    monkeypatch.setattr(chat, "_clients", {("synthetic-session", "model"): live})
+    first = asyncio.create_task(api_settings.toggle_mcp_server(
+        "sample", api_settings.MCPToggleReq(disabled=True),
+    ))
+    second = None
+    try:
+        assert await asyncio.to_thread(first_saved.wait, 5)
+        second = asyncio.create_task(api_settings.toggle_mcp_server(
+            "sample", api_settings.MCPToggleReq(disabled=False),
+        ))
+        responses = await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+        assert all(response["ok"] and not response["errors"] for response in responses)
+    finally:
+        second_applied.set()
+        tasks = [task for task in (first, second) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        chat._clients.clear()
+
+    saved = json.loads(temp_mcp.read_text(encoding="utf-8"))["mcpServers"]["sample"]
+    assert saved["disabled"] is False
+    assert live.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_toggle_wait_for_one_mcp_does_not_block_another(temp_mcp, monkeypatch):
+    from backend import api_settings, chat
+
+    temp_mcp.write_text(json.dumps({"mcpServers": {
+        name: {"command": "synthetic", "disabled": False} for name in ("alpha", "beta")
+    }}), encoding="utf-8")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class LiveClient:
+        async def toggle_mcp_server(self, name, enabled):
+            if name == "alpha":
+                entered.set()
+                await release.wait()
+
+    monkeypatch.setattr(chat, "_clients", {("synthetic-session", "model"): LiveClient()})
+    first = asyncio.create_task(api_settings.toggle_mcp_server(
+        "alpha", api_settings.MCPToggleReq(disabled=True),
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = await asyncio.wait_for(api_settings.toggle_mcp_server(
+            "beta", api_settings.MCPToggleReq(disabled=True),
+        ), timeout=2)
+        assert second["ok"] and not second["errors"]
+        assert not first.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(first, timeout=5)
+        chat._clients.clear()
+
+    saved = json.loads(temp_mcp.read_text(encoding="utf-8"))["mcpServers"]
+    assert saved["alpha"]["disabled"] and saved["beta"]["disabled"]

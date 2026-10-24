@@ -20,6 +20,7 @@ import re
 import shutil
 import tempfile
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -659,7 +660,11 @@ OVERRIDES_PATH = PROVIDER_OVERRIDES_PATH
 # supports_effort, and max_output_tokens are intentionally NOT user-editable in
 # the UI (vendor quirks that break the request if wrong); built-ins keep their
 # baked values, user-created providers take the safe defaults below.
-_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,99}$")
+# Namespaced upstream models use slashes, e.g. an account/model Gateway route.
+_MODEL_ID_RE = re.compile(
+    r"^(?=.{1,100}$)[A-Za-z0-9][A-Za-z0-9._:+\-]*"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._:+\-]*)*$"
+)
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,39}$")
 
 # Custom-provider env keys must live in this reserved namespace. Without the
@@ -714,6 +719,8 @@ def _slug(text: str) -> str:
 _OVERRIDES_CACHE: tuple[tuple[int, int], dict] | None = None
 _CATALOG_CACHE: tuple[tuple[int, int] | None, tuple[Provider, ...]] | None = None
 _OVERRIDES_CACHE_LOCK = threading.Lock()
+# Keep validation and read/modify/write together across API request threads.
+_OVERRIDES_WRITE_LOCK = threading.RLock()
 
 
 def _overrides_stat_key() -> tuple[int, int] | None:
@@ -728,15 +735,29 @@ def _overrides_stat_key() -> tuple[int, int] | None:
         return None
 
 
-def _parse_overrides(text: str) -> dict:
+class ProviderOverridesReadError(RuntimeError):
+    """Stored provider configuration cannot safely be used for a write."""
+
+
+def _parse_overrides(text: str, *, strict: bool = False) -> dict:
     """Normalize the raw JSON text into the canonical store shape. Tolerates
     malformed content by returning the empty shape."""
     try:
         data = json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        if strict:
+            raise ProviderOverridesReadError("Provider configuration contains invalid JSON") from exc
         return {"providers": {}, "deleted": [], "anthropic_models": None}
     if not isinstance(data, dict):
+        if strict:
+            raise ProviderOverridesReadError("Provider configuration must be an object")
         return {"providers": {}, "deleted": [], "anthropic_models": None}
+    if strict:
+        for name, kind in (("providers", dict), ("deleted", list)):
+            if name in data and not isinstance(data[name], kind):
+                raise ProviderOverridesReadError(f"Provider configuration has invalid {name}")
+        if data.get("anthropic_models") is not None and not isinstance(data["anthropic_models"], list):
+            raise ProviderOverridesReadError("Provider configuration has invalid anthropic_models")
     prov = data.get("providers")
     deleted = data.get("deleted")
     # Anthropic/Claude is special-cased (OAuth-or-key auth, no editable
@@ -750,13 +771,29 @@ def _parse_overrides(text: str) -> dict:
     }
 
 
-def _load_overrides() -> dict:
+def _load_overrides(*, for_write: bool = False) -> dict:
     """Read the override store, cached by the file's (mtime_ns, size). Tolerates
     a missing / malformed file by returning the empty shape.
 
     Returns a deep copy so write-path callers (which mutate `store` in place
     before _save_overrides) can't corrupt the shared cache."""
     global _OVERRIDES_CACHE
+    if for_write:
+        # Cached/tolerant reads are useful for routing, but cannot authorize a
+        # destructive rewrite. Read the actual file on each write transaction.
+        try:
+            OVERRIDES_PATH.stat()
+        except FileNotFoundError:
+            # The file may appear between stat and read. Only the actual read
+            # can establish that it is missing; exists() is not authoritative.
+            pass
+        try:
+            text = OVERRIDES_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {"providers": {}, "deleted": [], "anthropic_models": None}
+        except UnicodeError as exc:
+            raise ProviderOverridesReadError("Provider configuration cannot be decoded") from exc
+        return _parse_overrides(text, strict=True)
     key = _overrides_stat_key()
     if key is None:
         return {"providers": {}, "deleted": [], "anthropic_models": None}
@@ -790,23 +827,26 @@ def _save_overrides(store: dict) -> None:
 
 
 def _looks_like_codex_provider(display: str, prefix: str, env_key: str, base_url: str) -> bool:
-    """Legacy custom Codex sidecar compatibility.
-
-    Older installs could have a user-created "Codex (ChatGPT subscription)"
-    provider (`gpt-*` models on the same local sidecar) before Codex Gateway
-    became a built-in. Custom providers don't carry capability bits in
-    provider_overrides.json, so infer the known Codex sidecar shape here.
-    """
-    low_display = (display or "").lower()
+    """Recognize legacy sidecars and account aliases of the configured Gateway."""
+    if "codex" not in (display or "").lower():
+        return False
     low_url = (base_url or "").lower()
-    return (
-        "codex" in low_display
-        and (prefix or "").startswith(("gpt-", "codex:"))
-        and (
-            env_key == "MUSELAB_PROVIDER_CODEX_API_KEY"
-            or "127.0.0.1:8317" in low_url
-            or "localhost:8317" in low_url
-        )
+    legacy = (prefix or "").startswith(("gpt-", "codex:")) and (
+        env_key == "MUSELAB_PROVIDER_CODEX_API_KEY"
+        or "127.0.0.1:8317" in low_url
+        or "localhost:8317" in low_url
+    )
+    # Internal aliases may use any colon prefix. Only inherit capabilities from
+    # the actual configured Codex endpoint, never from a model's GPT spelling.
+    override = _load_overrides()["providers"].get("b:codex:", {})
+    configured_url = (
+        os.environ.get("CODEX_GATEWAY_BASE_URL", "").strip()
+        or (override.get("base_url") if isinstance(override, dict) else "")
+        or "http://127.0.0.1:8317"
+    )
+    return legacy or (
+        (prefix or "").endswith(":")
+        and (base_url or "").rstrip("/") == configured_url.rstrip("/")
     )
 
 
@@ -830,7 +870,7 @@ def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
         models = base.models
     else:
         models = ()
-    is_legacy_codex = base is None and _looks_like_codex_provider(
+    is_custom_codex = base is None and _looks_like_codex_provider(
         display, prefix, env_key, base_url)
     return Provider(
         prefix=prefix,
@@ -838,9 +878,9 @@ def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
         env_key=env_key,
         display=display,
         models=models,
-        supports_thinking=base.supports_thinking if base else (False if is_legacy_codex else True),
-        supports_effort=base.supports_effort if base else is_legacy_codex,
-        max_output_tokens=base.max_output_tokens if base else (128000 if is_legacy_codex else None),
+        supports_thinking=base.supports_thinking if base else (False if is_custom_codex else True),
+        supports_effort=base.supports_effort if base else is_custom_codex,
+        max_output_tokens=base.max_output_tokens if base else (128000 if is_custom_codex else None),
         id=pid,
     )
 
@@ -934,81 +974,104 @@ def validate_provider_fields(base_url: str, prefix: str, models: list[str],
 
 
 def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
-                    display: str, env_key: str, models: list[str]) -> Provider:
+                    display: str, env_key: str, models: list[str],
+                    before_save: Callable[[str, str], None] | None = None) -> Provider:
     """Create or update a provider override. Returns the saved effective
     Provider. api-key is handled separately (stays in .env). Raises ValueError
     on invalid input."""
-    models = [str(m).strip() for m in models if str(m).strip()]
-    validate_provider_fields(base_url, prefix, models, this_id=pid)
-    store = _load_overrides()
-    # New provider: mint a stable custom id + an env-key slot if none given.
-    if not pid:
-        pid = "c:" + _slug(base_url)
-        # Avoid collision with an existing id.
-        n = 1
-        base_pid = pid
-        existing = set(store["providers"].keys()) | {_builtin_id(b) for b in CATALOG}
-        while pid in existing:
-            n += 1
-            pid = f"{base_pid}-{n}"
-    if not env_key:
-        env_key = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_") + "_API_KEY"
-    # User-supplied env_key flows into .env writes (api_settings._write_env) —
-    # without this gate a crafted value could overwrite MUSELAB_TOKEN, PATH,
-    # or another provider's credential.
-    validate_env_key(env_key)
-    entry = {
-        "base_url": base_url.strip(),
-        "prefix": prefix.strip(),
-        "display": (display or prefix).strip(),
-        "env_key": env_key.strip(),
-        "models": models,
-    }
-    store["providers"][pid] = entry
-    # If this id was previously deleted (e.g. re-adding a built-in), un-delete.
-    store["deleted"] = [d for d in store["deleted"] if d != pid]
-    _save_overrides(store)
-    return _provider_from_def(pid, entry, _builtin_by_id(pid))
+    with _OVERRIDES_WRITE_LOCK:
+        store = _load_overrides(for_write=True)
+        models = [str(m).strip() for m in models if str(m).strip()]
+        validate_provider_fields(base_url, prefix, models, this_id=pid)
+        # New provider: mint a stable custom id + an env-key slot if none given.
+        if not pid:
+            pid = "c:" + _slug(base_url)
+            # Avoid collision with an existing id.
+            n = 1
+            base_pid = pid
+            existing = set(store["providers"].keys()) | {_builtin_id(b) for b in CATALOG}
+            while pid in existing:
+                n += 1
+                pid = f"{base_pid}-{n}"
+        if not env_key:
+            previous = get_provider(pid) or _builtin_by_id(pid)
+            if previous is not None:
+                # Editing endpoint metadata must not detach its credential.
+                env_key = previous.env_key
+            else:
+                # Several accounts can share an endpoint. Automatically
+                # allocated credential slots still belong to one provider.
+                used_keys = {p.env_key for p in catalog()}
+                used_keys.update(
+                    entry.get("env_key") for entry in store["providers"].values()
+                    if isinstance(entry, dict)
+                )
+                stem = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_")
+                env_key = stem + "_API_KEY"
+                suffix = 1
+                while env_key in used_keys:
+                    suffix += 1
+                    env_key = f"{stem}_{suffix}_API_KEY"
+        # User-supplied env_key flows into .env writes (api_settings._write_env) —
+        # without this gate a crafted value could overwrite MUSELAB_TOKEN, PATH,
+        # or another provider's credential.
+        validate_env_key(env_key)
+        entry = {
+            "base_url": base_url.strip(),
+            "prefix": prefix.strip(),
+            "display": (display or prefix).strip(),
+            "env_key": env_key.strip(),
+            "models": models,
+        }
+        store["providers"][pid] = entry
+        # If this id was previously deleted (e.g. re-adding a built-in), un-delete.
+        store["deleted"] = [d for d in store["deleted"] if d != pid]
+        if before_save is not None:
+            before_save(pid, entry["env_key"])
+        _save_overrides(store)
+        return _provider_from_def(pid, entry, _builtin_by_id(pid))
 
 
 def delete_provider(pid: str) -> bool:
     """Remove a provider. Built-ins are tombstoned in `deleted` so they don't
     reappear; user-created providers are dropped outright. Returns True if
     anything changed."""
-    store = _load_overrides()
-    changed = False
-    if pid in store["providers"]:
-        del store["providers"][pid]
-        changed = True
-    if _builtin_by_id(pid) is not None and pid not in store["deleted"]:
-        store["deleted"].append(pid)
-        changed = True
-    if changed:
-        _save_overrides(store)
-    return changed
+    with _OVERRIDES_WRITE_LOCK:
+        store = _load_overrides(for_write=True)
+        changed = False
+        if pid in store["providers"]:
+            del store["providers"][pid]
+            changed = True
+        if _builtin_by_id(pid) is not None and pid not in store["deleted"]:
+            store["deleted"].append(pid)
+            changed = True
+        if changed:
+            _save_overrides(store)
+        return changed
 
 
 def restore_provider(pid: str) -> bool:
     """Restore a built-in provider to its factory default by dropping its
     override + tombstone. No-op (returns False) for user-created providers
     (nothing to restore to). Caller should DELETE those instead."""
-    # Anthropic isn't in CATALOG (special auth), but its model list IS
-    # overridable — route restore to the dedicated Claude-models reset.
-    if pid == "anthropic":
-        return restore_anthropic_models()
-    if _builtin_by_id(pid) is None:
-        return False
-    store = _load_overrides()
-    changed = False
-    if pid in store["providers"]:
-        del store["providers"][pid]
-        changed = True
-    if pid in store["deleted"]:
-        store["deleted"] = [d for d in store["deleted"] if d != pid]
-        changed = True
-    if changed:
-        _save_overrides(store)
-    return changed
+    with _OVERRIDES_WRITE_LOCK:
+        # Anthropic isn't in CATALOG (special auth), but its model list IS
+        # overridable — route restore to the dedicated Claude-models reset.
+        if pid == "anthropic":
+            return restore_anthropic_models()
+        if _builtin_by_id(pid) is None:
+            return False
+        store = _load_overrides(for_write=True)
+        changed = False
+        if pid in store["providers"]:
+            del store["providers"][pid]
+            changed = True
+        if pid in store["deleted"]:
+            store["deleted"] = [d for d in store["deleted"] if d != pid]
+            changed = True
+        if changed:
+            _save_overrides(store)
+        return changed
 
 
 def provider_meta() -> list[dict]:
@@ -1153,28 +1216,30 @@ def set_anthropic_models(models: list[str]) -> None:
     """Persist a custom Claude model list. Validates non-empty + that every id
     looks like a Claude model (the auth/endpoint are fixed to Anthropic, so a
     non-`claude-` id here would 404). Raises ValueError on bad input."""
-    cleaned = [str(m).strip() for m in (models or []) if str(m).strip()]
-    if not cleaned:
-        raise ValueError("model list cannot be empty")
-    for m in cleaned:
-        if not m.lower().startswith("claude-"):
-            raise ValueError(f"not a Claude model id: {m!r} (must start with 'claude-')")
-    if len(set(cleaned)) != len(cleaned):
-        raise ValueError("duplicate model ids")
-    store = _load_overrides()
-    store["anthropic_models"] = cleaned
-    _save_overrides(store)
+    with _OVERRIDES_WRITE_LOCK:
+        cleaned = [str(m).strip() for m in (models or []) if str(m).strip()]
+        if not cleaned:
+            raise ValueError("model list cannot be empty")
+        for m in cleaned:
+            if not m.lower().startswith("claude-"):
+                raise ValueError(f"not a Claude model id: {m!r} (must start with 'claude-')")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("duplicate model ids")
+        store = _load_overrides(for_write=True)
+        store["anthropic_models"] = cleaned
+        _save_overrides(store)
 
 
 def restore_anthropic_models() -> bool:
     """Drop the Claude model override (revert to factory default). Returns
     True if there was an override to remove, False if already default."""
-    store = _load_overrides()
-    if store.get("anthropic_models") is None:
-        return False
-    store["anthropic_models"] = None
-    _save_overrides(store)
-    return True
+    with _OVERRIDES_WRITE_LOCK:
+        store = _load_overrides(for_write=True)
+        if store.get("anthropic_models") is None:
+            return False
+        store["anthropic_models"] = None
+        _save_overrides(store)
+        return True
 
 
 # Tier is left open (`[a-z]+`) rather than a fixed opus|sonnet|haiku allowlist:

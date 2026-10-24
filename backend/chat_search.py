@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Callable
 
+from .chat_history import raw_msg_from_entry
 from .observability import perf_event
 from .private_storage import ensure_private_directory, ensure_private_regular_file
 
@@ -39,6 +40,25 @@ def _check(cancel: threading.Event) -> None:
 def _guard(handle, offset: int) -> str:
     handle.seek(max(0, offset - 65536))
     return hashlib.blake2b(handle.read(min(offset, 65536)), digest_size=16).hexdigest()
+
+
+def _source_match_span(text: str, folded_text: str, needle: str) -> tuple[int, int]:
+    """Map a lowercase substring match back to original-text coordinates."""
+    start = folded_text.index(needle)
+    end = start + len(needle)
+    if len(text) == len(folded_text):
+        return start, len(needle)
+    # Unicode lowercasing can expand a source character (for example İ).
+    # Indexed offsets then drift from the text the snippet renderer slices.
+    folded_offset = 0
+    source_start = 0
+    for index, character in enumerate(text):
+        if folded_offset <= start:
+            source_start = index
+        folded_offset += len(character.lower())
+        if folded_offset >= end:
+            return source_start, index + 1 - source_start
+    return len(text), 0
 
 
 class SearchIndex:
@@ -91,6 +111,11 @@ class SearchIndex:
                 ''')
                 if not has_triggers:
                     db.execute("INSERT INTO search_fts(search_fts) VALUES ('rebuild')")
+            if db.execute('PRAGMA user_version').fetchone()[0] < 1:
+                # Legacy checkpoints skipped native steering attachments. Their
+                # unchanged files need one rebuild under the complete parser.
+                db.execute('DELETE FROM sources')
+                db.execute('PRAGMA user_version=1')
             db.commit()
             return db
         except BaseException:
@@ -144,6 +169,11 @@ class SearchIndex:
                         entry = json.loads(raw.decode('utf-8-sig'))
                     except (UnicodeDecodeError, ValueError):
                         entry = None
+                    if isinstance(entry, dict) and entry.get('type') == 'attachment':
+                        message = raw_msg_from_entry(entry)
+                        if message is not None and message.message.get('_muselab_steering'):
+                            entry = {**entry, 'type': message.type, 'uuid': message.uuid,
+                                     'message': message.message}
                     if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant'):
                         message = entry.get('message')
                         body = extract(message.get('content')) if isinstance(message, dict) else ''
@@ -212,7 +242,7 @@ class SearchIndex:
             hits = [{
                 'sid': row['sid'], 'name': names.get(row['sid'], ''), 'uuid': row['uuid'],
                 'role': row['role'], 'ts': row['ts'],
-                'snippet': snippet(row['body'], row['folded'].find(folded), len(query)),
+                'snippet': snippet(row['body'], *_source_match_span(row['body'], row['folded'], folded)),
             } for row in rows]
             metrics['lookup_ms'] = round((time.perf_counter() - sql_started) * 1000)
             metrics['fts'] = bool(use_fts)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from claude_agent_sdk import (
     AssistantMessage,
     SessionMessage,
@@ -389,9 +391,153 @@ def test_authenticated_history_endpoint_uses_sdk_projection(
     assert calls == [(session["id"], str(sess.session_workspace(session["id"])))]
 
 
+def test_concurrent_history_reads_share_snapshot_then_refresh(
+    app_module, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    sid = sess.create_session("concurrent subagents")["id"]
+    version = [1]
+    load_calls = []
+
+    def load(owner, directory=None):
+        load_calls.append((owner, directory))
+        return [{"agent_id": "agent-a", "message_count": version[0], "blocks": []}]
+
+    monkeypatch.setattr(chat_mod.chat_subagents, "load_subagent_threads", load)
+
+    async def exercise():
+        original = chat_mod.obs.to_thread_io
+        history_started = asyncio.Event()
+        release_history = asyncio.Event()
+        both_workspace_reads = asyncio.Event()
+        workspace_reads = 0
+
+        async def observed(site, owner, operation, *args, **kwargs):
+            nonlocal workspace_reads
+            if site == "chat.subagents_history_read":
+                history_started.set()
+                await release_history.wait()
+                return operation(*args, **kwargs)
+            result = await original(site, owner, operation, *args, **kwargs)
+            if site == "chat.subagents_workspace_read":
+                workspace_reads += 1
+                if workspace_reads == 2:
+                    both_workspace_reads.set()
+            return result
+
+        monkeypatch.setattr(chat_mod.obs, "to_thread_io", observed)
+        first = asyncio.create_task(chat_mod.get_session_subagents_api(sid))
+        await asyncio.wait_for(history_started.wait(), 5)
+        second = asyncio.create_task(chat_mod.get_session_subagents_api(sid))
+        await asyncio.wait_for(both_workspace_reads.wait(), 5)
+        release_history.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result == second_result
+        assert len(load_calls) == 1
+
+        version[0] = 2
+        refreshed = await chat_mod.get_session_subagents_api(sid)
+        assert refreshed["threads"][0]["message_count"] == 2
+        assert len(load_calls) == 2
+
+    asyncio.run(exercise())
+
+
 def test_history_endpoint_rejects_unknown_session(client, auth):
     response = client.get(
         "/api/chat/sessions/00000000-0000-4000-8000-000000000000/subagents",
         headers=auth,
     )
     assert response.status_code == 404
+
+
+def test_successor_history_inherits_only_attached_ancestor_threads(
+    app_module, client, auth, monkeypatch,
+):
+    from copy import deepcopy
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    source = sess.create_session("source")["id"]
+    child = sess.create_session("successor")["id"]
+    future = sess.create_session("later successor")["id"]
+    assert sess.link_runtime_successor(source, child)
+    assert sess.link_runtime_successor(child, future)
+
+    def thread(owner, agent, parent, blocks=(), orphaned=False):
+        return {
+            "session_id": owner, "agent_id": agent,
+            "parent_tool_use_id": parent, "parent_agent_id": None,
+            "orphaned": orphaned, "message_count": len(blocks),
+            "blocks": list(blocks),
+        }
+
+    root = thread(source, "old-agent", "copied-call", [{
+        "role": "tool_use", "name": "Agent", "id": "nested-call",
+        "block_id": "nested-launch", "session_id": source,
+    }])
+    nested = thread(source, "nested-agent", "nested-call", [{
+        "role": "assistant", "text": "nested progress", "block_id": "nested-text",
+        "session_id": source,
+    }])
+    own = thread(child, "own-agent", "own-call")
+    inherited = [
+        nested, root,
+        thread(source, "after-fork-agent", "uncopied-call"),
+        thread(source, "orphan-agent", None, orphaned=True),
+        # A copied subagent transcript must not duplicate the child-owned one.
+        thread(source, "own-agent", "own-call"),
+    ]
+    before = deepcopy(inherited)
+    calls = []
+
+    def load(owner, directory=None):
+        calls.append(owner)
+        assert owner in {source, child}, "must not read descendant sessions"
+        return [own] if owner == child else inherited
+
+    monkeypatch.setattr(chat_mod.chat_subagents, "load_subagent_threads", load)
+    monkeypatch.setattr(chat_mod, "_shaped_ui_messages", lambda *a, **k: [
+        {"role": "tool_use", "name": "Agent", "id": "copied-call"},
+        {"role": "tool_use", "name": "Agent", "id": "own-call"},
+    ])
+    result = client.get(f"/api/chat/sessions/{child}/subagents", headers=auth)
+    assert result.status_code == 200
+    assert result.json() == {"session_id": child, "threads": [own, root, nested]}
+    assert calls == [child, source]
+    assert inherited == before
+
+
+def test_successor_history_refresh_reads_growing_ancestor_transcript(
+    app_module, client, auth, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import sessions as sess
+
+    source = sess.create_session("source")["id"]
+    child = sess.create_session("successor")["id"]
+    assert sess.link_runtime_successor(source, child)
+    blocks = [{"role": "assistant", "text": "started", "block_id": "start"}]
+
+    def load(owner, directory=None):
+        if owner == child:
+            return []
+        return [{
+            "session_id": source, "agent_id": "running-agent",
+            "parent_tool_use_id": "copied-call", "orphaned": False,
+            "blocks": list(blocks), "message_count": len(blocks),
+        }]
+
+    monkeypatch.setattr(chat_mod.chat_subagents, "load_subagent_threads", load)
+    monkeypatch.setattr(chat_mod, "_shaped_ui_messages", lambda *a, **k: [
+        {"role": "tool_use", "name": "Agent", "id": "copied-call"},
+    ])
+    url = f"/api/chat/sessions/{child}/subagents"
+    first = client.get(url, headers=auth).json()
+    assert first["threads"][0]["blocks"] == blocks
+    blocks.append({"role": "tool_result", "text": "finished read", "block_id": "result"})
+    second = client.get(url, headers=auth).json()
+    assert len(first["threads"][0]["blocks"]) == 1
+    assert second["threads"][0]["blocks"] == blocks

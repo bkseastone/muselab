@@ -39,6 +39,7 @@ _VAPID_FILE = (_DIR / "vapid.json") if _DIR else None
 _SUBS_FILE = (_DIR / "push_subs.json") if _DIR else None
 
 _vapid: dict[str, str] | None = None
+_vapid_lock = threading.Lock()
 # ``pywebpush.webpush`` exposes ``timeout=None`` and forwards that explicit
 # value to requests.  That disables requests' own timeout entirely: a dead
 # proxy once held a completed chat turn open for almost seven minutes while
@@ -115,19 +116,26 @@ def _migrate_pkcs8_to_sec1(pem: str) -> str | None:
 
 def _ensure_vapid() -> dict[str, str]:
     global _vapid
-    if _vapid:
+    with _vapid_lock:
+        if _vapid is None:
+            # Publish only a persisted keypair; concurrent readers must wait
+            # for the same initialization or migration to finish.
+            _vapid = _load_or_generate_vapid()
         return _vapid
+
+
+def _load_or_generate_vapid() -> dict[str, str]:
     if _VAPID_FILE and _VAPID_FILE.exists():
         try:
-            _vapid = json.loads(_VAPID_FILE.read_text(encoding="utf-8"))
+            vapid = json.loads(_VAPID_FILE.read_text(encoding="utf-8"))
             # Auto-migrate old PKCS8 vapid.json to SEC1 in place. Public
             # key (and therefore subscriptions) are unchanged.
-            old_pem = _vapid.get("private_pem", "")
+            old_pem = vapid.get("private_pem", "")
             new_pem = _migrate_pkcs8_to_sec1(old_pem)
             if new_pem and new_pem != old_pem:
-                _vapid["private_pem"] = new_pem
+                vapid["private_pem"] = new_pem
                 atomic_write_text(_VAPID_FILE,
-                                   json.dumps(_vapid, indent=2))
+                                   json.dumps(vapid, indent=2))
                 try:
                     os.chmod(_VAPID_FILE, 0o600)
                 except Exception:
@@ -135,7 +143,7 @@ def _ensure_vapid() -> dict[str, str]:
                 sys.stderr.write(
                     "[push] migrated vapid.json from PKCS8 to SEC1; "
                     "existing subscriptions still valid\n")
-            return _vapid
+            return vapid
         except Exception as e:
             # Fail LOUDLY instead of silently regenerating. A transient read
             # error / corrupted-but-recoverable file would otherwise trigger
@@ -150,30 +158,41 @@ def _ensure_vapid() -> dict[str, str]:
                 f"regenerate (would invalidate all push subscriptions). "
                 f"Inspect or delete {_VAPID_FILE} to force a new keypair."
             ) from e
-    _vapid = _gen_vapid_keypair()
+    vapid = _gen_vapid_keypair()
     if _VAPID_FILE:
-        atomic_write_text(_VAPID_FILE, json.dumps(_vapid, indent=2))
+        atomic_write_text(_VAPID_FILE, json.dumps(vapid, indent=2))
         try:
             os.chmod(_VAPID_FILE, 0o600)
         except Exception:
             pass
-    return _vapid
+    return vapid
 
 
 def get_vapid_public_key() -> str:
     return _ensure_vapid()["public_b64"]
 
 
+class SubscriptionStoreUnavailable(RuntimeError):
+    """The durable device snapshot could not be loaded safely."""
+
+
 def _load_subs() -> None:
     global _subs
-    if not _SUBS_FILE or not _SUBS_FILE.exists():
+    if not _SUBS_FILE:
         return
     try:
-        d = json.loads(_SUBS_FILE.read_text(encoding="utf-8"))
-        if isinstance(d, dict):
-            _subs = d
-    except Exception:
-        pass
+        snapshot = json.loads(_SUBS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        _subs = {}
+        return
+    except (OSError, ValueError):
+        # A stale cache is not a writable snapshot: persisting it would erase
+        # devices added since the last successful read. Keep disk and cache
+        # intact so a subsequent request can retry the authoritative read.
+        raise SubscriptionStoreUnavailable("push subscription storage unavailable") from None
+    if not isinstance(snapshot, dict):
+        raise SubscriptionStoreUnavailable("push subscription storage unavailable")
+    _subs = snapshot
 
 
 def _save_subs() -> None:
@@ -296,7 +315,7 @@ def send_to_all(title: str, body: str, *, url: str = "/",
         _load_subs()
         targets = list(_subs.items())
     sent = 0
-    dropped: list[str] = []
+    dead: list[tuple[str, dict]] = []
     errors: list[str] = []
     for endpoint, sub in targets:
         try:
@@ -336,7 +355,7 @@ def send_to_all(title: str, body: str, *, url: str = "/",
             if code in (404, 410):
                 # Subscription is dead (user uninstalled / cleared) — mark for
                 # removal; applied at the end under the lock.
-                dropped.append(endpoint)
+                dead.append((endpoint, sub))
             else:
                 # Push exception strings commonly embed the full subscription
                 # endpoint (including its opaque device token) and proxy URL.
@@ -347,18 +366,24 @@ def send_to_all(title: str, body: str, *, url: str = "/",
                     f"{label} status={code}" if code is not None else label)
         except Exception as e:
             errors.append(type(e).__name__)
-    if dropped:
+    dropped = 0
+    if dead:
         with _subs_lock:
             _load_subs()
-            for endpoint in dropped:
-                _subs.pop(endpoint, None)
-            _save_subs()
-    result = {"sent": sent, "dropped": len(dropped), "errors": errors}
+            for endpoint, failed_sub in dead:
+                # A delayed response describes the sent snapshot, not a
+                # subscription renewed while that request was in flight.
+                if _subs.get(endpoint) == failed_sub:
+                    del _subs[endpoint]
+                    dropped += 1
+            if dropped:
+                _save_subs()
+    result = {"sent": sent, "dropped": dropped, "errors": errors}
     # One journal line per fan-out — the only place the outcome is visible.
     # Callers historically discarded this dict, which made "did the push
     # even go out?" unanswerable from logs.
     sys.stderr.write(
-        f"[push] {context or tag}: sent={sent} dropped={len(dropped)}"
+        f"[push] {context or tag}: sent={sent} dropped={dropped}"
         + (f" errors={errors}" if errors else "") + "\n")
     sys.stderr.flush()
     return result

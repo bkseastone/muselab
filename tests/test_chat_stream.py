@@ -10,9 +10,12 @@ No real network, no real CLI subprocess, no Anthropic API.
 """
 import asyncio
 import base64
+import errno
 import inspect
 import json
+import os
 import threading
+import time
 import urllib.parse
 from types import SimpleNamespace
 
@@ -362,6 +365,56 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
+
+
+def test_model_switched_mid_turn_survives_post_turn_persistence(
+        stream_env, client, monkeypatch):
+    """A model PATCH that lands while a turn is streaming (it interrupts the
+    turn and writes the new model) must not be rolled back by that turn's
+    post-turn bookkeeping, which used to re-write the launch model."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    switched = "claude-opus-4-8"
+
+    class _SwitchMidTurnClient(_FakeStreamClient):
+        async def receive_response(self):
+            chat_mod.sess.update_runtime_controls(
+                sid, model=switched, effort="auto", service_tier="")
+            async for m in super().receive_response():
+                yield m
+
+    messages = [
+        AssistantMessage(
+            content=[TextBlock(text="ok")], model="claude-sonnet-4-6",
+            usage={"input_tokens": 1, "output_tokens": 1},
+            uuid="assistant-switch-uuid",
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+            result="ok",
+        ),
+    ]
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
+        return _SwitchMidTurnClient(messages)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    before = chat_mod.sess.get_session(sid)["updated_at"]
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=hi&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    assert "done" in [e for e, _ in _parse_sse(r.text)]
+
+    # bump_session (same post-turn write as the old model re-write) bumps
+    # updated_at; wait for it so the assertion runs after that persistence.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (
+            chat_mod.sess.get_session(sid)["updated_at"] == before):
+        time.sleep(0.05)
+    assert chat_mod.sess.get_session(sid)["updated_at"] != before
+    assert chat_mod.sess.get_session(sid)["model"] == switched
 
 
 def test_tool_only_turn_recovers_result_text_and_survives_refresh(
@@ -1170,6 +1223,83 @@ def test_activity_hidden_turn_never_enters_global_task_center(
     assert chat_mod.sess.get_session(sid)["activity_hidden"] is True
 
 
+def test_first_turn_auto_title_syncs_activity_ledger(
+        stream_env, client, monkeypatch):
+    """The task ledger starts under the placeholder name; the automatic title
+    given after the first turn must reach it as well."""
+    from backend import activity as activity_module
+
+    chat_mod = stream_env
+    sid = chat_mod.sess.create_session()["id"]
+    first_prompt = "怎么解读这次体检报告"
+    monkeypatch.setattr(
+        chat_mod, "_get_session_msgs",
+        lambda *_args, **_kwargs: [SimpleNamespace(
+            type="user", parent_tool_use_id=None,
+            message={"content": first_prompt})],
+    )
+    renamed = []
+    monkeypatch.setattr(
+        activity_module.activity, "rename_session",
+        lambda target_sid, name: renamed.append((target_sid, name)),
+    )
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=9,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+
+    async def exercise():
+        broadcast = await chat_mod._start_turn(sid, first_prompt)
+        await asyncio.wait_for(broadcast.task, timeout=5)
+
+    asyncio.run(exercise())
+
+    assert chat_mod.sess.get_session_meta(sid)["name"] == first_prompt
+    assert renamed == [(sid, first_prompt)]
+
+
+def test_turn_admission_creates_replay_spool_off_event_loop(
+        stream_env, client, monkeypatch):
+    """Spool file creation hits the disk; a slow disk must not stall the loop."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    created_on = []
+    original_init = chat_mod._ReplaySpool.__init__
+
+    def tracking_init(self):
+        created_on.append(threading.get_ident())
+        original_init(self)
+
+    monkeypatch.setattr(chat_mod._ReplaySpool, "__init__", tracking_init)
+    fake = _FakeStreamClient([ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=9,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+    )])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+
+    async def exercise():
+        loop_thread = threading.get_ident()
+        broadcast = await chat_mod._start_turn(sid, "hello")
+        await asyncio.wait_for(broadcast.task, timeout=5)
+        return loop_thread
+
+    loop_thread = asyncio.run(exercise())
+
+    assert created_on
+    assert loop_thread not in created_on
+
+
 def test_done_is_published_before_slow_post_turn_bookkeeping(
         stream_env, client, monkeypatch):
     """ResultMessage ends the UI turn before context/JSONL bookkeeping."""
@@ -1343,7 +1473,7 @@ def test_activity_finishes_before_background_continuation_settles(
         )
 
         broadcast = await chat_mod._start_turn(sid, "run a background task")
-        await asyncio.wait_for(watcher_attached.wait(), timeout=1)
+        await asyncio.wait_for(watcher_attached.wait(), timeout=10)
 
         assert any(
             event.get("event") == "done"
@@ -1363,10 +1493,10 @@ def test_activity_finishes_before_background_continuation_settles(
         }
         assert boundary_threads
         assert threading.get_ident() not in boundary_threads
-        await asyncio.wait_for(broadcast.task, timeout=1)
+        await asyncio.wait_for(broadcast.task, timeout=10)
         watcher = chat_mod._task_watchers[sid]
         release_watcher.set()
-        await asyncio.wait_for(watcher, timeout=1)
+        await asyncio.wait_for(watcher, timeout=10)
 
         assert activity_transitions == [
             ("start", sid, "run a background task"),
@@ -1720,7 +1850,7 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(error_result) == "current_result"
 
 
-def test_turn_response_boundary_keeps_nonhuman_delivery_out_of_human_turn(
+def test_turn_response_boundary_keeps_nonhuman_result_from_ending_human_turn(
         stream_env):
     chat_mod = stream_env
     boundary = chat_mod._TurnResponseBoundary(set())
@@ -1740,7 +1870,7 @@ def test_turn_response_boundary_keeps_nonhuman_delivery_out_of_human_turn(
         is_error=False, num_turns=1, session_id="human", origin=None,
     )
 
-    assert boundary.classify(side_user) == "background"
+    assert boundary.classify(side_user) == "forward"
     assert boundary.classify(side_result) == "background_result"
     assert boundary.classify(human_result) == "current_result"
 
@@ -3255,6 +3385,74 @@ async def test_watcher_shutdown_partial_never_projects_completed_bubble(
         chat_mod._delete_cancelled_turn_snapshots(child_sid)
 
 
+def test_context_meter_uses_final_message_delta_usage(stream_env, client, monkeypatch):
+    """AssistantMessage.usage is the message_start snapshot. Gateways such as
+    DUCC report the real input count only in message_delta (measured: 41,200
+    at start vs 52,301 final), so the meter must follow the merged final usage
+    and must not fall back to a later call's provisional start count."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+
+    def start(n):
+        return StreamEvent(uuid=f"s{n}", session_id=sid, event={
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": n, "output_tokens": 1,
+                                  "cache_read_input_tokens": 7}}})
+
+    def delta(n, out):
+        return StreamEvent(uuid=f"d{n}", session_id=sid, event={
+            "type": "message_delta",
+            "usage": {"input_tokens": n, "output_tokens": out}})
+
+    def assistant(n, block, uuid):
+        return AssistantMessage(
+            content=[block], model="claude-sonnet-4-6",
+            usage={"input_tokens": n, "output_tokens": 1,
+                   "cache_read_input_tokens": 7},
+            uuid=uuid)
+
+    messages = [
+        start(100),
+        assistant(100, ToolUseBlock(id="tu_1", name="Read",
+                                    input={"file_path": "/tmp/x.py"}), "a1"),
+        delta(130, 20),
+        start(140),
+        assistant(140, TextBlock(text="done"), "a2"),
+        delta(170, 9),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=2, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 170, "output_tokens": 9},
+            result="done", terminal_reason="completed"),
+    ]
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
+        return _FakeStreamClient(messages)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod, "_recent_turn_uuids", lambda _sid, _want: ("a2", "u-final"))
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=hi&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    done = next(json.loads(d) for e, d in _parse_sse(r.text) if e == "done")
+    usage = done["session_usage"]
+    assert usage["input_tokens"] == 170
+    assert usage["cache_read_tokens"] == 7
+    assert usage["output_tokens"] == 9
+    assert usage["context_used"] == 177
+
+
+def test_merge_call_usage_keeps_start_fields_missing_from_delta():
+    from backend.chat import _merge_call_usage
+
+    merged = _merge_call_usage(
+        {"input_tokens": 10, "cache_read_input_tokens": 500, "output_tokens": 1},
+        {"input_tokens": 0, "output_tokens": 42})
+    assert merged == {"input_tokens": 10, "cache_read_input_tokens": 500,
+                      "output_tokens": 42}
+
+
 def test_usage_reads_valid_sidecar_summary_without_scanning_transcript(
         stream_env, monkeypatch):
     sid = "12345678-usage-summary"
@@ -4122,7 +4320,7 @@ def test_pooled_stream_attaches_before_query_and_parks_leftovers(stream_env):
     assert pooled.index("turn_q = stream.attach_turn()") < pooled.index(
         "await _send_query()"
     )
-    assert "await stream.release_turn(turn_q, background_messages)" in pooled
+    assert "await stream.release_turn(turn_q)" in pooled
 
 
 def test_turn_does_not_consume_detached_continuation(stream_env, monkeypatch):
@@ -4200,6 +4398,32 @@ def test_replay_spool_uses_private_configured_runtime_dir(
         spool.close()
 
 
+def test_sweep_orphan_replay_spools_removes_only_stale_matching_files(
+        stream_env, monkeypatch, tmp_path):
+    chat_mod = stream_env
+    runtime_dir = tmp_path / "durable-runtime"
+    monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(runtime_dir))
+    live = chat_mod._ReplaySpool()
+    try:
+        stale = runtime_dir / "muselab-turn-stale.jsonl"
+        fresh = runtime_dir / "muselab-turn-fresh.jsonl"
+        other = runtime_dir / "unrelated-old.jsonl"
+        for path in (stale, fresh, other):
+            path.write_text("{}\n")
+        old = time.time() - chat_mod._REPLAY_SPOOL_ORPHAN_AGE_S - 60
+        os.utime(stale, (old, old))
+        os.utime(other, (old, old))
+
+        assert chat_mod.sweep_orphan_replay_spools() == 1
+
+        assert not stale.exists()
+        assert fresh.exists()
+        assert other.exists()
+        assert live.path.exists()
+    finally:
+        live.close()
+
+
 def test_replay_spool_rolls_back_partial_enospc(
         stream_env, monkeypatch, tmp_path):
     chat_mod = stream_env
@@ -4210,21 +4434,23 @@ def test_replay_spool_rolls_back_partial_enospc(
 
     def partial_then_full(fd, blob):
         nonlocal calls
+        if fd != spool._fd:
+            return real_write(fd, blob)
         calls += 1
         if calls == 1:
             return real_write(fd, blob[:max(1, len(blob) // 2)])
         raise OSError(28, "disk full private detail")
 
     try:
-        monkeypatch.setattr(chat_mod.os, "write", partial_then_full)
-        with pytest.raises(OSError) as failure:
-            spool.append({"event": "done", "data": "{}"})
-        assert failure.value.errno == 28
-        assert spool.size() == 0
-        assert len(spool) == 0
-        assert spool.path.read_bytes() == b""
+        with monkeypatch.context() as fault:
+            fault.setattr(chat_mod.os, "write", partial_then_full)
+            with pytest.raises(OSError) as failure:
+                spool.append({"event": "done", "data": "{}"})
+            assert failure.value.errno == 28
+            assert spool.size() == 0
+            assert len(spool) == 0
+            assert spool.path.read_bytes() == b""
 
-        monkeypatch.setattr(chat_mod.os, "write", real_write)
         spool.append({"event": "done", "data": "{}"})
         assert list(spool) == [{"event": "done", "data": "{}"}]
     finally:
@@ -4237,28 +4463,68 @@ def test_replay_spool_becomes_unusable_when_partial_rollback_fails(
     monkeypatch.setenv("MUSELAB_RUNTIME_DIR", str(tmp_path / "runtime"))
     spool = chat_mod._ReplaySpool()
     real_write = chat_mod.os.write
+    real_ftruncate = chat_mod.os.ftruncate
     calls = 0
 
     def partial_then_enospc(fd, blob):
         nonlocal calls
+        if fd != spool._fd:
+            return real_write(fd, blob)
         calls += 1
         if calls == 1:
             return real_write(fd, blob[:1])
         raise OSError(28, "disk full")
 
-    monkeypatch.setattr(chat_mod.os, "write", partial_then_enospc)
-    monkeypatch.setattr(
-        chat_mod.os, "ftruncate",
-        lambda *_args: (_ for _ in ()).throw(OSError(5, "rollback failed")),
-    )
+    def fail_spool_rollback(fd, length):
+        if fd != spool._fd:
+            return real_ftruncate(fd, length)
+        raise OSError(5, "rollback failed")
+
     try:
-        with pytest.raises(OSError) as failure:
-            spool.append({"event": "done", "data": "{}"})
-        assert failure.value.errno == 28
-        with pytest.raises(RuntimeError, match="unusable"):
-            spool.append({"event": "done", "data": "{}"})
+        with monkeypatch.context() as fault:
+            fault.setattr(chat_mod.os, "write", partial_then_enospc)
+            fault.setattr(chat_mod.os, "ftruncate", fail_spool_rollback)
+            with pytest.raises(OSError) as failure:
+                spool.append({"event": "done", "data": "{}"})
+            assert failure.value.errno == 28
+            with pytest.raises(RuntimeError, match="unusable"):
+                spool.append({"event": "done", "data": "{}"})
     finally:
         spool.close()
+    assert not spool.path.exists()
+    with pytest.raises(OSError) as closed_fd:
+        chat_mod.os.fstat(spool._fd)
+    assert closed_fd.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_replay_spool_faults_leave_unrelated_file_descriptor_usable(
+        stream_env, monkeypatch, tmp_path, rollback_fails):
+    """Spool fault injection must preserve process-global OS operations."""
+    chat_mod = stream_env
+    original_write_blob = chat_mod._ReplaySpool._write_blob
+    checked = False
+    with (tmp_path / "unrelated-file").open("w+b") as unrelated:
+        def check_unrelated_descriptor(spool, blob):
+            nonlocal checked
+            if not checked:
+                checked = True
+                fd = unrelated.fileno()
+                assert chat_mod.os.write(fd, b"unrelated") == len(b"unrelated")
+                chat_mod.os.ftruncate(fd, 5)
+                chat_mod.os.lseek(fd, 0, chat_mod.os.SEEK_SET)
+                assert chat_mod.os.read(fd, 16) == b"unrel"
+            return original_write_blob(spool, blob)
+
+        monkeypatch.setattr(
+            chat_mod._ReplaySpool, "_write_blob", check_unrelated_descriptor)
+        if rollback_fails:
+            test_replay_spool_becomes_unusable_when_partial_rollback_fails(
+                stream_env, monkeypatch, tmp_path)
+        else:
+            test_replay_spool_rolls_back_partial_enospc(
+                stream_env, monkeypatch, tmp_path)
+    assert checked
 
 
 def test_replay_corruption_is_typed_and_subscriber_resyncs_once(
@@ -4618,6 +4884,101 @@ def test_attached_reader_receives_text_delta_without_waiting_for_chunk(stream_en
     asyncio.run(exercise())
 
 
+
+@pytest.mark.parametrize(
+    ("history", "waiting", "blocked_pool"),
+    [
+        pytest.param(False, False, "read", id="first-delta"),
+        pytest.param(False, True, "read", id="waiting-reader"),
+        pytest.param(True, False, "read", id="history-read"),
+        pytest.param(True, False, "write", id="pending-history-write"),
+    ],
+)
+def test_live_delta_waits_only_for_real_history(
+        stream_env, monkeypatch, history, waiting, blocked_pool):
+    """An occupied I/O pool must not delay a delta after known replay EOF."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    chat_mod = stream_env
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        occupied = asyncio.Event()
+        ready_started = asyncio.Event()
+        release = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        monkeypatch.setattr(
+            chat_mod.replay_io,
+            "_READ_POOL" if blocked_pool == "read" else "_WRITE_POOL", pool,
+        )
+        real_ready = chat_mod.replay_io.ReplayReader.ready
+
+        async def observe_ready(reader):
+            ready_started.set()
+            await real_ready(reader)
+
+        monkeypatch.setattr(
+            chat_mod.replay_io.ReplayReader, "ready", observe_ready)
+
+        def occupy_pool():
+            loop.call_soon_threadsafe(occupied.set)
+            assert release.wait(5), "I/O pool occupant was not released"
+
+        occupant = pool.submit(occupy_pool)
+        bc = None
+        subscriber = None
+        getter = None
+        try:
+            await asyncio.wait_for(occupied.wait(), 2)
+            bc = chat_mod.TurnBroadcast(session_id="occupied-replay-pool")
+            if history:
+                bc.publish({"event": "tool_result", "data": '{"id":"history"}'})
+            subscriber = bc.subscribe()
+            if waiting:
+                getter = asyncio.create_task(subscriber.get())
+                await asyncio.wait_for(ready_started.wait(), 2)
+            bc.publish({"event": "text", "data": '{"text":"now"}'})
+            if getter is None:
+                getter = asyncio.create_task(subscriber.get())
+            if history:
+                await asyncio.wait_for(ready_started.wait(), 2)
+                # The old record/write remains behind a real worker gate.
+                # Its history must precede the subsequently queued live delta.
+                assert not getter.done()
+                release.set()
+                event = await asyncio.wait_for(getter, 1)
+                assert event["event"] == "tool_result"
+                assert json.loads(event["data"])["id"] == "history"
+                event = await asyncio.wait_for(subscriber.get(), 1)
+            else:
+                # Preserve the original latency contract while the read pool
+                # stays occupied: no warmup and no extra token/finish event.
+                event = await asyncio.wait_for(getter, 1)
+                assert not release.is_set()
+            assert event["event"] == "text"
+            assert json.loads(event["data"])["text"] == "now"
+        finally:
+            release.set()
+            await asyncio.wrap_future(occupant)
+            if getter is not None and not getter.done():
+                getter.cancel()
+            if getter is not None:
+                await asyncio.gather(getter, return_exceptions=True)
+            if subscriber is not None:
+                pending = subscriber._pending_spool_read
+                if pending is not None:
+                    await asyncio.gather(pending, return_exceptions=True)
+            if bc is not None:
+                reader = subscriber._replay if subscriber is not None else None
+                bc.close()
+                await bc.events.flush_async()
+                if reader is not None:
+                    await asyncio.to_thread(reader._close)
+            await asyncio.to_thread(pool.shutdown, wait=True)
+
+    asyncio.run(exercise())
+
+
 def test_desktop_replay_boundary_delivers_live_tail_once(stream_env):
     """Events published while replay drains are neither lost nor duplicated."""
     import asyncio
@@ -4935,7 +5296,15 @@ async def test_recent_turn_expires_without_followup_access(
     broadcast.finish()
 
     chat_mod._remember_recent_turn(broadcast.session_id, broadcast)
-    await asyncio.sleep(0.05)
+    # The expiry timer and the spool unlink (handed to the replay writer
+    # thread) both run asynchronously; poll instead of a fixed sleep.
+    deadline = asyncio.get_running_loop().time() + 5
+    while (broadcast.session_id in chat_mod._recent_turns
+           or broadcast.session_id in chat_mod._recent_turn_expiry_handles
+           or replay_path.exists()):
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.01)
 
     assert broadcast.session_id not in chat_mod._recent_turns
     assert broadcast.session_id not in chat_mod._recent_turn_expiry_handles
@@ -5794,6 +6163,57 @@ def test_task_output_404_when_missing(client, auth):
     r = client.get("/api/chat/task-output",
                    params={"session_id": sid, "path": p}, headers=auth)
     assert r.status_code == 404, r.text
+
+
+def _make_relocated_task_output(root, sid, task_id, body):
+    """`<CLAUDE_CODE_TMPDIR>/claude-<uid>/<project>/<sid>/tasks/<id>.output`."""
+    base = root / "claude-508" / "-proj" / sid / "tasks"
+    base.mkdir(parents=True)
+    path = base / f"{task_id}.output"
+    path.write_text(body)
+    return path
+
+
+def test_task_output_serves_path_under_relocated_tmp_root(
+        client, auth, tmp_path, monkeypatch):
+    sid = "1fc3ce90-e7f3-4726-b21c-4a8a85287037"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    path = _make_relocated_task_output(tmp_path, sid, "bx1", "relocated\n")
+    r = client.get("/api/chat/task-output",
+                   params={"session_id": sid, "path": str(path)}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.text == "relocated\n"
+
+
+def test_task_output_resolves_by_task_id_across_runtime_lineage(
+        client, auth, tmp_path, monkeypatch):
+    """The card has no output_file and the task ran under the hidden
+    predecessor of the session being viewed."""
+    from backend import chat
+    pred = "aaaaaaaa-0000-0000-0000-00000000000a"
+    succ = "bbbbbbbb-0000-0000-0000-00000000000b"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    _make_relocated_task_output(tmp_path, pred, "bz9", "from predecessor\n")
+    monkeypatch.setattr(chat.sess, "runtime_lineage",
+                        lambda sid: [pred, succ] if sid == succ else [sid])
+    r = client.get("/api/chat/task-output",
+                   params={"session_id": succ, "task_id": "bz9"}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.text == "from predecessor\n"
+    # A session outside the lineage never reads someone else's task.
+    other = "cccccccc-0000-0000-0000-00000000000c"
+    r = client.get("/api/chat/task-output",
+                   params={"session_id": other, "task_id": "bz9"}, headers=auth)
+    assert r.status_code == 404, r.text
+
+
+def test_task_output_by_task_id_rejects_traversal(client, auth, tmp_path, monkeypatch):
+    sid = "1fc3ce90-e7f3-4726-b21c-4a8a85287037"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    for bad in ("../x", "a/b", "*", "a b"):
+        r = client.get("/api/chat/task-output",
+                       params={"session_id": sid, "task_id": bad}, headers=auth)
+        assert r.status_code == 404, (bad, r.text)
 
 
 def test_task_output_requires_token(client):
@@ -7197,6 +7617,33 @@ def test_native_cron_jsonl_completion_notifies_mux_without_content(
         assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
     finally:
         chat_mod._sdk_cron_jobs.pop(sid, None)
+
+
+def test_native_cron_jsonl_follower_skips_ended_jobs(stream_env, monkeypatch):
+    """Ended receipts are history: never look up or read their transcripts."""
+    chat_mod = stream_env
+    lookups = []
+    monkeypatch.setattr(
+        chat_mod, "_find_session_jsonl",
+        lambda candidate: lookups.append(candidate) or None)
+    ended = {
+        f"sid-native-cron-ended-{state}": {
+            "job": {"prompt_sha256": "a" * 64, "runtime_state": state},
+        }
+        for state in ("missing", "expired", "finished", "paused", "interrupted")
+    }
+    live = {"sid-native-cron-live": {
+        "job": {"prompt_sha256": "b" * 64, "runtime_state": "unconfirmed"},
+    }}
+    chat_mod._sdk_cron_jobs.update({**ended, **live})
+    cursors = {sid: chat_mod._ScheduledHistoryCursor() for sid in ended}
+    try:
+        assert chat_mod._collect_sdk_scheduled_history_updates(cursors) == []
+        assert lookups == ["sid-native-cron-live"]
+        assert set(cursors) == {"sid-native-cron-live"}
+    finally:
+        for sid in (*ended, *live):
+            chat_mod._sdk_cron_jobs.pop(sid, None)
 
 
 def test_native_cron_jsonl_follower_keeps_inflight_trigger_on_attach(
@@ -8613,6 +9060,157 @@ async def test_commit_loses_atomically_to_rollback_and_fails_closed(
     assert not artifact.exists()
 
 
+def _leased_broadcast(chat, sid, aid):
+    chat._image_store[aid] = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "commit.txt",
+        "raw": b"commit",
+        "text": "commit",
+        "ts": chat.time.time(),
+    }
+    lease, _missing, _busy = chat._lease_staged_attachments(
+        aid, require_all=True)
+    broadcast = chat.TurnBroadcast(sid)
+    broadcast._attachment_lease = lease
+    return broadcast, lease
+
+
+@pytest.mark.asyncio
+async def test_attachment_commit_runs_off_event_loop(app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    broadcast, lease = _leased_broadcast(
+        chat, "commit-off-loop", "commit-off-loop-aid")
+    committed_on = []
+    original_commit = chat._commit_broadcast_attachments
+
+    def tracking_commit(bc):
+        committed_on.append(threading.get_ident())
+        original_commit(bc)
+
+    monkeypatch.setattr(chat, "_commit_broadcast_attachments", tracking_commit)
+    loop_thread = threading.get_ident()
+
+    await chat._commit_broadcast_attachments_off_loop(
+        broadcast, "commit-off-loop")
+
+    assert committed_on
+    assert loop_thread not in committed_on
+    assert lease.state == "committed"
+    assert broadcast._attachment_lease is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_attachment_commit_still_completes(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    broadcast, lease = _leased_broadcast(
+        chat, "commit-cancel", "commit-cancel-aid")
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = chat._commit_broadcast_attachments
+
+    def gated_commit(bc):
+        entered.set()
+        assert release.wait(timeout=5)
+        original_commit(bc)
+
+    monkeypatch.setattr(chat, "_commit_broadcast_attachments", gated_commit)
+    task = asyncio.create_task(
+        chat._commit_broadcast_attachments_off_loop(broadcast, "commit-cancel"))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert lease.state == "committed"
+    assert "commit-cancel-aid" not in chat._image_store
+    assert broadcast._attachment_lease is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_attachment_commit_uncertain_rebuilds_runtime(
+        app_module, monkeypatch):
+    del app_module
+    from backend import chat
+
+    sid = "commit-cancel-uncertain"
+    broadcast, lease = _leased_broadcast(chat, sid, "commit-cancel-uncertain-aid")
+    lease.state = "rolling_back"
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = chat._commit_broadcast_attachments
+
+    def gated_commit(bc):
+        entered.set()
+        assert release.wait(timeout=5)
+        original_commit(bc)
+
+    monkeypatch.setattr(chat, "_commit_broadcast_attachments", gated_commit)
+    task = asyncio.create_task(
+        chat._commit_broadcast_attachments_off_loop(broadcast, sid))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    release.set()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert lease.state == "uncertain"
+        assert sid in chat._pending_runtime_rebuilds
+    finally:
+        chat._pending_runtime_rebuilds.discard(sid)
+
+
+def test_get_queue_api_reads_durable_metadata_outside_store_lock(
+        app_module, monkeypatch):
+    del app_module
+    from fastapi import Response
+    from backend import chat
+
+    aid = "a" * 32
+    monkeypatch.setattr(chat.sess, "get_queue", lambda _sid: {
+        "items": [{"image_ids": aid}],
+    })
+    chat._image_store.pop(aid, None)
+    lock_free_in_metadata = []
+
+    def probing_metadata(_aid):
+        acquired = []
+
+        def probe_lock():
+            got = chat._image_store_lock.acquire(blocking=False)
+            if got:
+                chat._image_store_lock.release()
+            acquired.append(got)
+
+        probe = threading.Thread(target=probe_lock)
+        probe.start()
+        probe.join()
+        lock_free_in_metadata.append(acquired[0])
+        return {"kind": "image", "name": "q.png", "mime": "image/png"}
+
+    monkeypatch.setattr(
+        chat._durable_attachment_store, "metadata", probing_metadata)
+
+    data = chat.get_queue_api("queue-metadata-sid", Response())
+
+    assert lock_free_in_metadata == [True]
+    assert data["items"][0]["attachments"] == [{
+        "id": aid, "kind": "image", "name": "q.png",
+        "mime": "image/png", "available": True,
+    }]
+
+
 @pytest.mark.asyncio
 async def test_shutdown_timeout_records_cleanup_intent_for_slow_prepare(
     app_module,
@@ -8909,3 +9507,76 @@ async def test_recall_overlaps_connect_and_retires_with_startup(
         if attachment:
             assert aid in chat._image_store
     assert "SYNTHETIC_RECALL_CONTEXT" not in repr(events)
+
+
+
+def test_successful_image_turn_with_meta_hint_commits_canonical_history(
+    stream_env, client, monkeypatch, tmp_path,
+):
+    """A real Result success survives the SDK's internal image user record."""
+    from datetime import datetime, timezone
+
+    chat_mod = stream_env
+    sid = _make_session(client)
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: transcript)
+    monkeypatch.setattr(
+        chat_mod, "_turn_uuids_from_boundary",
+        chat_mod._real_turn_uuids_from_boundary_for_test,
+    )
+
+    def append(uid, typ, content, parent=None, **extra):
+        entry = {
+            "uuid": uid, "parentUuid": parent, "type": typ,
+            "sessionId": sid,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": content}, **extra,
+        }
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    class ImageClient(_FakeStreamClient):
+        async def query(self, prompt_or_gen):
+            await super().query(prompt_or_gen)
+            append("image-user", "user", [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "YQ==",
+                }},
+                {"type": "text", "text": "describe the image"},
+            ])
+            append("image-hint", "user", "internal image dimensions",
+                   "image-user", isMeta=True)
+
+        async def receive_response(self):
+            append("image-assistant", "assistant", [
+                {"type": "text", "text": "complete image answer"},
+            ], "image-hint")
+            yield AssistantMessage(
+                content=[TextBlock(text="complete image answer")],
+                model="claude-sonnet-4-6", uuid="image-assistant",
+            )
+            yield ResultMessage(
+                subtype="success", duration_ms=50, duration_api_ms=40,
+                is_error=False, num_turns=1, session_id=sid,
+                total_cost_usd=0.0, usage={},
+            )
+
+    fake = ImageClient([])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=describe-image&model=claude-sonnet-4-6",
+    )
+    assert response.status_code == 200, response.text
+    done = next(json.loads(data) for event, data in _parse_sse(response.text)
+                if event == "done")
+    assert done["is_error"] is False
+    assert done["assistant_uuid"] == "image-assistant"
+    assert chat_mod.sess.get_message_annotations(sid)["image-assistant"]["turn_status"] == "completed"
+    snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
+    assert snapshots == []

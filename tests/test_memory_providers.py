@@ -169,6 +169,136 @@ def test_qdrant_refuses_existing_collection_with_wrong_dimension(monkeypatch):
         _run(store.ensure(1024))
 
 
+@pytest.fixture()
+def qdrant_requests(monkeypatch):
+    import httpx
+    from backend.memory_config import VectorConfig
+    from backend.memory_providers import QdrantVectorStore
+
+    store = QdrantVectorStore(VectorConfig(url="http://qdrant:6333", collection="memory"))
+    state = {"exists": True, "size": 1024, "schema": {}, "fail": None, "calls": []}
+
+    async def request(method, path, **kwargs):
+        state["calls"].append((method, path, kwargs))
+        status, body = 200, {"result": {"status": "completed"}}
+        if state["fail"] and state["fail"][:2] == (method, path):
+            status = state["fail"][2]
+        elif method == "GET":
+            if not state["exists"]:
+                status = 404
+            body = {"result": {
+                "config": {"params": {"vectors": {"size": state["size"]}}},
+                "payload_schema": dict(state["schema"]),
+            }}
+        elif path == "/collections/memory":
+            assert method == "PUT"
+            state["exists"] = True
+        else:
+            assert method == "PUT" and path == "/collections/memory/index?wait=true"
+            assert kwargs["json"]["field_schema"] == "keyword"
+            state["schema"][kwargs["json"]["field_name"]] = {"data_type": "keyword"}
+        response = httpx.Response(status, json=body, request=httpx.Request(method, store.base + path))
+        response.raise_for_status()
+        return response
+
+    monkeypatch.setattr(store, "_request", request)
+    return store, state
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_qdrant_ensure_adds_filter_indexes_without_recreating(qdrant_requests, exists):
+    store, state = qdrant_requests
+    state["exists"] = exists
+    _run(store.ensure(1024))
+    calls = [("GET", "/collections/memory", {})]
+    if not exists:
+        calls.append(("PUT", "/collections/memory", {"json": {
+            "vectors": {"size": 1024, "distance": "Cosine"}, "on_disk_payload": True}}))
+    calls.extend(("PUT", "/collections/memory/index?wait=true", {"json": {
+        "field_name": field, "field_schema": "keyword"}}) for field in ("owner_id", "status"))
+    assert state["calls"] == calls
+    state["calls"].clear()
+    _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+@pytest.mark.parametrize("field", ["owner_id", "status"])
+def test_qdrant_ensure_only_creates_missing_index(qdrant_requests, field):
+    store, state = qdrant_requests
+    state["schema"][field] = {"data_type": "keyword", "points": 7745}
+    _run(store.ensure(1024))
+    assert len(state["calls"]) == 2
+    assert state["calls"][1][2]["json"]["field_name"] != field
+
+
+@pytest.mark.parametrize("field", ["owner_id", "status"])
+def test_qdrant_ensure_rejects_incompatible_index_without_mutation(qdrant_requests, field):
+    store, state = qdrant_requests
+    state["schema"][field] = {"data_type": "text"}
+    with pytest.raises(ValueError, match="keyword"):
+        _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+def test_qdrant_dimension_mismatch_does_not_create_indexes(qdrant_requests):
+    store, state = qdrant_requests
+    state["size"] = 768
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_qdrant_ensure_does_not_recreate_on_collection_read_failure(qdrant_requests, status):
+    import httpx
+    store, state = qdrant_requests
+    state["fail"] = ("GET", "/collections/memory", status)
+    with pytest.raises(httpx.HTTPStatusError):
+        _run(store.ensure(1024))
+    assert state["calls"] == [("GET", "/collections/memory", {})]
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_qdrant_index_failure_propagates_and_can_resume(qdrant_requests, status):
+    import httpx
+    store, state = qdrant_requests
+    state["schema"]["owner_id"] = {"data_type": "keyword"}
+    state["fail"] = ("PUT", "/collections/memory/index?wait=true", status)
+    with pytest.raises(httpx.HTTPStatusError):
+        _run(store.ensure(1024))
+    assert len(state["calls"]) == 2
+    assert state["calls"][1][2]["json"]["field_name"] == "status"
+    state["fail"] = None
+    state["calls"].clear()
+    _run(store.ensure(1024))
+    assert len(state["calls"]) == 2
+    assert state["calls"][1][2]["json"]["field_name"] == "status"
+
+
+def test_qdrant_search_keeps_owner_status_full_payload_and_candidate_count(monkeypatch):
+    import httpx
+    from backend.memory_config import VectorConfig
+    from backend.memory_providers import QdrantVectorStore
+
+    payload = {"memory_id": "memory", "content": "complete synthetic body" * 1000}
+    store = QdrantVectorStore(VectorConfig(url="http://qdrant:6333", collection="memory"))
+
+    async def request(method, path, **kwargs):
+        assert (method, path) == ("POST", "/collections/memory/points/query")
+        assert kwargs["json"] == {
+            "query": [1., 0.], "limit": 60, "with_payload": True,
+            "filter": {"must": [
+                {"key": "owner_id", "match": {"value": "test-owner"}},
+                {"key": "status", "match": {"value": "active"}}]},
+        }
+        return httpx.Response(200, json={"result": {"points": [
+            {"payload": payload, "score": .9}]}})
+
+    monkeypatch.setattr(store, "_request", request)
+    rows = _run(store.search([1., 0.], owner_id="test-owner", limit=60))
+    assert rows == [{"id": "memory", "score": .9, "payload": payload, "channel": "dense"}]
+
+
 def test_pgvector_table_name_is_not_interpolatable():
     from backend.memory_config import VectorConfig
     from backend.memory_providers import PgVectorStore
@@ -204,6 +334,38 @@ def test_claude_oauth_generation_uses_fresh_no_tool_sdk_query(
     assert seen["options"].mcp_servers == {}
     assert seen["options"].setting_sources == []
     assert seen["options"].skills == []
+
+
+def test_sdk_memory_cli_stderr_is_private_and_deduplicated(
+        tmp_path, monkeypatch, capsys):
+    import claude_agent_sdk
+    from claude_agent_sdk.types import ResultMessage
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    monkeypatch.setenv("MUSELAB_MEMORY_DIR", str(tmp_path / "memory"))
+    seen = {}
+
+    async def fake_query(*, prompt, options):
+        seen["options"] = options
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                            is_error=False, num_turns=1, session_id="fixture", result="ok")
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    provider = GenerationProvider(MemoryConfig(generation_model="claude-sonnet-4-6"))
+    monkeypatch.setattr(provider, "_route", lambda: None)
+    assert _run(provider.complete("system", "synthetic-private-prompt")) == "ok"
+
+    sink = seen["options"].stderr
+    assert callable(sink)
+    capsys.readouterr()
+    line = "unrecognized_model: synthetic-private-prompt /private/workspace/file.py"
+    sink(line)
+    sink(line)
+    logged = capsys.readouterr().err
+    assert logged.count("category=configuration") == 1
+    assert "synthetic-private-prompt" not in logged
+    assert "/private/workspace" not in logged
 
 
 def test_ducc_generation_model_never_routes_through_http(monkeypatch):
@@ -774,6 +936,82 @@ def test_generation_repairs_non_object_once_and_preserves_schema(monkeypatch):
     assert len(calls) == 2
     assert calls[0][1] == calls[1][1]
     assert 'wrong format' in calls[1][0]
+
+
+@pytest.mark.parametrize("first", ['not JSON', '[]', '{"valid":false}'])
+def test_json_validator_shares_format_repair_budget(monkeypatch, first):
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    provider = GenerationProvider(MemoryConfig())
+    calls = []
+
+    async def complete(system, prompt):
+        calls.append((system, prompt))
+        return first if len(calls) == 1 else '{"valid":true}'
+
+    def validate(value):
+        if value.get("valid") is not True:
+            raise ValueError("private-validator-detail")
+        return {"normalized": True}
+
+    monkeypatch.setattr(provider, "complete", complete)
+    assert _run(provider.complete_json("system", "prompt", validator=validate)) == {
+        "normalized": True}
+    assert len(calls) == 2
+    assert "private-validator-detail" not in str(calls)
+
+
+@pytest.mark.parametrize("first", ['not JSON', '[]', '{}'])
+def test_json_validator_exhaustion_is_sanitized(monkeypatch, first):
+    import traceback
+    from backend import observability
+    from backend.memory_config import MemoryConfig
+    from backend.memory_engine import classify_memory_failure
+    from backend.memory_providers import GenerationError, GenerationProvider
+
+    provider = GenerationProvider(MemoryConfig())
+    calls, events = [], []
+
+    async def complete(system, prompt):
+        calls.append((system, prompt))
+        return first if len(calls) == 1 else '{"secret":"private-payload"}'
+
+    def validate(value):
+        raise ValueError("private-validator-detail")
+
+    monkeypatch.setattr(provider, "complete", complete)
+    monkeypatch.setattr(observability, "perf_event", lambda *args, **kw: events.append(kw))
+    with pytest.raises(GenerationError) as caught:
+        _run(provider.complete_json("system", "prompt", validator=validate))
+    error = caught.value
+    assert error.reason == "invalid_schema"
+    assert error.category == "malformed_response"
+    assert error.retryable is False
+    assert len(calls) == 2
+    assert classify_memory_failure(error)[1]["reason"] == "invalid_schema"
+    assert events[-1]["reason"] == "invalid_schema"
+    assert events[-1]["retrying"] is False
+    diagnostics = str(events) + str(calls) + "".join(traceback.format_exception(error))
+    assert "private-payload" not in diagnostics
+    assert "private-validator-detail" not in diagnostics
+
+
+def test_json_validator_programming_errors_do_not_retry(monkeypatch):
+    from unittest.mock import AsyncMock
+    from backend.memory_config import MemoryConfig
+    from backend.memory_providers import GenerationProvider
+
+    provider = GenerationProvider(MemoryConfig())
+    complete = AsyncMock(return_value='{}')
+    monkeypatch.setattr(provider, "complete", complete)
+
+    def validate(value):
+        raise RuntimeError("programming failure")
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        _run(provider.complete_json("system", "prompt", validator=validate))
+    assert complete.await_count == 1
 
 
 def test_sdk_memory_applies_native_output_and_reasoning_budget(tmp_path, monkeypatch):
